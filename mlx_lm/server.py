@@ -135,7 +135,9 @@ def process_message_content(messages):
         content = message.get("content")
         if isinstance(content, list):
             text_fragments = [
-                fragment["text"] for fragment in content if fragment["type"] == "text"
+                fragment["text"]
+                for fragment in content
+                if fragment.get("type") in ("text", "input_text", "output_text")
             ]
             if len(text_fragments) != len(content):
                 raise ValueError("Only 'text' content type is supported.")
