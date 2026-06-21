@@ -1,8 +1,10 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import hashlib
+import json
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -10,6 +12,39 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
+
+
+PROMPT_CACHE_CHECKPOINT_FORMAT = "mlx_lm.prompt_cache_checkpoint"
+PROMPT_CACHE_CHECKPOINT_VERSION = "1"
+DEFAULT_PROMPT_CHECKPOINT_NAMESPACE = "glm52-local"
+DEFAULT_PROMPT_CHECKPOINT_MODEL_ID = "default_model"
+DEFAULT_PROMPT_CHECKPOINT_TOKENIZER_ID = "default_tokenizer"
+EMPTY_ARRAYS_METADATA_KEY = "__mlx_lm_prompt_cache_empty_arrays_v1__"
+
+_CHECKPOINT_REQUIRED_METADATA_KEYS = (
+    "checkpoint_format",
+    "checkpoint_version",
+    "checkpoint_namespace",
+    "checkpoint_model_hint",
+    "checkpoint_model_hint_hash",
+    "checkpoint_tokenizer_hint",
+    "checkpoint_tokenizer_hint_hash",
+    "checkpoint_prefix_hash",
+    "checkpoint_prefix_length",
+    "checkpoint_cache_signature_hash",
+    "checkpoint_cache_signature",
+    "checkpoint_model_hint_metadata",
+    "checkpoint_tokenizer_hint_metadata",
+    "checkpoint_glm_dsa_metadata",
+)
+
+
+class PromptCacheCheckpointError(ValueError):
+    pass
+
+
+def _is_empty_array(value):
+    return hasattr(value, "shape") and hasattr(value, "dtype") and 0 in value.shape
 
 
 def make_prompt_cache(
@@ -40,7 +75,11 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
-def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
+def save_prompt_cache(
+    file_name: str,
+    cache: List[Any],
+    metadata: Optional[Dict[str, str]] = None,
+):
     """
     Save a pre-computed prompt cache to a file.
 
@@ -50,9 +89,24 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         metadata (Dict[str, str]): Optional metadata to save along with model
             state.
     """
+    metadata = dict(metadata or {})
+    if EMPTY_ARRAYS_METADATA_KEY in metadata:
+        raise ValueError(f"metadata uses reserved key: {EMPTY_ARRAYS_METADATA_KEY}")
     cache_data = [c.state for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
+    empty_arrays = {}
+    for key, value in list(cache_data.items()):
+        if not _is_empty_array(value):
+            continue
+        empty_arrays[key] = {"shape": list(value.shape)}
+        cache_data[key] = mx.zeros((1,), dtype=value.dtype)
+    if empty_arrays:
+        metadata[EMPTY_ARRAYS_METADATA_KEY] = json.dumps(
+            empty_arrays,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     cache_classes = [type(c).__name__ for c in cache]
     cache_metadata = [cache_info, metadata, cache_classes]
     cache_metadata = dict(tree_flatten(cache_metadata))
@@ -73,9 +127,14 @@ def load_prompt_cache(file_name, return_metadata=False):
             the metadata if requested.
     """
     arrays, cache_metadata = mx.load(file_name, return_metadata=True)
-    arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
+    empty_arrays = json.loads(metadata.pop(EMPTY_ARRAYS_METADATA_KEY, "{}"))
+    for key, spec in empty_arrays.items():
+        if key not in arrays:
+            raise ValueError(f"Prompt cache is missing empty array placeholder {key}")
+        arrays[key] = mx.zeros(spec["shape"], dtype=arrays[key].dtype)
+    arrays = tree_unflatten(list(arrays.items()))
     cache = [
         globals()[c].from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
@@ -83,6 +142,391 @@ def load_prompt_cache(file_name, return_metadata=False):
     if return_metadata:
         return cache, metadata
     return cache
+
+
+def _normalize_for_json(value):
+    if is_dataclass(value):
+        return _normalize_for_json(asdict(value))
+    if isinstance(value, dict):
+        return {
+            str(k): _normalize_for_json(v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_json(v) for v in value]
+    if hasattr(value, "tolist"):
+        return _normalize_for_json(value.tolist())
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _json_dumps(value):
+    return json.dumps(
+        _normalize_for_json(value),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _json_hash(value):
+    return hashlib.sha256(_json_dumps(value).encode("utf-8")).hexdigest()
+
+
+def _token_list(tokens):
+    tokens = _normalize_for_json(tokens)
+    if isinstance(tokens, int) and not isinstance(tokens, bool):
+        tokens = [tokens]
+    if (
+        isinstance(tokens, list)
+        and len(tokens) == 1
+        and isinstance(tokens[0], list)
+    ):
+        tokens = tokens[0]
+    if not isinstance(tokens, list):
+        raise TypeError("prefix_tokens must be a sequence of token ids")
+    if any(isinstance(t, bool) or not isinstance(t, int) for t in tokens):
+        raise TypeError("prefix_tokens must contain only integer token ids")
+    return tokens
+
+
+def prompt_prefix_hash(prefix_tokens):
+    return _json_hash(_token_list(prefix_tokens))
+
+
+def _model_config_dict(model):
+    config = getattr(model, "args", None)
+    if config is None:
+        config = getattr(model, "config", None)
+    if config is None and hasattr(model, "model"):
+        config = getattr(model.model, "args", None)
+    if config is None:
+        return {}
+    return _normalize_for_json(config)
+
+
+def _model_metadata(model, model_id):
+    config = _model_config_dict(model)
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    return {
+        "id": model_id,
+        "class": f"{type(model).__module__}.{type(model).__qualname__}"
+        if model is not None
+        else None,
+        "model_type": model_type,
+        "config": config,
+    }
+
+
+def _tokenizer_metadata(tokenizer, tokenizer_config, tokenizer_id):
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    chat_template = getattr(inner, "chat_template", None)
+    eos_token_ids = getattr(tokenizer, "eos_token_ids", None)
+    if eos_token_ids is not None:
+        eos_token_ids = sorted(eos_token_ids)
+    return {
+        "id": tokenizer_id,
+        "class": f"{type(inner).__module__}.{type(inner).__qualname__}"
+        if inner is not None
+        else None,
+        "name_or_path": getattr(inner, "name_or_path", None),
+        "vocab_size": getattr(inner, "vocab_size", None),
+        "eos_token_ids": eos_token_ids,
+        "chat_template_hash": hashlib.sha256(
+            (chat_template or "").encode("utf-8")
+        ).hexdigest(),
+        "tokenizer_config": tokenizer_config or {},
+    }
+
+
+def _glm_dsa_metadata(model):
+    config = _model_config_dict(model)
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    if model_type != "glm_moe_dsa" and "indexer_types" not in config:
+        return {}
+
+    layers = getattr(model, "layers", [])
+    layer_cache_widths = []
+    for layer in layers:
+        self_attn = getattr(layer, "self_attn", None)
+        layer_cache_widths.append(
+            1 if getattr(self_attn, "skip_topk", False) else 2
+        )
+
+    return {
+        "model_type": model_type,
+        "indexer_types": config.get("indexer_types"),
+        "index_topk": config.get("index_topk"),
+        "index_head_dim": config.get("index_head_dim"),
+        "index_n_heads": config.get("index_n_heads"),
+        "index_topk_pattern": config.get("index_topk_pattern"),
+        "index_topk_freq": config.get("index_topk_freq"),
+        "index_skip_topk_offset": config.get("index_skip_topk_offset"),
+        "layer_cache_widths": layer_cache_widths,
+    }
+
+
+def _state_signature(value):
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return {
+            "kind": "array",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+    if isinstance(value, (list, tuple)):
+        return [_state_signature(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            str(k): _state_signature(v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return {
+        "kind": "object",
+        "class": f"{type(value).__module__}.{type(value).__qualname__}",
+    }
+
+
+def prompt_cache_signature(cache: List[Any]):
+    signature = []
+    for c in cache:
+        entry = {
+            "class": type(c).__name__,
+            "meta_state": _normalize_for_json(c.meta_state),
+            "state": _state_signature(c.state),
+        }
+        try:
+            entry["size"] = c.size()
+        except Exception:
+            entry["size"] = None
+        signature.append(entry)
+    return signature
+
+
+def build_prompt_cache_checkpoint_metadata(
+    cache: List[Any],
+    *,
+    prefix_tokens,
+    checkpoint_namespace: str = DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+    model_id: str = DEFAULT_PROMPT_CHECKPOINT_MODEL_ID,
+    tokenizer_id: str = DEFAULT_PROMPT_CHECKPOINT_TOKENIZER_ID,
+    model: Optional[nn.Module] = None,
+    tokenizer: Optional[Any] = None,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, str]] = None,
+):
+    """
+    Build metadata for trusted local prompt checkpoints.
+
+    This checkpoint path is intended for trusted single-model local operation.
+    It does not prove full model artifact identity. Users must clear checkpoint
+    files or use a new checkpoint_namespace when changing model weights,
+    quantization, tokenizer, adapters, or GLM-5.2 implementation details.
+    """
+    prefix = _token_list(prefix_tokens)
+    model_info = _model_metadata(model, model_id)
+    tokenizer_info = _tokenizer_metadata(tokenizer, tokenizer_config, tokenizer_id)
+    glm_dsa_info = _glm_dsa_metadata(model)
+    cache_signature = prompt_cache_signature(cache)
+
+    checkpoint_metadata = {
+        "checkpoint_format": PROMPT_CACHE_CHECKPOINT_FORMAT,
+        "checkpoint_version": PROMPT_CACHE_CHECKPOINT_VERSION,
+        "checkpoint_namespace": checkpoint_namespace,
+        "checkpoint_model_hint": model_id,
+        "checkpoint_model_hint_hash": _json_hash(model_info),
+        "checkpoint_tokenizer_hint": tokenizer_id,
+        "checkpoint_tokenizer_hint_hash": _json_hash(tokenizer_info),
+        "checkpoint_prefix_hash": _json_hash(prefix),
+        "checkpoint_prefix_length": str(len(prefix)),
+        "checkpoint_cache_signature_hash": _json_hash(cache_signature),
+        "checkpoint_cache_signature": _json_dumps(cache_signature),
+        "checkpoint_model_hint_metadata": _json_dumps(model_info),
+        "checkpoint_tokenizer_hint_metadata": _json_dumps(tokenizer_info),
+        "checkpoint_glm_dsa_metadata": _json_dumps(glm_dsa_info),
+        "model": model_id,
+        "tokenizer_config": json.dumps(tokenizer_config or {}),
+    }
+    if metadata:
+        extra_metadata = {str(k): str(v) for k, v in metadata.items()}
+        reserved = set(checkpoint_metadata)
+        conflicts = reserved.intersection(extra_metadata)
+        if conflicts:
+            keys = ", ".join(sorted(conflicts))
+            raise ValueError(f"metadata overrides checkpoint keys: {keys}")
+        checkpoint_metadata.update(extra_metadata)
+    return checkpoint_metadata
+
+
+def save_prompt_checkpoint(
+    file_name: str,
+    cache: List[Any],
+    *,
+    prefix_tokens,
+    checkpoint_namespace: str = DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+    model_id: str = DEFAULT_PROMPT_CHECKPOINT_MODEL_ID,
+    tokenizer_id: str = DEFAULT_PROMPT_CHECKPOINT_TOKENIZER_ID,
+    model: Optional[nn.Module] = None,
+    tokenizer: Optional[Any] = None,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, str]] = None,
+):
+    checkpoint_metadata = build_prompt_cache_checkpoint_metadata(
+        cache,
+        prefix_tokens=prefix_tokens,
+        checkpoint_namespace=checkpoint_namespace,
+        model_id=model_id,
+        tokenizer_id=tokenizer_id,
+        model=model,
+        tokenizer=tokenizer,
+        tokenizer_config=tokenizer_config,
+        metadata=metadata,
+    )
+    save_prompt_cache(file_name, cache, checkpoint_metadata)
+
+
+def _require_metadata(metadata, key):
+    value = metadata.get(key)
+    if value is None:
+        raise PromptCacheCheckpointError(f"checkpoint is missing {key}")
+    return value
+
+
+def _require_checkpoint_metadata(metadata):
+    for key in _CHECKPOINT_REQUIRED_METADATA_KEYS:
+        _require_metadata(metadata, key)
+
+
+def _metadata_json(metadata, key):
+    try:
+        return json.loads(_require_metadata(metadata, key))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise PromptCacheCheckpointError(f"checkpoint has malformed {key}") from exc
+
+
+def _metadata_int(metadata, key):
+    try:
+        return int(_require_metadata(metadata, key))
+    except (TypeError, ValueError) as exc:
+        raise PromptCacheCheckpointError(f"checkpoint has malformed {key}") from exc
+
+
+def _validate_checkpoint_metadata(
+    cache: List[Any],
+    metadata: Dict[str, str],
+    *,
+    prefix_tokens,
+    checkpoint_namespace: str,
+    model_id: str,
+    tokenizer_id: str,
+    model: Optional[nn.Module],
+    tokenizer: Optional[Any],
+    tokenizer_config: Optional[Dict[str, Any]],
+):
+    _require_checkpoint_metadata(metadata)
+    if _require_metadata(metadata, "checkpoint_format") != PROMPT_CACHE_CHECKPOINT_FORMAT:
+        raise PromptCacheCheckpointError("unsupported checkpoint format")
+    if (
+        _require_metadata(metadata, "checkpoint_version")
+        != PROMPT_CACHE_CHECKPOINT_VERSION
+    ):
+        raise PromptCacheCheckpointError("unsupported checkpoint version")
+    if _require_metadata(metadata, "checkpoint_namespace") != checkpoint_namespace:
+        raise PromptCacheCheckpointError("checkpoint namespace does not match")
+    if _require_metadata(metadata, "checkpoint_model_hint") != model_id:
+        raise PromptCacheCheckpointError("checkpoint model hint does not match")
+    if _require_metadata(metadata, "checkpoint_tokenizer_hint") != tokenizer_id:
+        raise PromptCacheCheckpointError("checkpoint tokenizer hint does not match")
+
+    prefix = _token_list(prefix_tokens)
+    if _require_metadata(metadata, "checkpoint_prefix_hash") != _json_hash(prefix):
+        raise PromptCacheCheckpointError("checkpoint prefix hash does not match")
+    if _metadata_int(metadata, "checkpoint_prefix_length") != len(prefix):
+        raise PromptCacheCheckpointError("checkpoint prefix length does not match")
+
+    model_info = _model_metadata(model, model_id)
+    saved_model_info = _metadata_json(metadata, "checkpoint_model_hint_metadata")
+    if (
+        saved_model_info != model_info
+        or _require_metadata(metadata, "checkpoint_model_hint_hash")
+        != _json_hash(model_info)
+    ):
+        raise PromptCacheCheckpointError("checkpoint model hint metadata does not match")
+
+    tokenizer_info = _tokenizer_metadata(tokenizer, tokenizer_config, tokenizer_id)
+    saved_tokenizer_info = _metadata_json(
+        metadata, "checkpoint_tokenizer_hint_metadata"
+    )
+    if (
+        saved_tokenizer_info != tokenizer_info
+        or _require_metadata(metadata, "checkpoint_tokenizer_hint_hash")
+        != _json_hash(tokenizer_info)
+    ):
+        raise PromptCacheCheckpointError(
+            "checkpoint tokenizer hint metadata does not match"
+        )
+
+    cache_signature = prompt_cache_signature(cache)
+    saved_cache_signature = _metadata_json(metadata, "checkpoint_cache_signature")
+    if (
+        saved_cache_signature != cache_signature
+        or _require_metadata(metadata, "checkpoint_cache_signature_hash")
+        != _json_hash(cache_signature)
+    ):
+        raise PromptCacheCheckpointError("checkpoint cache signature does not match")
+
+    saved_glm_dsa = _metadata_json(metadata, "checkpoint_glm_dsa_metadata")
+    current_glm_dsa = _glm_dsa_metadata(model)
+    if saved_glm_dsa != current_glm_dsa:
+        raise PromptCacheCheckpointError("checkpoint GLM DSA metadata does not match")
+
+
+def load_prompt_checkpoint(
+    file_name: str,
+    *,
+    prefix_tokens,
+    checkpoint_namespace: str = DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+    model_id: str = DEFAULT_PROMPT_CHECKPOINT_MODEL_ID,
+    tokenizer_id: str = DEFAULT_PROMPT_CHECKPOINT_TOKENIZER_ID,
+    model: Optional[nn.Module] = None,
+    tokenizer: Optional[Any] = None,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    return_metadata: bool = False,
+):
+    try:
+        cache, metadata = load_prompt_cache(file_name, return_metadata=True)
+    except Exception as exc:
+        raise PromptCacheCheckpointError(f"failed to load prompt checkpoint: {exc}") from exc
+    _validate_checkpoint_metadata(
+        cache,
+        metadata,
+        prefix_tokens=prefix_tokens,
+        checkpoint_namespace=checkpoint_namespace,
+        model_id=model_id,
+        tokenizer_id=tokenizer_id,
+        model=model,
+        tokenizer=tokenizer,
+        tokenizer_config=tokenizer_config,
+    )
+    if return_metadata:
+        return cache, metadata
+    return cache
+
+
+def invalidate_prompt_checkpoint(file_name: str):
+    """
+    Clear a local prompt checkpoint by deleting its safetensors file.
+
+    Using a new checkpoint_namespace is the non-destructive invalidation path
+    when users want to keep older checkpoint files on disk.
+    """
+    try:
+        import os
+
+        os.remove(file_name)
+    except FileNotFoundError:
+        pass
 
 
 def can_trim_prompt_cache(cache: List[Any]) -> bool:

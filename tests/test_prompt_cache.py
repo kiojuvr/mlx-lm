@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import copy
+import json
 import os
 import tempfile
 import unittest
@@ -15,17 +16,255 @@ from mlx_lm.models.cache import (
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
+    EMPTY_ARRAYS_METADATA_KEY,
     KVCache,
+    PromptCacheCheckpointError,
     QuantizedKVCache,
     RotatingKVCache,
+    load_prompt_checkpoint,
     load_prompt_cache,
     make_prompt_cache,
+    save_prompt_checkpoint,
     save_prompt_cache,
     trim_prompt_cache,
 )
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+
+
+class TestPromptCacheCheckpoint(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir_fid = tempfile.TemporaryDirectory()
+        self.test_dir = self.test_dir_fid.name
+
+    def tearDown(self):
+        self.test_dir_fid.cleanup()
+
+    def _filled_kv_cache(self, shape=(1, 2, 4, 8), dtype=mx.float32):
+        cache = [KVCache() for _ in range(2)]
+        for c in cache:
+            x = mx.random.uniform(shape=shape).astype(dtype)
+            c.update_and_fetch(x, x)
+        return cache
+
+    def test_checkpoint_validates_prefix_namespace_and_model_hint(self):
+        cache = self._filled_kv_cache()
+
+        cache_file = os.path.join(self.test_dir, "checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="toy-model",
+            prefix_tokens=[1, 2, 3, 4],
+        )
+
+        loaded_cache = load_prompt_checkpoint(
+            cache_file,
+            model_id="toy-model",
+            prefix_tokens=[1, 2, 3, 4],
+        )
+        self.assertEqual(len(cache), len(loaded_cache))
+        for c, lc in zip(cache, loaded_cache):
+            self.assertEqual(c.offset, lc.offset)
+            self.assertTrue(mx.array_equal(c.state[0], lc.state[0]))
+            self.assertTrue(mx.array_equal(c.state[1], lc.state[1]))
+
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="toy-model",
+                prefix_tokens=[1, 2, 3, 5],
+            )
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="other-model",
+                prefix_tokens=[1, 2, 3, 4],
+            )
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                cache_file,
+                checkpoint_namespace="other-namespace",
+                model_id="toy-model",
+                prefix_tokens=[1, 2, 3, 4],
+            )
+
+    def test_checkpoint_rejects_cache_signature_mismatch(self):
+        cache = self._filled_kv_cache()
+        cache_file = os.path.join(self.test_dir, "checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="toy-model",
+            prefix_tokens=[1, 2, 3, 4],
+        )
+
+        _, metadata = load_prompt_cache(cache_file, return_metadata=True)
+        wrong_cache = self._filled_kv_cache(shape=(1, 2, 5, 8))
+        bad_file = os.path.join(self.test_dir, "bad_signature.safetensors")
+        save_prompt_cache(bad_file, wrong_cache, metadata)
+
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                bad_file,
+                model_id="toy-model",
+                prefix_tokens=[1, 2, 3, 4],
+            )
+
+    def test_checkpoint_rejects_malformed_or_partial_metadata(self):
+        cache = self._filled_kv_cache()
+        cache_file = os.path.join(self.test_dir, "checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="toy-model",
+            prefix_tokens=[1, 2, 3, 4],
+        )
+        _, metadata = load_prompt_cache(cache_file, return_metadata=True)
+
+        malformed_cases = [
+            ("checkpoint_prefix_length", "not-an-int"),
+            ("checkpoint_glm_dsa_metadata", "{"),
+        ]
+        for key, value in malformed_cases:
+            with self.subTest(key=key):
+                bad_metadata = dict(metadata)
+                bad_metadata[key] = value
+                bad_file = os.path.join(self.test_dir, f"bad_{key}.safetensors")
+                save_prompt_cache(bad_file, cache, bad_metadata)
+                with self.assertRaises(PromptCacheCheckpointError):
+                    load_prompt_checkpoint(
+                        bad_file,
+                        model_id="toy-model",
+                        prefix_tokens=[1, 2, 3, 4],
+                    )
+
+        partial_metadata = dict(metadata)
+        del partial_metadata["checkpoint_cache_signature"]
+        partial_file = os.path.join(self.test_dir, "partial_metadata.safetensors")
+        save_prompt_cache(partial_file, cache, partial_metadata)
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                partial_file,
+                model_id="toy-model",
+                prefix_tokens=[1, 2, 3, 4],
+            )
+
+    def test_zero_sized_arrays_round_trip_shape_and_dtype(self):
+        cache = [KVCache()]
+        keys = mx.ones((1, 1, 3, 4), dtype=mx.float16)
+        values = mx.zeros((1, 1, 3, 0), dtype=mx.float32)
+        cache[0].update_and_fetch(keys, values)
+
+        cache_file = os.path.join(self.test_dir, "zero_sized.safetensors")
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        loaded_keys, loaded_values = loaded_cache[0].state
+
+        self.assertEqual(loaded_keys.shape, (1, 1, 3, 4))
+        self.assertEqual(loaded_keys.dtype, mx.float16)
+        self.assertEqual(loaded_values.shape, (1, 1, 3, 0))
+        self.assertEqual(loaded_values.dtype, mx.float32)
+
+    def test_empty_array_metadata_key_is_reserved(self):
+        cache = self._filled_kv_cache()
+        cache_file = os.path.join(self.test_dir, "reserved_key.safetensors")
+        with self.assertRaises(ValueError):
+            save_prompt_cache(
+                cache_file,
+                cache,
+                {EMPTY_ARRAYS_METADATA_KEY: "{}"},
+            )
+
+    def _make_glm_moe_dsa_model(self, pattern="FSFS"):
+        from mlx_lm.models import glm_moe_dsa
+
+        args = glm_moe_dsa.ModelArgs(
+            model_type="glm_moe_dsa",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0},
+            attention_bias=False,
+            index_topk_pattern=pattern,
+        )
+        return glm_moe_dsa.Model(args)
+
+    def test_glm_moe_dsa_checkpoint_round_trip(self):
+        model = self._make_glm_moe_dsa_model()
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        prefix_tokens = prompt[0].tolist()
+        cache = make_prompt_cache(model)
+        self.assertEqual([len(c.caches) for c in cache], [2, 1, 2, 1])
+
+        logits = model(prompt, cache=cache)
+        mx.eval(logits, [c.state for c in cache])
+        next_token = mx.argmax(logits[:, -1:, :], axis=-1)
+
+        cache_file = os.path.join(self.test_dir, "glm_checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="glm-moe-dsa-test",
+            prefix_tokens=prefix_tokens,
+            model=model,
+        )
+
+        loaded_cache, metadata = load_prompt_checkpoint(
+            cache_file,
+            model_id="glm-moe-dsa-test",
+            prefix_tokens=prefix_tokens,
+            model=model,
+            return_metadata=True,
+        )
+        self.assertEqual([len(c.caches) for c in loaded_cache], [2, 1, 2, 1])
+        self.assertIn("checkpoint_glm_dsa_metadata", metadata)
+
+        live_logits = model(next_token, cache=cache)
+        loaded_logits = model(next_token, cache=loaded_cache)
+        mx.eval(live_logits, loaded_logits)
+        self.assertTrue(mx.allclose(live_logits, loaded_logits).item())
+
+        metadata["checkpoint_glm_dsa_metadata"] = json.dumps(
+            {"model_type": "glm_moe_dsa", "indexer_types": ["full"]},
+            sort_keys=True,
+        )
+        bad_file = os.path.join(self.test_dir, "bad_glm_checkpoint.safetensors")
+        save_prompt_cache(bad_file, loaded_cache, metadata)
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                bad_file,
+                model_id="glm-moe-dsa-test",
+                prefix_tokens=prefix_tokens,
+                model=model,
+            )
 
 
 class TestPromptCache(unittest.TestCase):
