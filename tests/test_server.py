@@ -6,6 +6,8 @@ import json
 import threading
 import types
 import unittest
+import unittest.mock as mock
+from queue import Queue
 
 import mlx.core as mx
 import requests
@@ -200,6 +202,143 @@ class TestServerCLI(unittest.TestCase):
             cli_args=types.SimpleNamespace(kv_bits=8),
         )
         self.assertFalse(generator._is_batchable(args))
+
+    def test_single_request_passes_prompt_checkpoint_coexistence_args(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = types.SimpleNamespace(
+            prefill_step_size=2048,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=4096,
+        )
+        tokenizer = types.SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+            eos_token_id=0,
+            encode=lambda text: [0],
+        )
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            tokenizer=tokenizer,
+            draft_model=None,
+            model_key=("model", None, None),
+            cli_args=cli_args,
+        )
+        prompt = [1, 2, 3, 4, 5]
+        rest = prompt[2:]
+
+        class FakePromptCache:
+            def fetch_nearest_cache(self, model_key, tokens):
+                return ["server-cache"], rest
+
+            def insert_cache(self, model_key, tokens, cache):
+                self.inserted = (model_key, tokens, cache)
+
+        class FakeStateMachine:
+            def make_state(self):
+                return "normal"
+
+            def match(self, state, token):
+                return state, None, "normal"
+
+        generator.prompt_cache = FakePromptCache()
+        generator._log_cache_stats = lambda: None
+        generator._tokenize = lambda tokenizer, request, args: (
+            prompt,
+            [prompt[:3], prompt[3:]],
+            ["system", "user"],
+            "normal",
+        )
+        generator._make_state_machine = lambda *args, **kwargs: (
+            FakeStateMachine(),
+            {},
+        )
+        request = object()
+        args = types.SimpleNamespace(
+            seed=None,
+            stop_words=[],
+            max_tokens=1,
+            num_draft_tokens=3,
+            top_logprobs=0,
+            sampling=types.SimpleNamespace(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                xtc_probability=0.0,
+                xtc_threshold=0.0,
+            ),
+            logits=types.SimpleNamespace(
+                logit_bias=None,
+                repetition_penalty=None,
+                repetition_context_size=20,
+                presence_penalty=0.0,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
+            ),
+        )
+        captured = {}
+
+        def fake_stream_generate(**kwargs):
+            captured.update(kwargs)
+            yield types.SimpleNamespace(
+                finish_reason="length",
+                token=0,
+                text="",
+                logprobs=mx.array([0.0]),
+            )
+
+        rqueue = Queue()
+        with mock.patch("mlx_lm.server.stream_generate", fake_stream_generate):
+            generator._serve_single((rqueue, request, args))
+
+        queued = []
+        while not rqueue.empty():
+            queued.append(rqueue.get())
+        self.assertFalse(any(isinstance(item, Exception) for item in queued))
+        self.assertEqual(captured["prompt"], rest)
+        self.assertEqual(captured["prompt_cache"], ["server-cache"])
+        self.assertEqual(captured["prompt_checkpoint_full_prompt"], prompt)
+        self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 2)
+        self.assertEqual(captured["prompt_checkpoint_store_prefix_lengths"], [3])
+        self.assertTrue(captured["prompt_checkpoint_allow_existing_cache"])
+        self.assertEqual(captured["kv_bits"], 8)
+        self.assertEqual(captured["kv_group_size"], 64)
+        self.assertEqual(captured["quantized_kv_start"], 4096)
+
+    def test_tokenize_segments_system_prefix_without_chat_template(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(chat_template_args={})
+        )
+        tokenizer = types.SimpleNamespace(
+            has_chat_template=False,
+            has_thinking=False,
+            encode=lambda text: [ord(ch) for ch in text],
+        )
+        request = types.SimpleNamespace(
+            request_type="chat",
+            messages=[
+                {"role": "system", "content": "stable AGENT prefix"},
+                {"role": "user", "content": "changing task"},
+            ],
+            tools=None,
+            role_mapping=None,
+        )
+
+        prompt, segments, segment_types, initial_state = generator._tokenize(
+            tokenizer,
+            request,
+            types.SimpleNamespace(chat_template_kwargs=None),
+        )
+
+        self.assertEqual(initial_state, "normal")
+        self.assertEqual(segment_types, ["system", "user"])
+        self.assertEqual(segments[0] + segments[1], prompt)
+        self.assertGreater(len(segments[0]), 0)
+        self.assertLess(len(segments[0]), len(prompt))
 
 
 class TestServer(unittest.TestCase):

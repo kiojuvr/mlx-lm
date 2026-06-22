@@ -566,7 +566,7 @@ class ResponseGenerator:
                 )
             else:
                 prompt = tokenizer.encode(convert_chat(messages, role_mapping))
-                return prompt, [prompt], ["assistant"], "normal"
+                template_kwargs = None
         else:
             prompt = tokenizer.encode(request.prompt)
             return prompt, [prompt], ["assistant"], "normal"
@@ -598,11 +598,20 @@ class ResponseGenerator:
             else:
                 break
         if num_system > 0:
-            sys_tokens = tokenizer.apply_chat_template(
-                messages[:num_system] + [{"role": "user", "content": ""}],
-                add_generation_prompt=False,
-                **template_kwargs,
-            )
+            if tokenizer.has_chat_template:
+                sys_tokens = tokenizer.apply_chat_template(
+                    messages[:num_system] + [{"role": "user", "content": ""}],
+                    add_generation_prompt=False,
+                    **template_kwargs,
+                )
+            else:
+                sys_tokens = tokenizer.encode(
+                    convert_chat(
+                        messages[:num_system] + [{"role": "user", "content": ""}],
+                        role_mapping,
+                    )
+                )
+            sys_end = min(len(sys_tokens), len(prompt))
             for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
                 if a != b:
                     sys_end = i
@@ -936,7 +945,14 @@ class ResponseGenerator:
         rqueue, request, args = request
 
         # Define the progress callback
+        progress_started = False
+        ctx = None
+
         def progress(tokens_processed, tokens_total):
+            nonlocal progress_started
+            if not progress_started and ctx is not None:
+                ctx.prompt_cache_count = max(ctx.prompt_cache_count, tokens_processed)
+                progress_started = True
             rqueue.put((tokens_processed, tokens_total))
 
         try:
@@ -946,7 +962,9 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, segments, segment_types, initial_state = self._tokenize(
+                tokenizer, request, args
+            )
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -985,6 +1003,13 @@ class ResponseGenerator:
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
+            checkpoint_prefix_lengths = []
+            segment_end = 0
+            for segment, segment_type in zip(segments, segment_types):
+                segment_end += len(segment)
+                if segment_type == "system" and segment_end < len(prompt):
+                    checkpoint_prefix_lengths.append(segment_end)
+
             # Process the prompt and generate tokens
             for gen in stream_generate(
                 model=model,
@@ -1001,6 +1026,10 @@ class ResponseGenerator:
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
+                prompt_checkpoint_full_prompt=prompt,
+                prompt_checkpoint_initial_cached_tokens=ctx.prompt_cache_count,
+                prompt_checkpoint_store_prefix_lengths=checkpoint_prefix_lengths,
+                prompt_checkpoint_allow_existing_cache=True,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)

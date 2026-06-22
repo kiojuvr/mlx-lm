@@ -222,12 +222,76 @@ def prompt_prefix_hash(prefix_tokens):
     return _json_hash(_token_list(prefix_tokens))
 
 
-def prompt_checkpoint_file(prefix_tokens):
+def prompt_checkpoint_name(prefix_tokens):
     prefix = _token_list(prefix_tokens)
+    return f"{_json_hash(prefix)}-{len(prefix)}.safetensors"
+
+
+def prompt_checkpoint_file(prefix_tokens):
     return os.path.join(
         glm52_prompt_checkpoints_dir(),
-        f"{_json_hash(prefix)}-{len(prefix)}.safetensors",
+        prompt_checkpoint_name(prefix_tokens),
     )
+
+
+def _parse_prompt_checkpoint_name(name):
+    suffix = ".safetensors"
+    if not name.endswith(suffix):
+        return None
+    stem = name[: -len(suffix)]
+    hash_part, sep, length_part = stem.rpartition("-")
+    if sep != "-" or not hash_part or not length_part:
+        return None
+    try:
+        prefix_length = int(length_part)
+    except ValueError:
+        return None
+    if prefix_length <= 0:
+        return None
+    return hash_part, prefix_length
+
+
+def find_prompt_checkpoint_prefix(prefix_tokens, *, min_prefix_length=2):
+    """
+    Find checkpoint files whose token prefix is a prefix of ``prefix_tokens``.
+
+    This is the token-prefix analogue of ds4.c's rendered-byte prefix lookup.
+    It intentionally stays in the trusted single-model GLM-5.2 cache root and
+    returns longest candidates first so callers can safely fall back to shorter
+    checkpoints when a longer file is malformed or rejected.
+    """
+    tokens = _token_list(prefix_tokens)
+    try:
+        names = os.listdir(glm52_prompt_checkpoints_dir())
+    except OSError:
+        return []
+
+    candidates = []
+    seen_lengths = set()
+    for name in names:
+        parsed = _parse_prompt_checkpoint_name(name)
+        if parsed is None:
+            continue
+        hash_part, prefix_length = parsed
+        if (
+            prefix_length in seen_lengths
+            or prefix_length < min_prefix_length
+            or prefix_length > len(tokens)
+        ):
+            continue
+        prefix = tokens[:prefix_length]
+        if hash_part != prompt_prefix_hash(prefix):
+            continue
+        seen_lengths.add(prefix_length)
+        candidates.append(
+            (
+                prefix_length,
+                prefix,
+                os.path.join(glm52_prompt_checkpoints_dir(), name),
+            )
+        )
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates
 
 
 def _model_config_dict(model):

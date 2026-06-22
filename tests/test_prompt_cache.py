@@ -543,6 +543,164 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertTrue(os.path.exists(checkpoint_file))
         self.assertEqual([tok for tok, _ in recreated], [tok for tok, _ in baseline])
 
+    def test_prompt_checkpoint_reuses_stable_prefix_with_different_suffix(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        stable_prefix = [1, 2, 3, 4]
+        prompt_a = mx.array(stable_prefix + [10, 11, 12])
+        prompt_b = mx.array(stable_prefix + [20, 21, 22])
+        prefix_file = prompt_checkpoint_file(stable_prefix)
+
+        baseline_b = list(
+            generate_step(
+                prompt_b,
+                model,
+                max_tokens=2,
+                prefill_step_size=2,
+                prompt_checkpoint=False,
+            )
+        )
+
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(
+                generate_step(
+                    prompt_a,
+                    model,
+                    max_tokens=2,
+                    prefill_step_size=2,
+                    prompt_checkpoint_store_prefix_lengths=[len(stable_prefix)],
+                )
+            )
+        first_run = "\n".join(logs.output)
+        self.assertTrue(os.path.exists(prefix_file))
+        self.assertIn("save prefix success", first_run)
+
+        progress = []
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            hit_b = list(
+                generate_step(
+                    prompt_b,
+                    model,
+                    max_tokens=2,
+                    prefill_step_size=2,
+                    prompt_progress_callback=lambda processed, total: progress.append(
+                        (processed, total)
+                    ),
+                    prompt_checkpoint_store_prefix_lengths=[len(stable_prefix)],
+                )
+            )
+        second_run = "\n".join(logs.output)
+        self.assertIn("prompt checkpoint: prefix hit", second_run)
+        self.assertIn(f"prefix_length={len(stable_prefix)}", second_run)
+        self.assertEqual(progress[0], (len(stable_prefix), len(prompt_b)))
+        self.assertEqual([tok for tok, _ in hit_b], [tok for tok, _ in baseline_b])
+        for (_, expected), (_, from_hit) in zip(baseline_b, hit_b):
+            self.assertTrue(mx.allclose(expected, from_hit).item())
+
+    def test_prompt_checkpoint_coexists_with_server_managed_prompt_cache(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        stable_prefix = [1, 2, 3, 4]
+        prompt_a = mx.array(stable_prefix + [10, 11, 12])
+        prompt_b = stable_prefix + [20, 21, 22]
+
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    prompt_a,
+                    model,
+                    max_tokens=1,
+                    prefill_step_size=2,
+                    prompt_checkpoint_store_prefix_lengths=[len(stable_prefix)],
+                )
+            )
+
+        server_cache = make_prompt_cache(model)
+        logits = model(mx.array([prompt_b[:2]]), cache=server_cache)
+        mx.eval(logits, [c.state for c in server_cache])
+
+        progress = []
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(
+                generate_step(
+                    mx.array(prompt_b[2:]),
+                    model,
+                    max_tokens=1,
+                    prefill_step_size=2,
+                    prompt_cache=server_cache,
+                    prompt_checkpoint_full_prompt=prompt_b,
+                    prompt_checkpoint_initial_cached_tokens=2,
+                    prompt_checkpoint_allow_existing_cache=True,
+                    prompt_progress_callback=lambda processed, total: progress.append(
+                        (processed, total)
+                    ),
+                )
+            )
+        output = "\n".join(logs.output)
+        self.assertIn("server prompt_cache coexistence", output)
+        self.assertNotIn("skip explicit prompt_cache active", output)
+        self.assertIn("prompt checkpoint: prefix hit", output)
+        self.assertEqual(progress[0], (len(stable_prefix), len(prompt_b)))
+
+    def test_empty_prompt_with_explicit_prompt_cache_rejects_checkpoint_kwargs(self):
+        model = self._make_glm_moe_dsa_model()
+        prompt_cache = make_prompt_cache(model)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Either input_embeddings or prompt",
+        ):
+            list(
+                generate_step(
+                    mx.array([], dtype=mx.int32),
+                    model,
+                    max_tokens=1,
+                    prompt_cache=prompt_cache,
+                    prompt_checkpoint_full_prompt=[1, 2, 3, 4],
+                )
+            )
+
+    def test_empty_prompt_with_server_managed_cache_replays_last_token(self):
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = [1, 2, 3, 4]
+
+        baseline = list(
+            generate_step(
+                mx.array(prompt_tokens),
+                model,
+                max_tokens=1,
+                prompt_checkpoint=False,
+            )
+        )
+
+        prompt_cache = make_prompt_cache(model)
+        logits = model(mx.array([prompt_tokens]), cache=prompt_cache)
+        mx.eval(logits, [c.state for c in prompt_cache])
+
+        progress = []
+        resumed = list(
+            generate_step(
+                mx.array([], dtype=mx.int32),
+                model,
+                max_tokens=1,
+                prompt_cache=prompt_cache,
+                prompt_checkpoint=False,
+                prompt_checkpoint_full_prompt=prompt_tokens,
+                prompt_checkpoint_initial_cached_tokens=len(prompt_tokens),
+                prompt_checkpoint_allow_existing_cache=True,
+                prompt_progress_callback=lambda processed, total: progress.append(
+                    (processed, total)
+                ),
+            )
+        )
+
+        self.assertEqual(progress[0], (len(prompt_tokens) - 1, len(prompt_tokens)))
+        self.assertEqual([tok for tok, _ in resumed], [tok for tok, _ in baseline])
+        for (_, expected), (_, actual) in zip(baseline, resumed):
+            self.assertTrue(mx.allclose(expected, actual).item())
+
     def test_prompt_checkpoint_debug_logging(self):
         self._set_home_to_test_dir()
         self._set_prompt_checkpoint_debug()
@@ -555,13 +713,13 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertIn("prompt checkpoint: lookup", first_run)
         self.assertIn("prefix_length=4", first_run)
         self.assertIn("miss file does not exist", first_run)
-        self.assertIn("save success", first_run)
+        self.assertIn("save exact success", first_run)
 
         with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
             list(generate_step(prompt, model, max_tokens=1, prefill_step_size=2))
         second_run = "\n".join(logs.output)
         self.assertIn("prompt checkpoint: lookup", second_run)
-        self.assertIn("prompt checkpoint: hit", second_run)
+        self.assertIn("prompt checkpoint: exact hit", second_run)
         self.assertIn("prefix_length=4", second_run)
 
         with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
@@ -594,7 +752,7 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
 
         self.assertEqual(len(outputs), 1)
         self.assertFalse(os.path.exists(glm52_local_cache_root()))
-        self.assertIn("save failure swallowed", "\n".join(logs.output))
+        self.assertIn("save exact failure swallowed", "\n".join(logs.output))
 
 
 class TestPromptCache(unittest.TestCase):
