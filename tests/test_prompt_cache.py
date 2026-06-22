@@ -8,7 +8,12 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step, maybe_quantize_kv_cache, setup_arg_parser
+from mlx_lm.generate import (
+    PROMPT_CHECKPOINT_DEBUG_ENV,
+    generate_step,
+    maybe_quantize_kv_cache,
+    setup_arg_parser,
+)
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
@@ -61,6 +66,18 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 os.environ["HOME"] = old_home
 
         self.addCleanup(restore_home)
+
+    def _set_prompt_checkpoint_debug(self):
+        old_debug = os.environ.get(PROMPT_CHECKPOINT_DEBUG_ENV)
+        os.environ[PROMPT_CHECKPOINT_DEBUG_ENV] = "1"
+
+        def restore_debug():
+            if old_debug is None:
+                os.environ.pop(PROMPT_CHECKPOINT_DEBUG_ENV, None)
+            else:
+                os.environ[PROMPT_CHECKPOINT_DEBUG_ENV] = old_debug
+
+        self.addCleanup(restore_debug)
 
     def _filled_kv_cache(self, shape=(1, 2, 4, 8), dtype=mx.float32):
         cache = [KVCache() for _ in range(2)]
@@ -526,6 +543,32 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertTrue(os.path.exists(checkpoint_file))
         self.assertEqual([tok for tok, _ in recreated], [tok for tok, _ in baseline])
 
+    def test_prompt_checkpoint_debug_logging(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        prompt = mx.array([1, 2, 3, 4])
+
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(generate_step(prompt, model, max_tokens=1, prefill_step_size=2))
+        first_run = "\n".join(logs.output)
+        self.assertIn("prompt checkpoint: lookup", first_run)
+        self.assertIn("prefix_length=4", first_run)
+        self.assertIn("miss file does not exist", first_run)
+        self.assertIn("save success", first_run)
+
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(generate_step(prompt, model, max_tokens=1, prefill_step_size=2))
+        second_run = "\n".join(logs.output)
+        self.assertIn("prompt checkpoint: lookup", second_run)
+        self.assertIn("prompt checkpoint: hit", second_run)
+        self.assertIn("prefix_length=4", second_run)
+
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(generate_step(prompt, model, max_tokens=1, prompt_checkpoint=False))
+        disabled = "\n".join(logs.output)
+        self.assertIn("prompt checkpoint: checkpoint disabled", disabled)
+
     def test_prompt_checkpoint_can_be_disabled(self):
         self._set_home_to_test_dir()
         model = self._make_glm_moe_dsa_model()
@@ -539,16 +582,19 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
 
     def test_prompt_checkpoint_save_failure_does_not_stop_generation(self):
         self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
         os.makedirs(os.path.join(self.test_dir, ".cache"))
         with open(os.path.join(self.test_dir, ".cache", "mlx-lm"), "w"):
             pass
 
         model = self._make_glm_moe_dsa_model()
         prompt = mx.array([1, 2, 3, 4])
-        outputs = list(generate_step(prompt, model, max_tokens=1))
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            outputs = list(generate_step(prompt, model, max_tokens=1))
 
         self.assertEqual(len(outputs), 1)
         self.assertFalse(os.path.exists(glm52_local_cache_root()))
+        self.assertIn("save failure swallowed", "\n".join(logs.output))
 
 
 class TestPromptCache(unittest.TestCase):
