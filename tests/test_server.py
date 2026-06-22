@@ -17,6 +17,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     _process_control_tokens,
+    setup_arg_parser,
 )
 from mlx_lm.utils import load
 
@@ -55,6 +56,9 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "kv_bits": None,
+                "kv_group_size": 64,
+                "quantized_kv_start": 0,
             },
         )
 
@@ -155,6 +159,47 @@ class TestProcessControlTokens(unittest.TestCase):
             [t.state for t in out],
             ["tool", "tool", "tool", "normal", "normal"],
         )
+
+
+class TestServerCLI(unittest.TestCase):
+    def test_setup_arg_parser_accepts_kv_options(self):
+        args = setup_arg_parser().parse_args(
+            [
+                "--kv-bits",
+                "8",
+                "--kv-group-size",
+                "64",
+                "--quantized-kv-start",
+                "4096",
+            ]
+        )
+
+        self.assertEqual(args.kv_bits, 8)
+        self.assertEqual(args.kv_group_size, 64)
+        self.assertEqual(args.quantized_kv_start, 4096)
+
+    def test_setup_arg_parser_kv_defaults(self):
+        args = setup_arg_parser().parse_args([])
+
+        self.assertIsNone(args.kv_bits)
+        self.assertEqual(args.kv_group_size, 64)
+        self.assertEqual(args.quantized_kv_start, 0)
+
+    def test_kv_bits_uses_single_request_generation_path(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        args = types.SimpleNamespace(seed=None)
+
+        generator.model_provider = types.SimpleNamespace(
+            is_batchable=True,
+            cli_args=types.SimpleNamespace(kv_bits=None),
+        )
+        self.assertTrue(generator._is_batchable(args))
+
+        generator.model_provider = types.SimpleNamespace(
+            is_batchable=True,
+            cli_args=types.SimpleNamespace(kv_bits=8),
+        )
+        self.assertFalse(generator._is_batchable(args))
 
 
 class TestServer(unittest.TestCase):

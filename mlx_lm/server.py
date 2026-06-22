@@ -41,6 +41,7 @@ from .generate import (
 from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
+    model_has_glm_mla_kv_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -374,6 +375,12 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+        if (
+            self.cli_args.kv_bits is not None
+            and self.cli_args.kv_bits != 8
+            and model_has_glm_mla_kv_cache(model)
+        ):
+            raise ValueError("GLM MLA KV quantization supports only --kv-bits 8")
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -685,7 +692,11 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and self.model_provider.cli_args.kv_bits is None
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -987,6 +998,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -2143,7 +2157,7 @@ def run(
         response_generator.join()
 
 
-def main():
+def setup_arg_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -2264,6 +2278,26 @@ def main():
         help="Step size for prefill processing (default: 2048)",
     )
     parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization. GLM MLA KV "
+        "quantization supports only --kv-bits 8.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="When --kv-bits is set, start quantizing the KV cache from "
+        "this step (default: 0)",
+    )
+    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=10,
@@ -2279,6 +2313,11 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    return parser
+
+
+def main():
+    parser = setup_arg_parser()
     args = parser.parse_args()
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
