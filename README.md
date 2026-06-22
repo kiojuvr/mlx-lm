@@ -1,3 +1,91 @@
+## GLM-5.2 local fork notes
+
+This repository is a GLM-5.2-focused local fork of `mlx-lm`.
+
+It is intended for Apple Silicon users running very large GLM-5.2 MLX models locally, especially Mac Studio M3 Ultra 512GB-class machines. The goal is practical long-context GLM-5.2 operation, not general-purpose upstream compatibility.
+
+This branch is not intended as an upstream `mlx-lm` PR. Several changes intentionally specialize the runtime for GLM-5.2 trusted single-model local use.
+
+### Main changes
+
+- GLM-5.2 / `glm_moe_dsa` support, including DSA shared-indexer cache handling.
+- Responses API text content compatibility.
+- Automatic local prompt checkpoint save/load inspired by `ds4.c`.
+- GLM-5.2-specific MLA latent int8 KV cache support via `--kv-bits 8`.
+- Server-side support for `--kv-bits`, `--kv-group-size`, and `--quantized-kv-start`.
+- Local GLM-5.2 runtime cache layout designed for one-command invalidation.
+
+### Recommended target model
+
+This branch has been tested with:
+
+    avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw
+
+Example local path when downloaded through LM Studio:
+
+    ~/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw
+
+### Generate example
+
+    MLX_METAL_FAST_SYNCH=1 python -m mlx_lm generate \
+      --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+      --prompt "Hello. Briefly introduce yourself." \
+      --max-tokens 32 \
+      --kv-bits 8 \
+      --kv-group-size 64 \
+      --quantized-kv-start 4096
+
+### Server example
+
+    MLX_METAL_FAST_SYNCH=1 python -m mlx_lm server \
+      --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+      --host 0.0.0.0 \
+      --port 8000 \
+      --kv-bits 8 \
+      --kv-group-size 64 \
+      --quantized-kv-start 4096
+
+### Local runtime cache
+
+This fork uses a shared GLM-5.2 local runtime cache root:
+
+    ~/.cache/mlx-lm/glm52-local/
+
+Prompt checkpoints are stored under:
+
+    ~/.cache/mlx-lm/glm52-local/prompt-checkpoints/
+
+A `kv/` directory is also reserved under the same root.
+
+When changing model weights, quantization, tokenizer, adapters, GLM implementation details, or KV quantization settings, invalidate the local runtime cache by moving or deleting the shared root:
+
+    mv ~/.cache/mlx-lm/glm52-local \
+       ~/.cache/mlx-lm/glm52-local.bak.$(date +%Y%m%d_%H%M%S)
+
+### Important limitations
+
+- This is a GLM-5.2-specialized fork, not a generic `mlx-lm` runtime.
+- GLM MLA KV quantization currently supports only `--kv-bits 8`.
+- DSA indexer cache remains floating-point and is intentionally not quantized.
+- With `--kv-bits` enabled, the server uses the single-request `stream_generate` path instead of the existing `BatchGenerator` path. This preserves correctness for the first GLM MLA int8 KV implementation, but server batching / prompt batching benefits are not used in this mode.
+- Prompt checkpointing is trusted single-model local cache reuse. It validates prefix, cache structure, GLM DSA metadata, and GLM MLA KV settings, but it does not prove full model weight, tokenizer, adapter, or artifact identity.
+- Long-context decode currently dequantizes the full MLA latent cache on read. Sparse or block-wise dequantization is future work.
+- If generation behaves unexpectedly after changing model/runtime settings, clear the GLM-5.2 local runtime cache first.
+
+### Smoke test result
+
+A short smoke test with `avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw` on Mac Studio M3 Ultra 512GB completed successfully with:
+
+    --kv-bits 8 --kv-group-size 64 --quantized-kv-start 4096
+
+Observed short-prompt result:
+
+    Prompt: 19 tokens, ~6.9 tokens/sec
+    Generation: 32 tokens, ~21 tokens/sec
+    Peak memory: ~329 GB
+
+Short prompts do not meaningfully demonstrate long-context KV memory savings or prompt checkpoint benefit. Use longer prompts to evaluate those paths.
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
