@@ -42,6 +42,8 @@ _CHECKPOINT_REQUIRED_METADATA_KEYS = (
     "checkpoint_model_hint_metadata",
     "checkpoint_tokenizer_hint_metadata",
     "checkpoint_glm_dsa_metadata",
+    "checkpoint_glm_mla_kv_quantization",
+    "checkpoint_glm_mla_kv_settings",
 )
 
 
@@ -322,12 +324,131 @@ def _state_signature(value):
     }
 
 
+def _cache_quantization_signature(cache):
+    if hasattr(cache, "caches"):
+        return [_cache_quantization_signature(c) for c in cache.caches]
+
+    cache_type = type(cache).__name__
+    if cache_type == "QuantizedGlmMlaKVCache":
+        return {
+            "scheme": "glm_mla_latent_int8",
+            "group_size": cache.group_size,
+            "bits": cache.bits,
+        }
+    if cache_type == "QuantizedKVCache":
+        return {
+            "scheme": "kv",
+            "group_size": cache.group_size,
+            "bits": cache.bits,
+        }
+    if cache_type == "GlmMlaKVCache":
+        return {"scheme": "glm_mla_latent_fp"}
+    return None
+
+
+def glm_mla_kv_quantization_metadata(cache: List[Any]):
+    metadata = {
+        "glm_mla_latent_fp_layers": 0,
+        "glm_mla_latent_int8_layers": 0,
+        "glm_mla_latent_int8_group_sizes": [],
+        "glm_mla_latent_int8_bits": [],
+    }
+    group_sizes = set()
+    bits = set()
+
+    def visit(c):
+        cache_type = type(c).__name__
+        if cache_type == "GlmMlaKVCache":
+            metadata["glm_mla_latent_fp_layers"] += 1
+        elif cache_type == "QuantizedGlmMlaKVCache":
+            metadata["glm_mla_latent_int8_layers"] += 1
+            group_sizes.add(c.group_size)
+            bits.add(c.bits)
+        elif hasattr(c, "caches"):
+            for subcache in c.caches:
+                visit(subcache)
+
+    for c in cache:
+        visit(c)
+
+    metadata["glm_mla_latent_int8_group_sizes"] = sorted(group_sizes)
+    metadata["glm_mla_latent_int8_bits"] = sorted(bits)
+    return metadata
+
+
+def expected_glm_mla_kv_quantization_metadata(
+    model: Optional[nn.Module],
+    *,
+    cache_token_length: int,
+    kv_bits: Optional[int],
+    kv_group_size: int,
+    quantized_kv_start: int,
+):
+    glm_dsa = _glm_dsa_metadata(model)
+    layer_count = len(glm_dsa.get("layer_cache_widths", []))
+    if layer_count == 0:
+        return None
+    if kv_bits == 8 and cache_token_length >= quantized_kv_start:
+        return {
+            "glm_mla_latent_fp_layers": 0,
+            "glm_mla_latent_int8_layers": layer_count,
+            "glm_mla_latent_int8_group_sizes": [kv_group_size],
+            "glm_mla_latent_int8_bits": [8],
+        }
+    return {
+        "glm_mla_latent_fp_layers": layer_count,
+        "glm_mla_latent_int8_layers": 0,
+        "glm_mla_latent_int8_group_sizes": [],
+        "glm_mla_latent_int8_bits": [],
+    }
+
+
+def model_has_glm_mla_kv_cache(model: Optional[nn.Module]):
+    return len(_glm_dsa_metadata(model).get("layer_cache_widths", [])) > 0
+
+
+def glm_mla_kv_settings_metadata(
+    *,
+    kv_bits: Optional[int] = None,
+    kv_group_size: Optional[int] = None,
+    quantized_kv_start: Optional[int] = None,
+):
+    if kv_bits is None:
+        return {
+            "kv_bits": None,
+            "kv_group_size": None,
+            "quantized_kv_start": None,
+        }
+    return {
+        "kv_bits": int(kv_bits),
+        "kv_group_size": int(kv_group_size),
+        "quantized_kv_start": int(quantized_kv_start),
+    }
+
+
+def expected_glm_mla_kv_settings_metadata(
+    model: Optional[nn.Module],
+    *,
+    kv_bits: Optional[int] = None,
+    kv_group_size: Optional[int] = None,
+    quantized_kv_start: Optional[int] = None,
+):
+    if not model_has_glm_mla_kv_cache(model):
+        return None
+    return glm_mla_kv_settings_metadata(
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+    )
+
+
 def prompt_cache_signature(cache: List[Any]):
     signature = []
     for c in cache:
         entry = {
             "class": type(c).__name__,
             "meta_state": _normalize_for_json(c.meta_state),
+            "quantization": _cache_quantization_signature(c),
             "state": _state_signature(c.state),
         }
         try:
@@ -348,6 +469,9 @@ def build_prompt_cache_checkpoint_metadata(
     model: Optional[nn.Module] = None,
     tokenizer: Optional[Any] = None,
     tokenizer_config: Optional[Dict[str, Any]] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: Optional[int] = None,
+    quantized_kv_start: Optional[int] = None,
     metadata: Optional[Dict[str, str]] = None,
 ):
     """
@@ -362,6 +486,12 @@ def build_prompt_cache_checkpoint_metadata(
     model_info = _model_metadata(model, model_id)
     tokenizer_info = _tokenizer_metadata(tokenizer, tokenizer_config, tokenizer_id)
     glm_dsa_info = _glm_dsa_metadata(model)
+    glm_mla_kv_quantization_info = glm_mla_kv_quantization_metadata(cache)
+    glm_mla_kv_settings_info = glm_mla_kv_settings_metadata(
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+    )
     cache_signature = prompt_cache_signature(cache)
 
     checkpoint_metadata = {
@@ -379,6 +509,12 @@ def build_prompt_cache_checkpoint_metadata(
         "checkpoint_model_hint_metadata": _json_dumps(model_info),
         "checkpoint_tokenizer_hint_metadata": _json_dumps(tokenizer_info),
         "checkpoint_glm_dsa_metadata": _json_dumps(glm_dsa_info),
+        "checkpoint_glm_mla_kv_quantization": _json_dumps(
+            glm_mla_kv_quantization_info
+        ),
+        "checkpoint_glm_mla_kv_settings": _json_dumps(
+            glm_mla_kv_settings_info
+        ),
         "model": model_id,
         "tokenizer_config": json.dumps(tokenizer_config or {}),
     }
@@ -404,6 +540,9 @@ def save_prompt_checkpoint(
     model: Optional[nn.Module] = None,
     tokenizer: Optional[Any] = None,
     tokenizer_config: Optional[Dict[str, Any]] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: Optional[int] = None,
+    quantized_kv_start: Optional[int] = None,
     metadata: Optional[Dict[str, str]] = None,
 ):
     checkpoint_metadata = build_prompt_cache_checkpoint_metadata(
@@ -415,6 +554,9 @@ def save_prompt_checkpoint(
         model=model,
         tokenizer=tokenizer,
         tokenizer_config=tokenizer_config,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
         metadata=metadata,
     )
     save_prompt_cache(file_name, cache, checkpoint_metadata)
@@ -457,6 +599,8 @@ def _validate_checkpoint_metadata(
     model: Optional[nn.Module],
     tokenizer: Optional[Any],
     tokenizer_config: Optional[Dict[str, Any]],
+    expected_glm_mla_kv_quantization: Optional[Dict[str, Any]],
+    expected_glm_mla_kv_settings: Optional[Dict[str, Any]],
 ):
     _require_checkpoint_metadata(metadata)
     if _require_metadata(metadata, "checkpoint_format") != PROMPT_CACHE_CHECKPOINT_FORMAT:
@@ -515,6 +659,33 @@ def _validate_checkpoint_metadata(
     if saved_glm_dsa != current_glm_dsa:
         raise PromptCacheCheckpointError("checkpoint GLM DSA metadata does not match")
 
+    saved_glm_mla_kv = _metadata_json(
+        metadata, "checkpoint_glm_mla_kv_quantization"
+    )
+    current_glm_mla_kv = glm_mla_kv_quantization_metadata(cache)
+    if saved_glm_mla_kv != current_glm_mla_kv:
+        raise PromptCacheCheckpointError(
+            "checkpoint GLM MLA KV quantization metadata does not match"
+        )
+    if (
+        expected_glm_mla_kv_quantization is not None
+        and saved_glm_mla_kv != expected_glm_mla_kv_quantization
+    ):
+        raise PromptCacheCheckpointError(
+            "checkpoint GLM MLA KV quantization setting does not match"
+        )
+
+    saved_glm_mla_kv_settings = _metadata_json(
+        metadata, "checkpoint_glm_mla_kv_settings"
+    )
+    if (
+        expected_glm_mla_kv_settings is not None
+        and saved_glm_mla_kv_settings != expected_glm_mla_kv_settings
+    ):
+        raise PromptCacheCheckpointError(
+            "checkpoint GLM MLA KV settings do not match"
+        )
+
 
 def load_prompt_checkpoint(
     file_name: str,
@@ -526,6 +697,8 @@ def load_prompt_checkpoint(
     model: Optional[nn.Module] = None,
     tokenizer: Optional[Any] = None,
     tokenizer_config: Optional[Dict[str, Any]] = None,
+    expected_glm_mla_kv_quantization: Optional[Dict[str, Any]] = None,
+    expected_glm_mla_kv_settings: Optional[Dict[str, Any]] = None,
     return_metadata: bool = False,
 ):
     try:
@@ -542,6 +715,8 @@ def load_prompt_checkpoint(
         model=model,
         tokenizer=tokenizer,
         tokenizer_config=tokenizer_config,
+        expected_glm_mla_kv_quantization=expected_glm_mla_kv_quantization,
+        expected_glm_mla_kv_settings=expected_glm_mla_kv_settings,
     )
     if return_metadata:
         return cache, metadata
@@ -800,6 +975,140 @@ class QuantizedKVCache(_BaseCache):
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
+class QuantizedGlmMlaKVCache(_BaseCache):
+    """GLM-5.2 MLA cache with only the latent KV tensor stored as int8.
+
+    The associated RoPE side channel remains in its original floating dtype.
+    This is intentionally narrow and is used only by ``glm_moe_dsa`` cache
+    lists; DSA indexer caches remain regular ``KVCache`` instances.
+    """
+
+    step = 256
+    quantize_with_cache_list = True
+
+    def __init__(self, group_size: int = 64, bits: int = 8):
+        if bits != 8:
+            raise ValueError("GLM MLA latent KV cache only supports int8.")
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self.group_size = group_size
+        self.bits = bits
+
+    def _check_key_dim(self, key_dim: int):
+        if key_dim % self.group_size != 0:
+            raise ValueError(
+                "GLM MLA latent KV cache dimension must be divisible by "
+                f"kv_group_size ({key_dim} vs {self.group_size})."
+            )
+
+    def update_and_fetch(self, keys, values):
+        B, n_kv_heads, num_steps, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        self._check_key_dim(k_head_dim)
+        prev = self.offset
+
+        if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
+            el_per_int = 8 * mx.uint32.size // self.bits
+            new_steps = (self.step + num_steps - 1) // self.step * self.step
+            key_shape = (B, n_kv_heads, new_steps)
+            value_shape = (B, n_kv_heads, new_steps, v_head_dim)
+
+            def init_quant(dim):
+                return (
+                    mx.zeros((*key_shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*key_shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*key_shape, dim // self.group_size), dtype=keys.dtype),
+                )
+
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = tree_map(lambda x: x[..., :prev, :], self.keys)
+                    self.values = self.values[..., :prev, :]
+
+                def expand_quant(x):
+                    new_x = mx.zeros((*key_shape, x.shape[-1]), dtype=x.dtype)
+                    return mx.concatenate([x, new_x], axis=-2)
+
+                self.keys = tree_map(expand_quant, self.keys)
+                self.values = mx.concatenate(
+                    [self.values, mx.zeros(value_shape, values.dtype)], axis=-2
+                )
+            else:
+                self.keys = init_quant(k_head_dim)
+                self.values = mx.zeros(value_shape, values.dtype)
+
+        self.offset += num_steps
+
+        q_keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        for i in range(len(self.keys)):
+            self.keys[i][..., prev : self.offset, :] = q_keys[i]
+        self.values[..., prev : self.offset, :] = values
+
+        return self.state
+
+    def dequantize_keys(self, keys=None):
+        keys = self.keys if keys is None else keys
+        return mx.dequantize(*keys, group_size=self.group_size, bits=self.bits)
+
+    @property
+    def state(self):
+        if self.offset == self.keys[0].shape[2]:
+            return self.keys, self.values
+        return (
+            tree_map(lambda x: x[..., : self.offset, :], self.keys),
+            self.values[..., : self.offset, :],
+        )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self.offset = self.keys[0].shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.offset, self.group_size, self.bits)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset, self.group_size, self.bits = map(int, v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 8):
+        if bits != 8:
+            raise ValueError("GLM MLA latent KV cache only supports int8.")
+        if self.group_size == group_size:
+            return self
+        quant_cache = QuantizedGlmMlaKVCache(group_size=group_size, bits=bits)
+        quant_cache.offset = self.offset
+        if self.keys is not None:
+            latent = self.dequantize_keys()
+            quant_cache.keys = mx.quantize(
+                latent, group_size=group_size, bits=bits
+            )
+            quant_cache.values = self.values[..., : self.offset, :]
+        return quant_cache
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(lambda a, x: a + x.nbytes, self.keys, 0) + self.values.nbytes
+
+
 class KVCache(_BaseCache):
     step = 256
 
@@ -883,6 +1192,27 @@ class KVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class GlmMlaKVCache(KVCache):
+    """Unquantized GLM-5.2 MLA cache that can opt into latent-only int8."""
+
+    quantize_with_cache_list = True
+
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 8
+    ) -> QuantizedGlmMlaKVCache:
+        quant_cache = QuantizedGlmMlaKVCache(group_size=group_size, bits=bits)
+        quant_cache.offset = self.offset
+        if self.keys is not None:
+            quant_cache._check_key_dim(self.keys.shape[-1])
+            quant_cache.keys = mx.quantize(
+                self.keys[..., : self.offset, :],
+                group_size=group_size,
+                bits=bits,
+            )
+            quant_cache.values = self.values[..., : self.offset, :]
+        return quant_cache
 
 
 class RotatingKVCache(_BaseCache):
@@ -1296,6 +1626,10 @@ class CacheList(_BaseCache):
     def __getitem__(self, idx):
         return self.caches[idx]
 
+    @property
+    def offset(self):
+        return max((getattr(c, "offset", 0) for c in self.caches), default=0)
+
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
 
@@ -1303,6 +1637,20 @@ class CacheList(_BaseCache):
         for c in self.caches:
             m = c.trim(n)
         return m
+
+    def to_quantized(self, group_size: int = 64, bits: int = 8):
+        converted = []
+        changed = False
+        for c in self.caches:
+            if getattr(c, "quantize_with_cache_list", False):
+                q = c.to_quantized(group_size=group_size, bits=bits)
+                converted.append(q)
+                changed = changed or q is not c
+            else:
+                converted.append(c)
+        if not changed:
+            return self
+        return CacheList(*converted)
 
     @property
     def state(self):

@@ -9,7 +9,14 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    CacheList,
+    GlmMlaKVCache,
+    KVCache,
+    QuantizedGlmMlaKVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1481,6 +1488,112 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, args.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
+
+    def test_glm_moe_dsa_mla_int8_kv_cache(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models import glm_moe_dsa
+
+        args = glm_moe_dsa.ModelArgs(
+            model_type="glm_moe_dsa",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0},
+            attention_bias=False,
+            index_topk_pattern="FSFS",
+        )
+        model = glm_moe_dsa.Model(args)
+        model.set_dtype(mx.float16)
+
+        prompt = mx.array([1, 2, 3, 4, 5, 6, 7, 8])
+        cache = make_prompt_cache(model)
+        for layer_cache in cache:
+            self.assertIsInstance(layer_cache, CacheList)
+            self.assertIsInstance(layer_cache[0], GlmMlaKVCache)
+
+        fp_cache = make_prompt_cache(model)
+        fp_outputs = list(
+            generate_step(
+                prompt,
+                model,
+                max_tokens=1,
+                prompt_cache=fp_cache,
+                prompt_checkpoint=False,
+            )
+        )
+        self.assertEqual(len(fp_outputs), 1)
+        for layer_cache in fp_cache:
+            self.assertIsInstance(layer_cache[0], GlmMlaKVCache)
+
+        bad_cache = make_prompt_cache(model)
+        with self.assertRaisesRegex(
+            ValueError, "GLM MLA KV quantization supports only --kv-bits 8"
+        ):
+            list(
+                generate_step(
+                    prompt,
+                    model,
+                    max_tokens=1,
+                    prompt_cache=bad_cache,
+                    kv_bits=4,
+                    kv_group_size=64,
+                    quantized_kv_start=0,
+                    prompt_checkpoint=False,
+                )
+            )
+
+        outputs = list(
+            generate_step(
+                prompt,
+                model,
+                max_tokens=2,
+                prompt_cache=cache,
+                kv_bits=8,
+                kv_group_size=64,
+                quantized_kv_start=0,
+                prompt_checkpoint=False,
+            )
+        )
+
+        self.assertEqual(len(outputs), 2)
+        for _, logprobs in outputs:
+            self.assertTrue(mx.all(mx.isfinite(logprobs)).item())
+
+        for layer_cache in cache:
+            self.assertIsInstance(layer_cache[0], QuantizedGlmMlaKVCache)
+            self.assertEqual(layer_cache[0].bits, 8)
+            self.assertEqual(layer_cache[0].group_size, 64)
+            self.assertEqual(layer_cache[0].keys[0].dtype, mx.uint32)
+            self.assertEqual(layer_cache[0].values.dtype, mx.float16)
+            if len(layer_cache.caches) > 1:
+                self.assertIsInstance(layer_cache[1], KVCache)
+                self.assertEqual(layer_cache[1].keys.dtype, mx.float16)
+                self.assertEqual(layer_cache[1].values.dtype, mx.float16)
 
     def test_gemma2(self):
         from mlx_lm.models import gemma2

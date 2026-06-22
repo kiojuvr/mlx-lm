@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache
+from .cache import CacheList, GlmMlaKVCache, KVCache
 from .deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
@@ -111,6 +111,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         if cache is not None:
             kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
+            if hasattr(cache[0], "dequantize_keys"):
+                kv_latent = cache[0].dequantize_keys(kv_latent)
         else:
             cache = [None] * 2
 
@@ -148,7 +150,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
         if self.indexer is not None and cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+            if isinstance(cache[0].keys, (tuple, list)):
+                cache[0].keys = tuple(
+                    mx.depends(k, (cache[1].keys, cache[1].values))
+                    for k in cache[0].keys
+                )
+            else:
+                cache[0].keys = mx.depends(
+                    cache[0].keys, (cache[1].keys, cache[1].values)
+                )
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -252,7 +262,7 @@ class Model(DSV32Model):
         caches = []
         for layer in self.layers:
             if getattr(layer.self_attn, "skip_topk", False):
-                caches.append(CacheList(KVCache()))
+                caches.append(CacheList(GlmMlaKVCache()))
             else:
-                caches.append(CacheList(KVCache(), KVCache()))
+                caches.append(CacheList(GlmMlaKVCache(), KVCache()))
         return caches

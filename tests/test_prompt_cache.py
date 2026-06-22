@@ -8,7 +8,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step, setup_arg_parser
+from mlx_lm.generate import generate_step, maybe_quantize_kv_cache, setup_arg_parser
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
@@ -19,8 +19,11 @@ from mlx_lm.models.cache import (
     EMPTY_ARRAYS_METADATA_KEY,
     KVCache,
     PromptCacheCheckpointError,
+    QuantizedGlmMlaKVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    expected_glm_mla_kv_quantization_metadata,
+    expected_glm_mla_kv_settings_metadata,
     glm52_kv_cache_dir,
     glm52_local_cache_root,
     glm52_prompt_checkpoints_dir,
@@ -223,7 +226,7 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 {EMPTY_ARRAYS_METADATA_KEY: "{}"},
             )
 
-    def _make_glm_moe_dsa_model(self, pattern="FSFS"):
+    def _make_glm_moe_dsa_model(self, pattern="FSFS", kv_lora_rank=16):
         from mlx_lm.models import glm_moe_dsa
 
         args = glm_moe_dsa.ModelArgs(
@@ -241,7 +244,7 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
             n_shared_experts=1,
             n_routed_experts=4,
             routed_scaling_factor=2.5,
-            kv_lora_rank=16,
+            kv_lora_rank=kv_lora_rank,
             q_lora_rank=24,
             qk_rope_head_dim=16,
             v_head_dim=32,
@@ -291,6 +294,38 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         )
         self.assertEqual([len(c.caches) for c in loaded_cache], [2, 1, 2, 1])
         self.assertIn("checkpoint_glm_dsa_metadata", metadata)
+        self.assertIn("checkpoint_glm_mla_kv_quantization", metadata)
+        self.assertIn("checkpoint_glm_mla_kv_settings", metadata)
+        self.assertEqual(
+            json.loads(metadata["checkpoint_glm_mla_kv_settings"]),
+            {
+                "kv_bits": None,
+                "kv_group_size": None,
+                "quantized_kv_start": None,
+            },
+        )
+
+        expected_int8 = expected_glm_mla_kv_quantization_metadata(
+            model,
+            cache_token_length=len(prefix_tokens),
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="glm-moe-dsa-test",
+                prefix_tokens=prefix_tokens,
+                model=model,
+                expected_glm_mla_kv_quantization=expected_int8,
+                expected_glm_mla_kv_settings=expected_glm_mla_kv_settings_metadata(
+                    model,
+                    kv_bits=8,
+                    kv_group_size=64,
+                    quantized_kv_start=0,
+                ),
+            )
 
         live_logits = model(next_token, cache=cache)
         loaded_logits = model(next_token, cache=loaded_cache)
@@ -309,6 +344,115 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 model_id="glm-moe-dsa-test",
                 prefix_tokens=prefix_tokens,
                 model=model,
+            )
+
+    def test_glm_moe_dsa_int8_checkpoint_round_trip_and_settings(self):
+        model = self._make_glm_moe_dsa_model(kv_lora_rank=64)
+        model.set_dtype(mx.float16)
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        prefix_tokens = prompt[0].tolist()
+        cache = make_prompt_cache(model)
+
+        logits = model(prompt, cache=cache)
+        maybe_quantize_kv_cache(
+            cache,
+            quantized_kv_start=0,
+            kv_group_size=64,
+            kv_bits=8,
+        )
+        mx.eval(logits, [c.state for c in cache])
+        for layer_cache in cache:
+            self.assertIsInstance(layer_cache[0], QuantizedGlmMlaKVCache)
+            if len(layer_cache.caches) > 1:
+                self.assertIsInstance(layer_cache[1], KVCache)
+
+        cache_file = os.path.join(self.test_dir, "glm_int8_checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="glm-moe-dsa-test",
+            prefix_tokens=prefix_tokens,
+            model=model,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+
+        expected_quantization = expected_glm_mla_kv_quantization_metadata(
+            model,
+            cache_token_length=len(prefix_tokens),
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        expected_settings = expected_glm_mla_kv_settings_metadata(
+            model,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        loaded_cache, metadata = load_prompt_checkpoint(
+            cache_file,
+            model_id="glm-moe-dsa-test",
+            prefix_tokens=prefix_tokens,
+            model=model,
+            expected_glm_mla_kv_quantization=expected_quantization,
+            expected_glm_mla_kv_settings=expected_settings,
+            return_metadata=True,
+        )
+        self.assertEqual(
+            json.loads(metadata["checkpoint_glm_mla_kv_settings"]),
+            expected_settings,
+        )
+        for layer_cache in loaded_cache:
+            self.assertIsInstance(layer_cache[0], QuantizedGlmMlaKVCache)
+            self.assertEqual(layer_cache[0].group_size, 64)
+            self.assertEqual(layer_cache[0].bits, 8)
+            if len(layer_cache.caches) > 1:
+                self.assertIsInstance(layer_cache[1], KVCache)
+
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="glm-moe-dsa-test",
+                prefix_tokens=prefix_tokens,
+                model=model,
+                expected_glm_mla_kv_quantization=expected_quantization,
+                expected_glm_mla_kv_settings=expected_glm_mla_kv_settings_metadata(
+                    model,
+                    kv_bits=8,
+                    kv_group_size=32,
+                    quantized_kv_start=0,
+                ),
+            )
+
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="glm-moe-dsa-test",
+                prefix_tokens=prefix_tokens,
+                model=model,
+                expected_glm_mla_kv_quantization=expected_quantization,
+                expected_glm_mla_kv_settings=expected_glm_mla_kv_settings_metadata(
+                    model,
+                    kv_bits=8,
+                    kv_group_size=64,
+                    quantized_kv_start=1,
+                ),
+            )
+
+        with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="glm-moe-dsa-test",
+                prefix_tokens=prefix_tokens,
+                model=model,
+                expected_glm_mla_kv_settings=expected_glm_mla_kv_settings_metadata(
+                    model,
+                    kv_bits=None,
+                    kv_group_size=None,
+                    quantized_kv_start=None,
+                ),
             )
 
     def test_glm_moe_dsa_generation_prompt_checkpoint_smoke(self):
