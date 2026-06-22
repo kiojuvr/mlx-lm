@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -183,6 +184,11 @@ def setup_arg_parser():
         help="A file containing saved KV caches to avoid recomputing them",
     )
     parser.add_argument(
+        "--no-prompt-checkpoint",
+        action="store_true",
+        help="Disable automatic trusted local prompt checkpoint load/save.",
+    )
+    parser.add_argument(
         "--quantize-activations",
         "-qa",
         action="store_true",
@@ -319,6 +325,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    prompt_checkpoint: bool = True,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -347,6 +354,10 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        prompt_checkpoint (bool): If ``True``, automatically load/save trusted
+          local GLM-5.2 prompt checkpoints under
+          ``~/.cache/mlx-lm/glm52-local/prompt-checkpoints``. Exact-prefix
+          hits skip prefill; misses fall back to normal prefill.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -366,6 +377,36 @@ def generate_step(
         )
 
     tokens = None
+    total_prompt_tokens = (
+        len(input_embeddings) if input_embeddings is not None else len(prompt)
+    )
+    prompt_checkpoint_prefix = None
+    prompt_checkpoint_path = None
+    prompt_checkpoint_hit = False
+    prompt_checkpoint_cached_tokens = 0
+
+    if (
+        prompt_checkpoint
+        and input_embeddings is None
+        and prompt_cache is None
+        and total_prompt_tokens > 1
+    ):
+        prompt_checkpoint_prefix = prompt.tolist()
+        prompt_checkpoint_path = cache.prompt_checkpoint_file(prompt_checkpoint_prefix)
+        if os.path.exists(prompt_checkpoint_path):
+            try:
+                prompt_cache = cache.load_prompt_checkpoint(
+                    prompt_checkpoint_path,
+                    prefix_tokens=prompt_checkpoint_prefix,
+                    checkpoint_namespace=cache.DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                    model=model,
+                )
+                prompt = prompt[-1:]
+                prompt_checkpoint_hit = True
+                prompt_checkpoint_cached_tokens = total_prompt_tokens - len(prompt)
+            except cache.PromptCacheCheckpointError:
+                # A rejected checkpoint is a safe cache miss here: never reuse it.
+                prompt_cache = None
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -422,10 +463,7 @@ def generate_step(
             return sampled, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
-        total_prompt_tokens = (
-            len(input_embeddings) if input_embeddings is not None else len(prompt)
-        )
-        prompt_processed_tokens = 0
+        prompt_processed_tokens = prompt_checkpoint_cached_tokens
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
@@ -449,6 +487,23 @@ def generate_step(
                 else input_embeddings
             )
             mx.clear_cache()
+
+        if (
+            prompt_checkpoint_path is not None
+            and not prompt_checkpoint_hit
+            and prompt_checkpoint_prefix is not None
+        ):
+            try:
+                cache.ensure_glm52_local_cache_dirs()
+                cache.save_prompt_checkpoint(
+                    prompt_checkpoint_path,
+                    prompt_cache,
+                    prefix_tokens=prompt_checkpoint_prefix,
+                    checkpoint_namespace=cache.DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                    model=model,
+                )
+            except Exception:
+                pass
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
@@ -706,6 +761,7 @@ def stream_generate(
             (token, logprobs, False) for token, logprobs in token_generator
         )
     else:
+        kwargs.pop("prompt_checkpoint", None)
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
@@ -2103,6 +2159,7 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        prompt_checkpoint=not args.no_prompt_checkpoint,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )

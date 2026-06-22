@@ -8,7 +8,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step
+from mlx_lm.generate import generate_step, setup_arg_parser
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
@@ -21,9 +21,14 @@ from mlx_lm.models.cache import (
     PromptCacheCheckpointError,
     QuantizedKVCache,
     RotatingKVCache,
+    glm52_kv_cache_dir,
+    glm52_local_cache_root,
+    glm52_prompt_checkpoints_dir,
     load_prompt_checkpoint,
     load_prompt_cache,
     make_prompt_cache,
+    prompt_checkpoint_file,
+    prompt_prefix_hash,
     save_prompt_checkpoint,
     save_prompt_cache,
     trim_prompt_cache,
@@ -42,12 +47,52 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
     def tearDown(self):
         self.test_dir_fid.cleanup()
 
+    def _set_home_to_test_dir(self):
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.test_dir
+
+        def restore_home():
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+        self.addCleanup(restore_home)
+
     def _filled_kv_cache(self, shape=(1, 2, 4, 8), dtype=mx.float32):
         cache = [KVCache() for _ in range(2)]
         for c in cache:
             x = mx.random.uniform(shape=shape).astype(dtype)
             c.update_and_fetch(x, x)
         return cache
+
+    def test_glm52_local_cache_paths(self):
+        self._set_home_to_test_dir()
+        expected_root = os.path.join(
+            self.test_dir,
+            ".cache",
+            "mlx-lm",
+            "glm52-local",
+        )
+        prompt = [1, 2, 3]
+
+        self.assertEqual(glm52_local_cache_root(), expected_root)
+        self.assertEqual(
+            glm52_prompt_checkpoints_dir(),
+            os.path.join(expected_root, "prompt-checkpoints"),
+        )
+        self.assertEqual(
+            glm52_kv_cache_dir(),
+            os.path.join(expected_root, "kv"),
+        )
+        self.assertEqual(
+            prompt_checkpoint_file(prompt),
+            os.path.join(
+                expected_root,
+                "prompt-checkpoints",
+                f"{prompt_prefix_hash(prompt)}-3.safetensors",
+            ),
+        )
 
     def test_checkpoint_validates_prefix_namespace_and_model_hint(self):
         cache = self._filled_kv_cache()
@@ -265,6 +310,101 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 prefix_tokens=prefix_tokens,
                 model=model,
             )
+
+    def test_glm_moe_dsa_generation_prompt_checkpoint_smoke(self):
+        self._set_home_to_test_dir()
+        model = self._make_glm_moe_dsa_model()
+        prompt = mx.array([1, 2, 3, 4, 5, 6, 7, 8])
+        checkpoint_file = prompt_checkpoint_file(prompt.tolist())
+
+        baseline = list(
+            generate_step(
+                prompt,
+                model,
+                max_tokens=3,
+                prefill_step_size=3,
+                prompt_checkpoint=False,
+            )
+        )
+        miss_progress = []
+        miss = list(
+            generate_step(
+                prompt,
+                model,
+                max_tokens=3,
+                prefill_step_size=3,
+                prompt_progress_callback=lambda processed, total: miss_progress.append(
+                    (processed, total)
+                ),
+            )
+        )
+        self.assertTrue(os.path.exists(checkpoint_file))
+        self.assertTrue(os.path.isdir(glm52_prompt_checkpoints_dir()))
+        self.assertTrue(os.path.isdir(glm52_kv_cache_dir()))
+        self.assertEqual(miss_progress[0], (0, len(prompt)))
+
+        progress = []
+        hit = list(
+            generate_step(
+                prompt,
+                model,
+                max_tokens=3,
+                prefill_step_size=3,
+                prompt_progress_callback=lambda processed, total: progress.append(
+                    (processed, total)
+                ),
+            )
+        )
+
+        self.assertEqual(progress[0], (len(prompt) - 1, len(prompt)))
+        self.assertEqual([tok for tok, _ in miss], [tok for tok, _ in baseline])
+        self.assertEqual([tok for tok, _ in hit], [tok for tok, _ in baseline])
+        for (_, expected), (_, from_hit) in zip(baseline, hit):
+            self.assertTrue(mx.allclose(expected, from_hit).item())
+
+        backup_root = glm52_local_cache_root() + ".bak"
+        os.rename(glm52_local_cache_root(), backup_root)
+        self.assertFalse(os.path.exists(glm52_local_cache_root()))
+
+        recreated_progress = []
+        recreated = list(
+            generate_step(
+                prompt,
+                model,
+                max_tokens=3,
+                prefill_step_size=3,
+                prompt_progress_callback=lambda processed, total: recreated_progress.append(
+                    (processed, total)
+                ),
+            )
+        )
+        self.assertEqual(recreated_progress[0], (0, len(prompt)))
+        self.assertTrue(os.path.exists(checkpoint_file))
+        self.assertEqual([tok for tok, _ in recreated], [tok for tok, _ in baseline])
+
+    def test_prompt_checkpoint_can_be_disabled(self):
+        self._set_home_to_test_dir()
+        model = self._make_glm_moe_dsa_model()
+        prompt = mx.array([1, 2, 3, 4])
+
+        args = setup_arg_parser().parse_args(["--no-prompt-checkpoint"])
+        self.assertTrue(args.no_prompt_checkpoint)
+
+        list(generate_step(prompt, model, max_tokens=1, prompt_checkpoint=False))
+        self.assertFalse(os.path.exists(glm52_local_cache_root()))
+
+    def test_prompt_checkpoint_save_failure_does_not_stop_generation(self):
+        self._set_home_to_test_dir()
+        os.makedirs(os.path.join(self.test_dir, ".cache"))
+        with open(os.path.join(self.test_dir, ".cache", "mlx-lm"), "w"):
+            pass
+
+        model = self._make_glm_moe_dsa_model()
+        prompt = mx.array([1, 2, 3, 4])
+        outputs = list(generate_step(prompt, model, max_tokens=1))
+
+        self.assertEqual(len(outputs), 1)
+        self.assertFalse(os.path.exists(glm52_local_cache_root()))
 
 
 class TestPromptCache(unittest.TestCase):

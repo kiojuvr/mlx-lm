@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import os
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,11 @@ PROMPT_CACHE_CHECKPOINT_VERSION = "1"
 DEFAULT_PROMPT_CHECKPOINT_NAMESPACE = "glm52-local"
 DEFAULT_PROMPT_CHECKPOINT_MODEL_ID = "default_model"
 DEFAULT_PROMPT_CHECKPOINT_TOKENIZER_ID = "default_tokenizer"
+GLM52_LOCAL_CACHE_ROOT = os.path.join(
+    "~", ".cache", "mlx-lm", DEFAULT_PROMPT_CHECKPOINT_NAMESPACE
+)
+PROMPT_CHECKPOINTS_CACHE_DIR = "prompt-checkpoints"
+KV_RUNTIME_CACHE_DIR = "kv"
 EMPTY_ARRAYS_METADATA_KEY = "__mlx_lm_prompt_cache_empty_arrays_v1__"
 
 _CHECKPOINT_REQUIRED_METADATA_KEYS = (
@@ -41,6 +47,26 @@ _CHECKPOINT_REQUIRED_METADATA_KEYS = (
 
 class PromptCacheCheckpointError(ValueError):
     pass
+
+
+# Trusted local GLM-5.2 runtime caches live under one root. When model
+# weights, quantization, tokenizer, adapters, or GLM implementation details
+# change, move or delete ~/.cache/mlx-lm/glm52-local/ to invalidate them.
+def glm52_local_cache_root():
+    return os.path.expanduser(GLM52_LOCAL_CACHE_ROOT)
+
+
+def glm52_prompt_checkpoints_dir():
+    return os.path.join(glm52_local_cache_root(), PROMPT_CHECKPOINTS_CACHE_DIR)
+
+
+def glm52_kv_cache_dir():
+    return os.path.join(glm52_local_cache_root(), KV_RUNTIME_CACHE_DIR)
+
+
+def ensure_glm52_local_cache_dirs():
+    os.makedirs(glm52_prompt_checkpoints_dir(), exist_ok=True)
+    os.makedirs(glm52_kv_cache_dir(), exist_ok=True)
 
 
 def _is_empty_array(value):
@@ -192,6 +218,14 @@ def _token_list(tokens):
 
 def prompt_prefix_hash(prefix_tokens):
     return _json_hash(_token_list(prefix_tokens))
+
+
+def prompt_checkpoint_file(prefix_tokens):
+    prefix = _token_list(prefix_tokens)
+    return os.path.join(
+        glm52_prompt_checkpoints_dir(),
+        f"{_json_hash(prefix)}-{len(prefix)}.safetensors",
+    )
 
 
 def _model_config_dict(model):
