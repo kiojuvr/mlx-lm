@@ -18,11 +18,14 @@ from mlx_lm.generate import (
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
+    BatchGlmMlaKVCache,
     BatchKVCache,
+    BatchQuantizedGlmMlaKVCache,
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     EMPTY_ARRAYS_METADATA_KEY,
+    GlmMlaKVCache,
     KVCache,
     PROMPT_CHECKPOINT_MAX_BYTES_ENV,
     PROMPT_CHECKPOINT_MAX_FILES_ENV,
@@ -1511,6 +1514,130 @@ class TestPromptCache(unittest.TestCase):
         c2_ex = merged_cache.extract(1)
         self.assertTrue(mx.array_equal(c2_ex[0][0], c2[0][0]))
         self.assertTrue(mx.array_equal(c2_ex[1].state[0], c2[1].state[0]))
+
+    def test_glm_mla_batch_cache_quantizes_and_extracts(self):
+        def fill_cache(cache, length, offset=0):
+            keys = (mx.arange(length * 64, dtype=mx.float32) + offset).reshape(
+                1, 1, length, 64
+            )
+            values = (mx.arange(length * 16, dtype=mx.float32) + offset).reshape(
+                1, 1, length, 16
+            )
+            cache.update_and_fetch(keys / 100, values / 100)
+            mx.eval(cache.state)
+            return cache
+
+        c1 = fill_cache(GlmMlaKVCache(), 3)
+        c2 = fill_cache(GlmMlaKVCache(), 5, offset=1000)
+
+        merged = GlmMlaKVCache.merge([c1, c2])
+        self.assertIsInstance(merged, BatchGlmMlaKVCache)
+        self.assertEqual(merged.size(), 5)
+
+        quantized = merged.to_quantized(group_size=32, bits=8)
+        self.assertIsInstance(quantized, BatchQuantizedGlmMlaKVCache)
+
+        extracted = quantized.extract(1)
+        self.assertIsInstance(extracted, QuantizedGlmMlaKVCache)
+        expected = c2.to_quantized(group_size=32, bits=8)
+        for got, want in zip(extracted.keys, expected.keys):
+            self.assertTrue(mx.array_equal(got, want))
+        self.assertTrue(mx.array_equal(extracted.values, expected.values))
+
+    def test_quantized_glm_mla_batch_cache_merge_filter_extend_extract(self):
+        def fill_quantized(length, offset=0):
+            cache = QuantizedGlmMlaKVCache(group_size=32, bits=8)
+            keys = (mx.arange(length * 64, dtype=mx.float32) + offset).reshape(
+                1, 1, length, 64
+            )
+            values = (mx.arange(length * 16, dtype=mx.float32) + offset).reshape(
+                1, 1, length, 16
+            )
+            cache.update_and_fetch(keys / 100, values / 100)
+            mx.eval(cache.state)
+            return cache
+
+        c1 = fill_quantized(3)
+        c2 = fill_quantized(5, offset=1000)
+        merged = QuantizedGlmMlaKVCache.merge([c1, c2])
+
+        self.assertIsInstance(merged, BatchQuantizedGlmMlaKVCache)
+        self.assertEqual(merged.size(), 5)
+
+        c1_ex = merged.extract(0)
+        for got, want in zip(c1_ex.keys, c1.keys):
+            self.assertTrue(mx.array_equal(got, want[..., : c1.offset, :]))
+        self.assertTrue(mx.array_equal(c1_ex.values, c1.values[..., : c1.offset, :]))
+
+        merged.filter([1])
+        self.assertEqual(merged.size(), 5)
+        c2_ex = merged.extract(0)
+        for got, want in zip(c2_ex.keys, c2.keys):
+            self.assertTrue(mx.array_equal(got, want[..., : c2.offset, :]))
+        self.assertTrue(mx.array_equal(c2_ex.values, c2.values[..., : c2.offset, :]))
+
+        merged.extend(QuantizedGlmMlaKVCache.merge([c1]))
+        c1_ex = merged.extract(1)
+        for got, want in zip(c1_ex.keys, c1.keys):
+            self.assertTrue(mx.array_equal(got, want[..., : c1.offset, :]))
+        self.assertTrue(mx.array_equal(c1_ex.values, c1.values[..., : c1.offset, :]))
+
+    def test_glm_mla_mixed_quantized_batch_extend_rejected(self):
+        fp_cache = GlmMlaKVCache()
+        fp_cache.update_and_fetch(mx.ones((1, 1, 2, 64)), mx.ones((1, 1, 2, 16)))
+        q_cache = GlmMlaKVCache()
+        q_cache.update_and_fetch(mx.ones((1, 1, 3, 64)), mx.ones((1, 1, 3, 16)))
+        q_cache = q_cache.to_quantized(group_size=32, bits=8)
+        mx.eval(fp_cache.state, q_cache.state)
+
+        fp_batch = GlmMlaKVCache.merge([fp_cache])
+        q_batch = QuantizedGlmMlaKVCache.merge([q_cache])
+
+        with self.assertRaisesRegex(ValueError, "Cannot extend BatchGlmMlaKVCache"):
+            fp_batch.extend(q_batch)
+        with self.assertRaisesRegex(
+            ValueError, "Cannot extend BatchQuantizedGlmMlaKVCache"
+        ):
+            q_batch.extend(fp_batch)
+
+    def test_quantized_glm_mla_batch_prepare_finalize_trim_invariants(self):
+        cache = BatchQuantizedGlmMlaKVCache([0, 0], group_size=32, bits=8)
+        keys = mx.zeros((2, 1, 5, 64), dtype=mx.float32)
+        values = mx.zeros((2, 1, 5, 16), dtype=mx.float32)
+        keys[0] = mx.arange(5 * 64, dtype=mx.float32).reshape(1, 5, 64) / 100
+        values[0] = mx.arange(5 * 16, dtype=mx.float32).reshape(1, 5, 16) / 100
+        keys[1, :, :3] = (
+            mx.arange(3 * 64, dtype=mx.float32).reshape(1, 3, 64) + 1000
+        ) / 100
+        values[1, :, :3] = (
+            mx.arange(3 * 16, dtype=mx.float32).reshape(1, 3, 16) + 1000
+        ) / 100
+
+        cache.prepare(lengths=[5, 3], right_padding=[0, 2])
+        cache.update_and_fetch(keys, values)
+        cache.finalize()
+        mx.eval(cache.state)
+
+        self.assertEqual(cache.size(), 5)
+        self.assertEqual(cache.left_padding.tolist(), [0, 2])
+        self.assertEqual(cache.offset.tolist(), [5, 3])
+
+        row_1 = cache.extract(1)
+        expected = QuantizedGlmMlaKVCache(group_size=32, bits=8)
+        expected.update_and_fetch(keys[1:2, :, :3], values[1:2, :, :3])
+        mx.eval(expected.state)
+        for got, want in zip(row_1.keys, expected.keys):
+            self.assertTrue(mx.array_equal(got, want[..., : expected.offset, :]))
+        self.assertTrue(
+            mx.array_equal(row_1.values, expected.values[..., : expected.offset, :])
+        )
+
+        trimmed = cache.trim(1)
+        self.assertEqual(trimmed, 1)
+        self.assertEqual(cache.size(), 4)
+        self.assertEqual(cache.offset.tolist(), [4, 2])
+        row_1 = cache.extract(1)
+        self.assertEqual(row_1.offset, 2)
 
     def test_make_mask_with_cache(self):
         # For 1 time step with no cache, don't need a mask

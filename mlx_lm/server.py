@@ -701,10 +701,14 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
+        kv_bits = self.model_provider.cli_args.kv_bits
+        kv_batchable = kv_bits is None or (
+            kv_bits == 8 and model_has_glm_mla_kv_cache(self.model_provider.model)
+        )
         return (
             self.model_provider.is_batchable
             and args.seed is None
-            and self.model_provider.cli_args.kv_bits is None
+            and kv_batchable
         )
 
     def _generate(self):
@@ -845,6 +849,9 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        kv_bits=self.cli_args.kv_bits,
+                        kv_group_size=self.cli_args.kv_group_size,
+                        quantized_kv_start=self.cli_args.quantized_kv_start,
                         stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))

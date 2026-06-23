@@ -187,21 +187,38 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.kv_group_size, 64)
         self.assertEqual(args.quantized_kv_start, 0)
 
-    def test_kv_bits_uses_single_request_generation_path(self):
+    def test_glm_kv_bits_can_use_batch_generation_path(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         args = types.SimpleNamespace(seed=None)
 
         generator.model_provider = types.SimpleNamespace(
             is_batchable=True,
             cli_args=types.SimpleNamespace(kv_bits=None),
+            model=object(),
         )
         self.assertTrue(generator._is_batchable(args))
 
         generator.model_provider = types.SimpleNamespace(
             is_batchable=True,
             cli_args=types.SimpleNamespace(kv_bits=8),
+            model=object(),
         )
         self.assertFalse(generator._is_batchable(args))
+
+        glm_model = types.SimpleNamespace(
+            config={"model_type": "glm_moe_dsa", "indexer_types": ["full"]},
+            layers=[
+                types.SimpleNamespace(
+                    self_attn=types.SimpleNamespace(skip_topk=False)
+                )
+            ],
+        )
+        generator.model_provider = types.SimpleNamespace(
+            is_batchable=True,
+            cli_args=types.SimpleNamespace(kv_bits=8),
+            model=glm_model,
+        )
+        self.assertTrue(generator._is_batchable(args))
 
     def test_single_request_passes_prompt_checkpoint_coexistence_args(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
