@@ -39,21 +39,34 @@ Example local path when downloaded through LM Studio:
       --top-p 0.95
 ```
 
-### Server example
+### Recommended GLM-5.2 serving settings
+
+For long-running local GLM-5.2 serving on Apple silicon, the recommended starting point is:
 
 ```
-    MLX_METAL_FAST_SYNCH=1 python -m mlx_lm server \
-      --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
-      --host 0.0.0.0 \
-      --port 8000 \
-      --kv-bits 8 \
-      --kv-group-size 64 \
-      --quantized-kv-start 4096 \
-      --temp 0.4 \
-      --top-p 0.95
+MLX_METAL_FAST_SYNCH=1 python -m mlx_lm server \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --temp 0.4 \
+  --top-p 0.95 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 4096 \
+  --prefill-step-size 2048 \
+  --prompt-concurrency 2 \
+  --decode-concurrency 2
 ```
 
 Do not pass `--model-name` for this OpenCode setup unless you have explicitly verified that you need request-facing model-name aliasing. The normal single-model local server workflow loads the model from `--model` and serves OpenCode requests through `/v1/chat/completions`.
+
+`--temp 0.4` and `--top-p 0.95` are recommended as conservative default sampling settings for coding-agent and long-context workflows. In local use, lower-temperature sampling helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
+
+`--kv-bits 8` is not a cold-prefill speedup by itself. Its value is that GLM MLA int8 KV cache can now be used with continuous batching, which makes long-context queued serving more practical and gives memory/concurrency headroom.
+
+Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For this machine, `--prompt-concurrency 2` and `--decode-concurrency 2` were the best default balance. Avoid setting decode concurrency higher than prompt concurrency for fresh long-prefix workloads unless you are comfortable with mixed-cache rejection churn.
+
+Keep prompt checkpointing enabled. It is the dominant TTFT win for repeated prefixes: 4096/8192 exact hits dropped from ~23s/~52s to ~0.2s. **Interpretation** kv_bits=8 does not materially improve cold prefill speed. It helps by enabling continuous batching with long GLM MLA contexts and gives modest memory headroom, especially as contexts grow. It is most useful for long-running local serving where KV memory and concurrency matter. Avoid prompt-concurrency=4 as a default. It barely improves TPS at 4096, but roughly doubles TTFT and adds 6 to 9GB peak memory. Also avoid decode-concurrency > prompt-concurrency for fresh long prefixes unless you are comfortable with mixed-cache rejection churn; q8/p2/c4 hit 90 rejections and p95 wait ~195s. **Bottleneck Hypothesis** The bottleneck is still long-context prefill itself: later 32k chunks climbed to ~40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.
 
 ### OpenCode configuration example
 
