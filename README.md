@@ -19,7 +19,7 @@ This branch is not intended as an upstream `mlx-lm` PR. Several changes intentio
 
 This branch has been tested with:
 
-    avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw
+[avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw)
 
 Example local path when downloaded through LM Studio:
 
