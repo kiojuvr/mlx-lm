@@ -28,15 +28,15 @@ Example local path when downloaded through LM Studio:
 ### Generate example
 
 ```
-    MLX_METAL_FAST_SYNCH=1 python -m mlx_lm generate \
-      --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
-      --prompt "Hello. Briefly introduce yourself." \
-      --max-tokens 32 \
-      --kv-bits 8 \
-      --kv-group-size 64 \
-      --quantized-kv-start 4096 \
-      --temp 0.4 \
-      --top-p 0.95
+MLX_METAL_FAST_SYNCH=1 python -m mlx_lm generate \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --prompt "Hello. Briefly introduce yourself." \
+  --max-tokens 32 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 4096 \
+  --temp 0.4 \
+  --top-p 0.95
 ```
 
 ### Recommended GLM-5.2 serving settings
