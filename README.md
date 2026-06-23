@@ -62,6 +62,16 @@ When changing model weights, quantization, tokenizer, adapters, GLM implementati
     mv ~/.cache/mlx-lm/glm52-local \
        ~/.cache/mlx-lm/glm52-local.bak.$(date +%Y%m%d_%H%M%S)
 
+#### Prompt checkpoint retention limits
+
+The prompt checkpoint manifest/pruning layer uses these default limits:
+
+    MLX_LM_PROMPT_CHECKPOINT_MAX_FILES=256
+    MLX_LM_PROMPT_CHECKPOINT_MAX_BYTES=128GiB
+    MLX_LM_PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN=16
+
+They bound checkpoint file count, total checkpoint storage, and frontier checkpoint saves per generation run.
+
 ### Important limitations
 
 - This is a GLM-5.2-specialized fork, not a generic `mlx-lm` runtime.
