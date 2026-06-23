@@ -27,6 +27,7 @@ Example local path when downloaded through LM Studio:
 
 ### Generate example
 
+```
     MLX_METAL_FAST_SYNCH=1 python -m mlx_lm generate \
       --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
       --prompt "Hello. Briefly introduce yourself." \
@@ -36,9 +37,11 @@ Example local path when downloaded through LM Studio:
       --quantized-kv-start 4096 \
       --temp 0.4 \
       --top-p 0.95
+```
 
 ### Server example
 
+```
     MLX_METAL_FAST_SYNCH=1 python -m mlx_lm server \
       --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
       --host 0.0.0.0 \
@@ -48,6 +51,41 @@ Example local path when downloaded through LM Studio:
       --quantized-kv-start 4096 \
       --temp 0.4 \
       --top-p 0.95
+```
+
+Do not pass `--model-name` for this OpenCode setup unless you have explicitly verified that you need request-facing model-name aliasing. The normal single-model local server workflow loads the model from `--model` and serves OpenCode requests through `/v1/chat/completions`.
+
+### OpenCode configuration example
+
+OpenCode can use the local `mlx-lm` server through the OpenAI-compatible provider.
+
+Example `opencode.json` provider entry:
+
+```
+"mlx-lm": {
+  "name": "mlx-lm (local)",
+  "npm": "@ai-sdk/openai-compatible",
+  "options": {
+    "baseURL": "http://mac-studio:8000/v1",
+    "apiKey": "mlx-lm",
+    "timeout": 7200000,
+    "chunkTimeout": 7200000
+  },
+  "models": {
+    "default_model": {
+      "name": "GLM-5.2-Alis-MLX-Dynamic-3.5bpw",
+      "limit": {
+        "context": 1048576,
+        "output": 384000
+      }
+    }
+  }
+}
+```
+
+In this configuration, OpenCode sends requests using the model key `default_model`. The `name` field is a display label for the local GLM-5.2 model.
+
+Do not add numeric sampling parameters such as `temperature` or `top_p` under `models.default_model`. OpenCode expects `provider.<name>.models.<model>.temperature` to be a boolean or omitted, so numeric values there make the configuration invalid.
 
 ### Local runtime cache
 
