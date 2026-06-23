@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import time
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,12 @@ GLM52_LOCAL_CACHE_ROOT = os.path.join(
 PROMPT_CHECKPOINTS_CACHE_DIR = "prompt-checkpoints"
 KV_RUNTIME_CACHE_DIR = "kv"
 EMPTY_ARRAYS_METADATA_KEY = "__mlx_lm_prompt_cache_empty_arrays_v1__"
+PROMPT_CHECKPOINT_MANIFEST_NAME = "manifest.json"
+PROMPT_CHECKPOINT_MANIFEST_VERSION = 1
+PROMPT_CHECKPOINT_MAX_FILES_ENV = "MLX_LM_PROMPT_CHECKPOINT_MAX_FILES"
+PROMPT_CHECKPOINT_MAX_BYTES_ENV = "MLX_LM_PROMPT_CHECKPOINT_MAX_BYTES"
+DEFAULT_PROMPT_CHECKPOINT_MAX_FILES = 256
+DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES = 128 * 1024**3
 
 _CHECKPOINT_REQUIRED_METADATA_KEYS = (
     "checkpoint_format",
@@ -60,6 +67,10 @@ def glm52_local_cache_root():
 
 def glm52_prompt_checkpoints_dir():
     return os.path.join(glm52_local_cache_root(), PROMPT_CHECKPOINTS_CACHE_DIR)
+
+
+def prompt_checkpoint_manifest_file():
+    return os.path.join(glm52_prompt_checkpoints_dir(), PROMPT_CHECKPOINT_MANIFEST_NAME)
 
 
 def glm52_kv_cache_dir():
@@ -251,6 +262,390 @@ def _parse_prompt_checkpoint_name(name):
     return hash_part, prefix_length
 
 
+_PROMPT_CHECKPOINT_MANIFEST_KINDS = {"exact", "prefix", "frontier", "unknown"}
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _safe_manifest_int(value, default=0):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _safe_manifest_float(value, default=None):
+    if value is None:
+        return default
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _empty_prompt_checkpoint_manifest():
+    return {"version": PROMPT_CHECKPOINT_MANIFEST_VERSION, "entries": {}}
+
+
+def _manifest_metadata_identity(metadata):
+    if not metadata:
+        return {}
+    identity = {}
+    for key in (
+        "checkpoint_namespace",
+        "checkpoint_model_hint_hash",
+        "checkpoint_tokenizer_hint_hash",
+        "checkpoint_glm_mla_kv_quantization",
+        "checkpoint_glm_mla_kv_settings",
+    ):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        identity[key] = str(value)
+        identity[f"{key}_hash"] = hashlib.sha256(
+            str(value).encode("utf-8")
+        ).hexdigest()
+    return identity
+
+
+def _normalize_manifest_entry(filename, entry):
+    if not isinstance(entry, dict):
+        return None
+    filename = str(entry.get("filename", filename))
+    if filename != os.path.basename(filename):
+        return None
+    parsed = _parse_prompt_checkpoint_name(filename)
+    if parsed is None:
+        return None
+    _, parsed_prefix_length = parsed
+    prefix_length = _safe_manifest_int(
+        entry.get("prefix_length"),
+        parsed_prefix_length,
+    )
+    if prefix_length != parsed_prefix_length:
+        return None
+    kind = str(entry.get("kind", "unknown"))
+    if kind not in _PROMPT_CHECKPOINT_MANIFEST_KINDS:
+        kind = "unknown"
+    created_at = _safe_manifest_float(entry.get("created_at"), None)
+    if created_at is None:
+        created_at = _safe_manifest_float(entry.get("mtime"), time.time())
+    normalized = {
+        "filename": filename,
+        "prefix_length": prefix_length,
+        "kind": kind,
+        "created_at": created_at,
+        "last_hit_at": _safe_manifest_float(entry.get("last_hit_at"), None),
+        "hit_count": _safe_manifest_int(entry.get("hit_count"), 0),
+        "size_bytes": _safe_manifest_int(entry.get("size_bytes"), 0),
+    }
+    for key in (
+        "checkpoint_namespace",
+        "checkpoint_model_hint_hash",
+        "checkpoint_tokenizer_hint_hash",
+        "checkpoint_glm_mla_kv_quantization",
+        "checkpoint_glm_mla_kv_quantization_hash",
+        "checkpoint_glm_mla_kv_settings",
+        "checkpoint_glm_mla_kv_settings_hash",
+    ):
+        if key in entry and entry[key] is not None:
+            normalized[key] = str(entry[key])
+    return normalized
+
+
+def load_prompt_checkpoint_manifest(return_stats=False):
+    stats = {
+        "loaded": False,
+        "missing": False,
+        "malformed": False,
+        "entries": 0,
+        "malformed_entries": 0,
+    }
+    try:
+        with open(prompt_checkpoint_manifest_file(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        stats["missing"] = True
+        manifest = _empty_prompt_checkpoint_manifest()
+        return (manifest, stats) if return_stats else manifest
+    except (OSError, json.JSONDecodeError, TypeError):
+        stats["malformed"] = True
+        manifest = _empty_prompt_checkpoint_manifest()
+        return (manifest, stats) if return_stats else manifest
+
+    if (
+        not isinstance(raw, dict)
+        or raw.get("version") != PROMPT_CHECKPOINT_MANIFEST_VERSION
+        or not isinstance(raw.get("entries"), dict)
+    ):
+        stats["malformed"] = True
+        manifest = _empty_prompt_checkpoint_manifest()
+        return (manifest, stats) if return_stats else manifest
+
+    manifest = _empty_prompt_checkpoint_manifest()
+    for filename, entry in raw["entries"].items():
+        normalized = _normalize_manifest_entry(filename, entry)
+        if normalized is None:
+            stats["malformed_entries"] += 1
+            continue
+        manifest["entries"][normalized["filename"]] = normalized
+    stats["loaded"] = True
+    stats["entries"] = len(manifest["entries"])
+    return (manifest, stats) if return_stats else manifest
+
+
+def save_prompt_checkpoint_manifest(manifest):
+    ensure_glm52_local_cache_dirs()
+    tmp_file = prompt_checkpoint_manifest_file() + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, sort_keys=True, separators=(",", ":"))
+    os.replace(tmp_file, prompt_checkpoint_manifest_file())
+
+
+def _manifest_entry_from_file(filename, *, kind="unknown", metadata=None):
+    filename = os.path.basename(filename)
+    parsed = _parse_prompt_checkpoint_name(filename)
+    if parsed is None:
+        return None
+    _, prefix_length = parsed
+    file_path = os.path.join(glm52_prompt_checkpoints_dir(), filename)
+    try:
+        stat = os.stat(file_path)
+    except OSError:
+        return None
+    created_at = getattr(stat, "st_birthtime", stat.st_mtime)
+    if kind not in _PROMPT_CHECKPOINT_MANIFEST_KINDS:
+        kind = "unknown"
+    entry = {
+        "filename": filename,
+        "prefix_length": prefix_length,
+        "kind": kind,
+        "created_at": created_at,
+        "last_hit_at": None,
+        "hit_count": 0,
+        "size_bytes": int(stat.st_size),
+    }
+    entry.update(_manifest_metadata_identity(metadata))
+    return entry
+
+
+def _bootstrap_prompt_checkpoint_manifest():
+    manifest = _empty_prompt_checkpoint_manifest()
+    stats = {
+        "filesystem_scanned": 0,
+        "bootstrapped_entries": 0,
+    }
+    try:
+        names = os.listdir(glm52_prompt_checkpoints_dir())
+    except OSError:
+        return manifest, stats
+    for name in names:
+        stats["filesystem_scanned"] += 1
+        entry = _manifest_entry_from_file(name)
+        if entry is None:
+            continue
+        manifest["entries"][entry["filename"]] = entry
+    stats["bootstrapped_entries"] = len(manifest["entries"])
+    return manifest, stats
+
+
+def sync_prompt_checkpoint_manifest(*, bootstrap=False):
+    manifest, stats = load_prompt_checkpoint_manifest(return_stats=True)
+    stats.update(
+        {
+            "bootstrap": False,
+            "filesystem_scanned": 0,
+            "bootstrapped_entries": 0,
+            "missing_entries_removed": 0,
+            "size_updates": 0,
+            "saved": False,
+            "save_failed": False,
+        }
+    )
+    changed = stats["malformed_entries"] > 0
+    if bootstrap and (stats["missing"] or stats["malformed"]):
+        manifest, bootstrap_stats = _bootstrap_prompt_checkpoint_manifest()
+        stats["bootstrap"] = True
+        stats["filesystem_scanned"] = bootstrap_stats["filesystem_scanned"]
+        stats["bootstrapped_entries"] = bootstrap_stats["bootstrapped_entries"]
+        changed = len(manifest["entries"]) > 0 or stats["malformed"]
+
+    for filename in list(manifest["entries"]):
+        file_path = os.path.join(glm52_prompt_checkpoints_dir(), filename)
+        try:
+            stat = os.stat(file_path)
+        except OSError:
+            del manifest["entries"][filename]
+            stats["missing_entries_removed"] += 1
+            changed = True
+            continue
+        size_bytes = int(stat.st_size)
+        if manifest["entries"][filename].get("size_bytes") != size_bytes:
+            manifest["entries"][filename]["size_bytes"] = size_bytes
+            stats["size_updates"] += 1
+            changed = True
+
+    stats["entries"] = len(manifest["entries"])
+    if changed:
+        try:
+            save_prompt_checkpoint_manifest(manifest)
+            stats["saved"] = True
+        except OSError:
+            stats["save_failed"] = True
+    return manifest, stats
+
+
+def update_prompt_checkpoint_manifest(
+    file_name,
+    *,
+    prefix_length,
+    kind,
+    metadata=None,
+    hit=False,
+):
+    manifest, stats = load_prompt_checkpoint_manifest(return_stats=True)
+    if stats["malformed"]:
+        manifest = _empty_prompt_checkpoint_manifest()
+    filename = os.path.basename(file_name)
+    entry = _manifest_entry_from_file(filename, kind=kind, metadata=metadata)
+    if entry is None:
+        raise OSError("checkpoint file is missing or malformed")
+    if int(prefix_length) != entry["prefix_length"]:
+        raise OSError("checkpoint prefix length does not match manifest entry")
+
+    now = time.time()
+    old_entry = manifest["entries"].get(filename)
+    if old_entry is not None:
+        entry["created_at"] = old_entry.get("created_at", entry["created_at"])
+        entry["hit_count"] = _safe_manifest_int(old_entry.get("hit_count"), 0)
+        entry["last_hit_at"] = old_entry.get("last_hit_at")
+    if hit:
+        entry["hit_count"] += 1
+        entry["last_hit_at"] = now
+    manifest["entries"][filename] = entry
+    save_prompt_checkpoint_manifest(manifest)
+    return {
+        "filename": filename,
+        "entries": len(manifest["entries"]),
+        "kind": entry["kind"],
+        "size_bytes": entry["size_bytes"],
+        "hit_count": entry["hit_count"],
+        "manifest_was_malformed": stats["malformed"],
+    }
+
+
+def prompt_checkpoint_budget_from_env():
+    return {
+        "max_files": _env_int(
+            PROMPT_CHECKPOINT_MAX_FILES_ENV,
+            DEFAULT_PROMPT_CHECKPOINT_MAX_FILES,
+        ),
+        "max_bytes": _env_int(
+            PROMPT_CHECKPOINT_MAX_BYTES_ENV,
+            DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES,
+        ),
+    }
+
+
+def _prompt_checkpoint_prune_key(entry):
+    kind_rank = {
+        "exact": 0,
+        "unknown": 1,
+        "prefix": 2,
+        "frontier": 3,
+    }.get(entry.get("kind"), 1)
+    hit_count = _safe_manifest_int(entry.get("hit_count"), 0)
+    used_at = _safe_manifest_float(entry.get("last_hit_at"), None)
+    if used_at is None:
+        used_at = _safe_manifest_float(entry.get("created_at"), 0)
+    prefix_length = _safe_manifest_int(entry.get("prefix_length"), 0)
+    return (kind_rank, hit_count, used_at, prefix_length)
+
+
+def prune_prompt_checkpoints(
+    *,
+    max_files=None,
+    max_bytes=None,
+    protected_files=None,
+):
+    if max_files is None or max_bytes is None:
+        budget = prompt_checkpoint_budget_from_env()
+        if max_files is None:
+            max_files = budget["max_files"]
+        if max_bytes is None:
+            max_bytes = budget["max_bytes"]
+    max_files = _safe_manifest_int(max_files, 0)
+    max_bytes = _safe_manifest_int(max_bytes, 0)
+    protected = {os.path.basename(f) for f in (protected_files or [])}
+
+    manifest, sync_stats = sync_prompt_checkpoint_manifest(bootstrap=True)
+    entries = manifest["entries"]
+    total_bytes = sum(_safe_manifest_int(e.get("size_bytes"), 0) for e in entries.values())
+    removed = []
+    changed = False
+
+    def over_budget():
+        return (
+            (max_files > 0 and len(entries) > max_files)
+            or (max_bytes > 0 and total_bytes > max_bytes)
+        )
+
+    while over_budget():
+        victims = [
+            entry
+            for entry in entries.values()
+            if entry["filename"] not in protected
+        ]
+        if not victims:
+            break
+        victim = min(victims, key=_prompt_checkpoint_prune_key)
+        filename = victim["filename"]
+        file_path = os.path.join(glm52_prompt_checkpoints_dir(), filename)
+        try:
+            os.remove(file_path)
+            removed_status = "removed"
+        except FileNotFoundError:
+            removed_status = "missing"
+        except OSError:
+            break
+        removed.append(
+            {
+                "filename": filename,
+                "kind": victim.get("kind", "unknown"),
+                "prefix_length": victim.get("prefix_length", 0),
+                "size_bytes": victim.get("size_bytes", 0),
+                "status": removed_status,
+            }
+        )
+        total_bytes -= _safe_manifest_int(victim.get("size_bytes"), 0)
+        del entries[filename]
+        changed = True
+
+    if changed or sync_stats.get("saved"):
+        save_prompt_checkpoint_manifest(manifest)
+
+    return {
+        "max_files": max_files,
+        "max_bytes": max_bytes,
+        "total_files": len(entries),
+        "total_bytes": total_bytes,
+        "removed": removed,
+        "protected_files": sorted(protected),
+        "sync": sync_stats,
+    }
+
+
 def find_prompt_checkpoint_prefix(
     prefix_tokens,
     *,
@@ -272,14 +667,26 @@ def find_prompt_checkpoint_prefix(
         "candidate_lengths_scanned": 0,
         "prefix_hashes_computed": 0,
         "matched_candidates": 0,
+        "manifest_entries": 0,
+        "manifest_loaded": False,
+        "manifest_missing": False,
+        "manifest_malformed": False,
+        "manifest_bootstrap": False,
+        "manifest_missing_entries_removed": 0,
     }
-    try:
-        names = os.listdir(glm52_prompt_checkpoints_dir())
-    except OSError:
-        return ([], stats) if return_stats else []
+    manifest, manifest_stats = sync_prompt_checkpoint_manifest(bootstrap=True)
+    stats["manifest_entries"] = len(manifest["entries"])
+    stats["manifest_loaded"] = manifest_stats.get("loaded", False)
+    stats["manifest_missing"] = manifest_stats.get("missing", False)
+    stats["manifest_malformed"] = manifest_stats.get("malformed", False)
+    stats["manifest_bootstrap"] = manifest_stats.get("bootstrap", False)
+    stats["manifest_missing_entries_removed"] = manifest_stats.get(
+        "missing_entries_removed",
+        0,
+    )
 
     by_length = {}
-    for name in names:
+    for name in manifest["entries"]:
         stats["files_scanned"] += 1
         parsed = _parse_prompt_checkpoint_name(name)
         if parsed is None:
@@ -643,6 +1050,7 @@ def save_prompt_checkpoint(
         metadata=metadata,
     )
     save_prompt_cache(file_name, cache, checkpoint_metadata)
+    return checkpoint_metadata
 
 
 def _require_metadata(metadata, key):

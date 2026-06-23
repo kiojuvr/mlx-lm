@@ -59,6 +59,10 @@ DEFAULT_QUANTIZED_KV_START = 5000
 PROMPT_CHECKPOINT_DEBUG_ENV = "MLX_LM_PROMPT_CHECKPOINT_DEBUG"
 PROMPT_CHECKPOINT_FRONTIER_MIN_TOKENS = 8192
 PROMPT_CHECKPOINT_FRONTIER_STRIDE_TOKENS = 16384
+PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN_ENV = (
+    "MLX_LM_PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN"
+)
+PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN = 16
 
 
 def _prompt_checkpoint_debug(message):
@@ -121,6 +125,29 @@ def _checkpoint_frontier_lengths(
         if length >= first:
             frontiers.add(length)
     return sorted(frontiers)
+
+
+def _prompt_checkpoint_env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _checkpoint_limit_frontier_lengths(lengths, max_frontiers):
+    if max_frontiers is None or max_frontiers < 0 or len(lengths) <= max_frontiers:
+        return list(lengths)
+    if max_frontiers == 0:
+        return []
+    if max_frontiers == 1:
+        return [lengths[-1]]
+    limited = [lengths[0]]
+    limited.extend(lengths[-(max_frontiers - 1) :])
+    return sorted(set(limited))
 
 
 def str2bool(string):
@@ -501,6 +528,12 @@ def generate_step(
         "candidate_lengths_scanned": 0,
         "prefix_hashes_computed": 0,
         "matched_candidates": 0,
+        "manifest_entries": 0,
+        "manifest_loaded": False,
+        "manifest_missing": False,
+        "manifest_malformed": False,
+        "manifest_bootstrap": False,
+        "manifest_missing_entries_removed": 0,
     }
     prompt_checkpoint_lookup_seconds = 0.0
     prompt_checkpoint_initial_cached_tokens = max(
@@ -583,6 +616,10 @@ def generate_step(
             f"candidate_lengths={prompt_checkpoint_lookup_stats['candidate_lengths_scanned']} "
             f"matched_candidates={prompt_checkpoint_lookup_stats['matched_candidates']} "
             f"prefix_hashes={prompt_checkpoint_lookup_stats['prefix_hashes_computed']} "
+            f"manifest_entries={prompt_checkpoint_lookup_stats.get('manifest_entries', 0)} "
+            f"manifest_loaded={int(prompt_checkpoint_lookup_stats.get('manifest_loaded', False))} "
+            f"manifest_bootstrap={int(prompt_checkpoint_lookup_stats.get('manifest_bootstrap', False))} "
+            f"manifest_missing_entries_removed={prompt_checkpoint_lookup_stats.get('manifest_missing_entries_removed', 0)} "
             f"lookup_seconds={prompt_checkpoint_lookup_seconds:.6f}"
         )
         candidates = [
@@ -655,6 +692,27 @@ def generate_step(
                         f"cached_tokens={prompt_checkpoint_cached_tokens} "
                         f"load_seconds={load_seconds:.6f}"
                     )
+                    try:
+                        manifest_report = cache.update_prompt_checkpoint_manifest(
+                            candidate_path,
+                            prefix_length=candidate_length,
+                            kind=prompt_checkpoint_hit_kind,
+                            metadata=checkpoint_metadata,
+                            hit=True,
+                        )
+                        _prompt_checkpoint_debug(
+                            "manifest hit update "
+                            f"file={candidate_basename} "
+                            f"kind={manifest_report['kind']} "
+                            f"hit_count={manifest_report['hit_count']} "
+                            f"entries={manifest_report['entries']}"
+                        )
+                    except Exception as exc:
+                        _prompt_checkpoint_debug(
+                            "manifest hit update failure swallowed "
+                            f"file={candidate_basename} "
+                            f"error={type(exc).__name__}"
+                        )
                     break
                 except cache.PromptCacheCheckpointError:
                     load_seconds = time.perf_counter() - load_t0
@@ -710,6 +768,8 @@ def generate_step(
         f"files_scanned={prompt_checkpoint_lookup_stats['files_scanned']} "
         f"candidates_scanned={prompt_checkpoint_lookup_stats['candidate_files_scanned']} "
         f"matched_candidates={prompt_checkpoint_lookup_stats['matched_candidates']} "
+        f"manifest_entries={prompt_checkpoint_lookup_stats.get('manifest_entries', 0)} "
+        f"manifest_bootstrap={int(prompt_checkpoint_lookup_stats.get('manifest_bootstrap', False))} "
         f"lookup_seconds={prompt_checkpoint_lookup_seconds:.6f}"
     )
 
@@ -734,11 +794,27 @@ def generate_step(
     prompt_checkpoint_pending_store_lengths = []
     prompt_checkpoint_store_labels = {}
     if prompt_checkpoint_path is not None and prompt_checkpoint_exact_tokens is not None:
-        for length in _checkpoint_frontier_lengths(
+        prompt_checkpoint_frontier_lengths = _checkpoint_frontier_lengths(
             total_prompt_tokens,
             prompt_checkpoint_frontier_min_tokens,
             prompt_checkpoint_frontier_stride_tokens,
-        ):
+        )
+        max_frontiers = _prompt_checkpoint_env_int(
+            PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN_ENV,
+            PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN,
+        )
+        limited_frontier_lengths = _checkpoint_limit_frontier_lengths(
+            prompt_checkpoint_frontier_lengths,
+            max_frontiers,
+        )
+        if len(limited_frontier_lengths) != len(prompt_checkpoint_frontier_lengths):
+            _prompt_checkpoint_debug(
+                "frontier schedule capped "
+                f"requested={len(prompt_checkpoint_frontier_lengths)} "
+                f"scheduled={len(limited_frontier_lengths)} "
+                f"max_frontiers={max_frontiers}"
+            )
+        for length in limited_frontier_lengths:
             prompt_checkpoint_store_labels[length] = "frontier"
         for length in _checkpoint_store_lengths(
             prompt_checkpoint_store_prefix_lengths,
@@ -756,11 +832,145 @@ def generate_step(
                 f"prefix_lengths={prompt_checkpoint_pending_store_lengths}"
             )
 
+    def _expected_checkpoint_metadata(prefix_length):
+        checkpoint_cache_token_length = (
+            prefix_length - 1
+            if prefix_length == total_prompt_tokens
+            else prefix_length
+        )
+        return (
+            cache.expected_glm_mla_kv_quantization_metadata(
+                model,
+                cache_token_length=checkpoint_cache_token_length,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+            ),
+            cache.expected_glm_mla_kv_settings_metadata(
+                model,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+            ),
+        )
+
+    def _update_manifest_for_checkpoint(
+        checkpoint_path,
+        prefix_length,
+        label,
+        checkpoint_metadata,
+        *,
+        hit=False,
+    ):
+        basename = os.path.basename(checkpoint_path)
+        try:
+            manifest_report = cache.update_prompt_checkpoint_manifest(
+                checkpoint_path,
+                prefix_length=prefix_length,
+                kind=label,
+                metadata=checkpoint_metadata,
+                hit=hit,
+            )
+            _prompt_checkpoint_debug(
+                "manifest update "
+                f"file={basename} "
+                f"kind={manifest_report['kind']} "
+                f"entries={manifest_report['entries']} "
+                f"size_bytes={manifest_report['size_bytes']} "
+                f"hit_count={manifest_report['hit_count']}"
+            )
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "manifest update failure swallowed "
+                f"file={basename} "
+                f"kind={label} "
+                f"error={type(exc).__name__}"
+            )
+
+    def _prune_prompt_checkpoints(checkpoint_path, label):
+        basename = os.path.basename(checkpoint_path)
+        protected_files = [basename] if label in ("frontier", "prefix") else []
+        try:
+            prune_report = cache.prune_prompt_checkpoints(
+                protected_files=protected_files
+            )
+            removed = prune_report["removed"]
+            _prompt_checkpoint_debug(
+                "manifest prune "
+                f"removed={len(removed)} "
+                f"total_files={prune_report['total_files']} "
+                f"total_bytes={prune_report['total_bytes']} "
+                f"max_files={prune_report['max_files']} "
+                f"max_bytes={prune_report['max_bytes']} "
+                f"protected={len(protected_files)}"
+            )
+            for removed_entry in removed[:8]:
+                _prompt_checkpoint_debug(
+                    "manifest prune removed "
+                    f"file={removed_entry['filename']} "
+                    f"kind={removed_entry['kind']} "
+                    f"prefix_length={removed_entry['prefix_length']} "
+                    f"size_bytes={removed_entry['size_bytes']} "
+                    f"status={removed_entry['status']}"
+                )
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "manifest prune failure swallowed "
+                f"file={basename} "
+                f"kind={label} "
+                f"error={type(exc).__name__}"
+            )
+
+    def _existing_frontier_checkpoint_is_valid(prefix_tokens, checkpoint_path, label):
+        if label != "frontier" or not os.path.exists(checkpoint_path):
+            return False
+        prefix_length = len(prefix_tokens)
+        expected_quantization, expected_settings = _expected_checkpoint_metadata(
+            prefix_length
+        )
+        basename = os.path.basename(checkpoint_path)
+        try:
+            _, checkpoint_metadata = cache.load_prompt_checkpoint(
+                checkpoint_path,
+                prefix_tokens=prefix_tokens,
+                checkpoint_namespace=cache.DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                model=model,
+                expected_glm_mla_kv_quantization=expected_quantization,
+                expected_glm_mla_kv_settings=expected_settings,
+                return_metadata=True,
+            )
+        except cache.PromptCacheCheckpointError:
+            _prompt_checkpoint_debug(
+                "save frontier existing rejected "
+                f"file={basename} "
+                f"prefix_length={prefix_length}"
+            )
+            return False
+        _prompt_checkpoint_debug(
+            "save frontier skipped existing valid "
+            f"file={basename} "
+            f"prefix_length={prefix_length}"
+        )
+        _update_manifest_for_checkpoint(
+            checkpoint_path,
+            prefix_length,
+            label,
+            checkpoint_metadata,
+        )
+        _prune_prompt_checkpoints(checkpoint_path, label)
+        return True
+
     def _save_prompt_checkpoint(prefix_tokens, checkpoint_path, label):
+        if _existing_frontier_checkpoint_is_valid(
+            prefix_tokens,
+            checkpoint_path,
+            label,
+        ):
+            return True
         save_t0 = time.perf_counter()
         try:
             cache.ensure_glm52_local_cache_dirs()
-            cache.save_prompt_checkpoint(
+            checkpoint_metadata = cache.save_prompt_checkpoint(
                 checkpoint_path,
                 prompt_cache,
                 prefix_tokens=prefix_tokens,
@@ -778,6 +988,13 @@ def generate_step(
                 f"prefix_length={len(prefix_tokens)} "
                 f"save_seconds={save_seconds:.6f}"
             )
+            _update_manifest_for_checkpoint(
+                checkpoint_path,
+                len(prefix_tokens),
+                label,
+                checkpoint_metadata,
+            )
+            _prune_prompt_checkpoints(checkpoint_path, label)
             return True
         except Exception as exc:
             save_seconds = time.perf_counter() - save_t0
