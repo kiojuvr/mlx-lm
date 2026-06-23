@@ -33,7 +33,9 @@ Example local path when downloaded through LM Studio:
       --max-tokens 32 \
       --kv-bits 8 \
       --kv-group-size 64 \
-      --quantized-kv-start 4096
+      --quantized-kv-start 4096 \
+      --temp 0.2 \
+      --top-p 0.95
 
 ### Server example
 
@@ -43,7 +45,9 @@ Example local path when downloaded through LM Studio:
       --port 8000 \
       --kv-bits 8 \
       --kv-group-size 64 \
-      --quantized-kv-start 4096
+      --quantized-kv-start 4096 \
+      --temp 0.2 \
+      --top-p 0.95
 
 ### Local runtime cache
 
