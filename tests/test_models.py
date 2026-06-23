@@ -10,6 +10,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    BatchQuantizedGlmMlaKVCache,
     CacheList,
     GlmMlaKVCache,
     KVCache,
@@ -1490,7 +1491,7 @@ class TestModels(unittest.TestCase):
         mx.eval([c.state for c in cache])
 
     def test_glm_moe_dsa_mla_int8_kv_cache(self):
-        from mlx_lm.generate import generate_step
+        from mlx_lm.generate import BatchGenerator, generate_step
         from mlx_lm.models import glm_moe_dsa
 
         args = glm_moe_dsa.ModelArgs(
@@ -1594,6 +1595,128 @@ class TestModels(unittest.TestCase):
                 self.assertIsInstance(layer_cache[1], KVCache)
                 self.assertEqual(layer_cache[1].keys.dtype, mx.float16)
                 self.assertEqual(layer_cache[1].values.dtype, mx.float16)
+
+        batch_prompts = [[1, 2, 3, 4, 5], [1, 3, 5]]
+        batch_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            prefill_batch_size=2,
+            completion_batch_size=2,
+            prefill_step_size=4,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        uids = batch_gen.insert(batch_prompts)
+        batch_outputs = batch_gen.next_generated()
+        self.assertEqual(len(batch_outputs), 2)
+        batch_by_uid = {response.uid: response for response in batch_outputs}
+        for response in batch_outputs:
+            self.assertEqual(response.finish_reason, "length")
+            self.assertTrue(mx.all(mx.isfinite(response.logprobs)).item())
+            for layer_cache in response.prompt_cache:
+                self.assertIsInstance(layer_cache[0], QuantizedGlmMlaKVCache)
+                self.assertEqual(layer_cache[0].bits, 8)
+                self.assertEqual(layer_cache[0].group_size, 64)
+                if len(layer_cache.caches) > 1:
+                    self.assertIsInstance(layer_cache[1], KVCache)
+
+        for uid, batch_prompt in zip(uids, batch_prompts):
+            single_cache = make_prompt_cache(model)
+            (single_token, single_logprobs) = next(
+                generate_step(
+                    mx.array(batch_prompt),
+                    model,
+                    max_tokens=1,
+                    prompt_cache=single_cache,
+                    kv_bits=8,
+                    kv_group_size=64,
+                    quantized_kv_start=0,
+                    prompt_checkpoint=False,
+                )
+            )
+            batch_response = batch_by_uid[uid]
+            self.assertEqual(batch_response.token, single_token)
+            self.assertTrue(
+                mx.allclose(batch_response.logprobs, single_logprobs, rtol=4e-2)
+            )
+
+        guarded_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            prefill_batch_size=2,
+            completion_batch_size=2,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        guarded_gen._generation_batch.prompt_cache = [
+            CacheList(BatchQuantizedGlmMlaKVCache([0], group_size=64, bits=8))
+        ]
+        guarded_gen.insert([[1, 2, 3]])
+        selected = guarded_gen._select_compatible_sequences(1)
+        self.assertEqual(selected, [])
+        self.assertEqual(len(guarded_gen._unprocessed_sequences), 1)
+        self.assertEqual(
+            guarded_gen.admission_stats[
+                "glm_mla_quantized_batch_rejected_mixed_cache"
+            ],
+            1,
+        )
+        self.assertEqual(
+            guarded_gen.admission_stats["glm_mla_waited_for_compatible_batch"],
+            1,
+        )
+
+        bypass_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            prefill_batch_size=2,
+            completion_batch_size=2,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        bypass_gen._generation_batch.prompt_cache = [
+            CacheList(BatchQuantizedGlmMlaKVCache([0], group_size=64, bits=8))
+        ]
+        fp_uid = bypass_gen.insert([[1, 2, 3]])[0]
+        quantized_prompt_cache = []
+        for layer_cache in make_prompt_cache(model):
+            quantized_prompt_cache.append(
+                CacheList(
+                    QuantizedGlmMlaKVCache(group_size=64, bits=8),
+                    *[copy.deepcopy(c) for c in layer_cache.caches[1:]],
+                )
+            )
+        quantized_uid = bypass_gen.insert_segments(
+            [[[1, 2, 3]]],
+            caches=[quantized_prompt_cache],
+        )[0]
+        selected = bypass_gen._select_compatible_sequences(2)
+        self.assertEqual([sequence[0] for sequence in selected], [quantized_uid])
+        self.assertEqual(
+            [sequence[0] for sequence in bypass_gen._unprocessed_sequences],
+            [fp_uid],
+        )
+        self.assertEqual(
+            bypass_gen.admission_stats[
+                "glm_mla_quantized_batch_rejected_mixed_cache"
+            ],
+            1,
+        )
+        self.assertEqual(
+            bypass_gen.admission_stats["glm_mla_waited_for_compatible_batch"],
+            1,
+        )
+        self.assertEqual(
+            bypass_gen.admission_stats["glm_mla_quantized_batch_admitted"],
+            1,
+        )
+        self.assertEqual(
+            [event["event"] for event in bypass_gen._admission_events],
+            ["rejected_mixed_cache", "admitted"],
+        )
 
     def test_gemma2(self):
         from mlx_lm.models import gemma2

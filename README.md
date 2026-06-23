@@ -119,10 +119,15 @@ They bound checkpoint file count, total checkpoint storage, and frontier checkpo
 - This is a GLM-5.2-specialized fork, not a generic `mlx-lm` runtime.
 - GLM MLA KV quantization currently supports only `--kv-bits 8`.
 - DSA indexer cache remains floating-point and is intentionally not quantized.
-- With `--kv-bits` enabled, the server uses the single-request `stream_generate` path instead of the existing `BatchGenerator` path. This preserves correctness for the first GLM MLA int8 KV implementation, but server batching / prompt batching benefits are not used in this mode.
+- With GLM MLA `--kv-bits 8`, the server can use the continuous `BatchGenerator` path. It will not merge quantized and unquantized GLM MLA caches in the same active batch, so fresh short requests may wait for an incompatible quantized batch instead of being quantized earlier than `--quantized-kv-start`. Compatible queued requests can still bypass that waiting request and join the active batch.
+- Other model families with `--kv-bits` still use the single-request `stream_generate` path unless they grow batch-compatible quantized cache support.
 - Prompt checkpointing is trusted single-model local cache reuse. It validates prefix, cache structure, GLM DSA metadata, and GLM MLA KV settings, but it does not prove full model weight, tokenizer, adapter, or artifact identity.
 - Long-context decode currently dequantizes the full MLA latent cache on read. Sparse or block-wise dequantization is future work.
 - If generation behaves unexpectedly after changing model/runtime settings, clear the GLM-5.2 local runtime cache first.
+
+### Prefill benchmark
+
+See `docs/glm52-prefill-benchmark.md` for the GLM-5.2 prefill benchmark command, measured fields, and current batching notes. The benchmark script lives at `benchmarks/glm52_prefill_benchmark.py`. Use `--mode single` with `--max-tokens 1` for TTFT / checkpoint measurements, and `--mode queued --max-tokens 8` or similar to expose admission wait time under serving load.
 
 ### Smoke test result
 

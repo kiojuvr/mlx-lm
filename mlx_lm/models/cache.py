@@ -819,7 +819,7 @@ def _cache_quantization_signature(cache):
         return [_cache_quantization_signature(c) for c in cache.caches]
 
     cache_type = type(cache).__name__
-    if cache_type == "QuantizedGlmMlaKVCache":
+    if cache_type in ("QuantizedGlmMlaKVCache", "BatchQuantizedGlmMlaKVCache"):
         return {
             "scheme": "glm_mla_latent_int8",
             "group_size": cache.group_size,
@@ -831,7 +831,7 @@ def _cache_quantization_signature(cache):
             "group_size": cache.group_size,
             "bits": cache.bits,
         }
-    if cache_type == "GlmMlaKVCache":
+    if cache_type in ("GlmMlaKVCache", "BatchGlmMlaKVCache"):
         return {"scheme": "glm_mla_latent_fp"}
     return None
 
@@ -848,9 +848,9 @@ def glm_mla_kv_quantization_metadata(cache: List[Any]):
 
     def visit(c):
         cache_type = type(c).__name__
-        if cache_type == "GlmMlaKVCache":
+        if cache_type in ("GlmMlaKVCache", "BatchGlmMlaKVCache"):
             metadata["glm_mla_latent_fp_layers"] += 1
-        elif cache_type == "QuantizedGlmMlaKVCache":
+        elif cache_type in ("QuantizedGlmMlaKVCache", "BatchQuantizedGlmMlaKVCache"):
             metadata["glm_mla_latent_int8_layers"] += 1
             group_sizes.add(c.group_size)
             bits.add(c.bits)
@@ -1572,6 +1572,9 @@ class QuantizedGlmMlaKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def size(self):
+        return self.offset
+
     def to_quantized(self, group_size: int = 64, bits: int = 8):
         if bits != 8:
             raise ValueError("GLM MLA latent KV cache only supports int8.")
@@ -1598,6 +1601,10 @@ class QuantizedGlmMlaKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return tree_reduce(lambda a, x: a + x.nbytes, self.keys, 0) + self.values.nbytes
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchQuantizedGlmMlaKVCache.merge(caches)
 
 
 class KVCache(_BaseCache):
@@ -1704,6 +1711,10 @@ class GlmMlaKVCache(KVCache):
             )
             quant_cache.values = self.values[..., : self.offset, :]
         return quant_cache
+
+    @classmethod
+    def merge(_, caches):
+        return BatchGlmMlaKVCache.merge(caches)
 
 
 class RotatingKVCache(_BaseCache):
@@ -2119,7 +2130,13 @@ class CacheList(_BaseCache):
 
     @property
     def offset(self):
-        return max((getattr(c, "offset", 0) for c in self.caches), default=0)
+        offsets = []
+        for c in self.caches:
+            offset = getattr(c, "offset", 0)
+            if hasattr(offset, "shape") and offset.shape != ():
+                offset = c.size()
+            offsets.append(offset)
+        return max(offsets, default=0)
 
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
@@ -2409,7 +2426,7 @@ class BatchKVCache(_BaseCache):
 
         # No cache has content so make an empty one
         if max_length == 0:
-            return BatchKVCache([0] * len(caches))
+            return cls([0] * len(caches))
 
         padding = [max_length - l for l in lengths]
         B = len(caches)
@@ -2445,6 +2462,387 @@ class BatchKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class BatchGlmMlaKVCache(BatchKVCache):
+    """Batch-aware GLM-5.2 MLA cache that can opt into latent-only int8."""
+
+    quantize_with_cache_list = True
+
+    def extend(self, other):
+        if isinstance(other, BatchQuantizedGlmMlaKVCache):
+            raise ValueError(
+                "Cannot extend BatchGlmMlaKVCache with "
+                "BatchQuantizedGlmMlaKVCache."
+            )
+        super().extend(other)
+
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 8
+    ) -> "BatchQuantizedGlmMlaKVCache":
+        quant_cache = BatchQuantizedGlmMlaKVCache(
+            self.left_padding, group_size=group_size, bits=bits
+        )
+        quant_cache.offset = self.offset
+        quant_cache._idx = self._idx
+        quant_cache._right_padding = self._right_padding
+        if self.keys is not None:
+            keys = self.keys[..., : self._idx, :]
+            quant_cache._check_key_dim(keys.shape[-1])
+            quant_cache.keys = mx.quantize(
+                keys,
+                group_size=group_size,
+                bits=bits,
+            )
+            quant_cache.values = self.values[..., : self._idx, :]
+        return quant_cache
+
+
+class BatchQuantizedGlmMlaKVCache(_BaseCache):
+    """Batch-aware GLM-5.2 MLA cache with only latent KV stored as int8."""
+
+    step = 256
+    quantize_with_cache_list = True
+
+    def __init__(self, left_padding: List[int], group_size: int = 64, bits: int = 8):
+        if bits != 8:
+            raise ValueError("GLM MLA latent KV cache only supports int8.")
+        self.keys = None
+        self.values = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = -self.left_padding
+        self._idx = 0
+        self._right_padding = None
+        self.group_size = group_size
+        self.bits = bits
+
+    def _check_key_dim(self, key_dim: int):
+        if key_dim % self.group_size != 0:
+            raise ValueError(
+                "GLM MLA latent KV cache dimension must be divisible by "
+                f"kv_group_size ({key_dim} vs {self.group_size})."
+            )
+
+    def _trimmed_data(self):
+        if self.keys is None:
+            return self.keys, self.values
+        if self._idx == self.keys[0].shape[2]:
+            return self.keys, self.values
+        return (
+            tree_map(lambda x: x[..., : self._idx, :], self.keys),
+            self.values[..., : self._idx, :],
+        )
+
+    def update_and_fetch(self, keys, values):
+        B, n_kv_heads, num_steps, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        self._check_key_dim(k_head_dim)
+        prev = self._idx
+
+        if self.keys is None or (prev + num_steps) > self.keys[0].shape[2]:
+            el_per_int = 8 * mx.uint32.size // self.bits
+            n_steps = (self.step + num_steps - 1) // self.step
+            key_shape = (B, n_kv_heads, n_steps * self.step)
+            value_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+
+            def init_quant(dim):
+                return (
+                    mx.zeros((*key_shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*key_shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*key_shape, dim // self.group_size), dtype=keys.dtype),
+                )
+
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = tree_map(lambda x: x[..., :prev, :], self.keys)
+                    self.values = self.values[..., :prev, :]
+
+                def expand_quant(x):
+                    new_x = mx.zeros((*key_shape, x.shape[-1]), dtype=x.dtype)
+                    return mx.concatenate([x, new_x], axis=2)
+
+                self.keys = tree_map(expand_quant, self.keys)
+                self.values = mx.concatenate(
+                    [self.values, mx.zeros(value_shape, values.dtype)], axis=2
+                )
+            else:
+                self.keys = init_quant(k_head_dim)
+                self.values = mx.zeros(value_shape, values.dtype)
+
+        self.offset += num_steps
+        self._idx += num_steps
+
+        q_keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        for i in range(len(self.keys)):
+            self.keys[i][..., prev : self._idx, :] = q_keys[i]
+        self.values[..., prev : self._idx, :] = values
+
+        return self._trimmed_data()
+
+    def dequantize_keys(self, keys=None):
+        if keys is None:
+            keys = self._trimmed_data()[0]
+        return mx.dequantize(*keys, group_size=self.group_size, bits=self.bits)
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty "
+                    "BatchQuantizedGlmMlaKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            padding = self._right_padding
+            self.keys = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2),
+                self.keys,
+            )
+            self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
+
+    @property
+    def state(self):
+        keys, values = self._trimmed_data()
+        return keys, values, self.offset, self.left_padding
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.offset, self.left_padding = v
+        self._idx = 0 if self.keys is None else self.keys[0].shape[2]
+        self._right_padding = None
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.group_size, self.bits)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.group_size, self.bits = map(int, v)
+        self._right_padding = None
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
+
+    def filter(self, batch_indices):
+        """
+        In-place filter to keep just the given indices in the cache.
+        """
+        if self.keys is not None:
+            self.keys = tree_map(lambda x: x[batch_indices], self.keys)
+            self.values = self.values[batch_indices]
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
+
+        # Shift left to reduce padding.
+        min_left_pad = self.left_padding.min().item()
+        if min_left_pad > 0:
+            if self.keys is not None:
+                self.keys = tree_map(
+                    lambda x: x[..., min_left_pad:, :],
+                    self.keys,
+                )
+                self.values = self.values[..., min_left_pad:, :]
+            self._idx -= min_left_pad
+            self.left_padding -= min_left_pad
+
+    def _empty_key_tuple(self, batch_size, template):
+        return tuple(
+            mx.array([], dtype=t.dtype).reshape(batch_size, t.shape[1], 0, t.shape[3])
+            for t in template
+        )
+
+    def extend(self, other):
+        """
+        In-place extend this cache with the other cache.
+        """
+        if not isinstance(other, BatchQuantizedGlmMlaKVCache):
+            raise ValueError(
+                "Cannot extend BatchQuantizedGlmMlaKVCache with "
+                f"{type(other).__name__}."
+            )
+        if self.group_size != other.group_size or self.bits != other.bits:
+            raise ValueError(
+                "BatchQuantizedGlmMlaKVCache can only extend caches with the same "
+                "group size and bit width."
+            )
+
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
+        max_idx = max(self._idx, other._idx)
+        L1 = L2 = 0
+        key_template = self.keys if self.keys is not None else other.keys
+        if self.keys is not None:
+            L1 = self.keys[0].shape[2]
+            value_template = self.values
+        if other.keys is not None:
+            L2 = other.keys[0].shape[2]
+            value_template = other.values
+        max_size = max(L1, L2)
+
+        def pad(c):
+            k, v = c.keys, c.values
+            if k is None:
+                batch_size = c.offset.shape[0]
+                k = self._empty_key_tuple(batch_size, key_template)
+                v = mx.array([], dtype=value_template.dtype).reshape(
+                    batch_size,
+                    value_template.shape[1],
+                    0,
+                    value_template.shape[3],
+                )
+            left = max_idx - c._idx
+            right = max_size - k[0].shape[2] - left
+            if right < 0:
+                k = tree_map(lambda x: x[..., :right, :], k)
+                v = v[..., :right, :]
+                right = 0
+            if left != 0 or right != 0:
+                pad_width = [(0, 0), (0, 0), (left, right), (0, 0)]
+                k = tree_map(lambda x: mx.pad(x, pad_width), k)
+                v = mx.pad(v, pad_width)
+            left_padding = c.left_padding + left
+            return k, v, c.offset, left_padding
+
+        (self_keys, self_values, self_offset, self_left_padding), (
+            other_keys,
+            other_values,
+            other_offset,
+            other_left_padding,
+        ) = pad(self), pad(other)
+        self.keys = tuple(
+            mx.concatenate([a, b]) for a, b in zip(self_keys, other_keys)
+        )
+        self.values = mx.concatenate([self_values, other_values])
+        self.offset = mx.concatenate([self_offset, other_offset])
+        self.left_padding = mx.concatenate([self_left_padding, other_left_padding])
+        self._idx = max_idx
+
+    def extract(self, idx):
+        cache = QuantizedGlmMlaKVCache(group_size=self.group_size, bits=self.bits)
+        if self.keys is None:
+            return cache
+        padding = self.left_padding[idx].item()
+        cache.keys = tuple(
+            mx.contiguous(k[idx : idx + 1, :, padding : self._idx])
+            for k in self.keys
+        )
+        cache.values = mx.contiguous(
+            self.values[idx : idx + 1, :, padding : self._idx]
+        )
+        cache.offset = cache.keys[0].shape[2]
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        if not caches:
+            return cls([])
+        if not all(c.group_size == caches[0].group_size for c in caches):
+            raise ValueError(
+                "BatchQuantizedGlmMlaKVCache can only merge caches with the same "
+                "group size"
+            )
+        if not all(c.bits == caches[0].bits for c in caches):
+            raise ValueError(
+                "BatchQuantizedGlmMlaKVCache can only merge caches with the same "
+                "bit width"
+            )
+
+        lengths = [c.size() for c in caches]
+        max_length = max(lengths, default=0)
+        group_size = caches[0].group_size
+        bits = caches[0].bits
+
+        if max_length == 0:
+            return cls([0] * len(caches), group_size=group_size, bits=bits)
+
+        padding = [max_length - l for l in lengths]
+        B = len(caches)
+        key_template = next(c.keys for c in caches if c.keys is not None)
+        value_template = next(c.values for c in caches if c.values is not None)
+        keys = tuple(
+            mx.zeros(
+                (B, t.shape[1], max_length, t.shape[3]),
+                dtype=t.dtype,
+            )
+            for t in key_template
+        )
+        values = mx.zeros(
+            (B, value_template.shape[1], max_length, value_template.shape[3]),
+            dtype=value_template.dtype,
+        )
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            if c.keys is None:
+                continue
+            for e in range(len(keys)):
+                keys[e][i : i + 1, :, p : p + c.offset] = c.keys[e][
+                    ..., : c.offset, :
+                ]
+            values[i : i + 1, :, p : p + c.offset] = c.values[..., : c.offset, :]
+
+        cache = cls(padding, group_size=group_size, bits=bits)
+        cache.keys = keys
+        cache.values = values
+        cache.offset += max_length
+        cache._idx = max_length
+
+        return cache
+
+    def size(self):
+        return self._idx
+
+    def empty(self):
+        return self.keys is None
+
+    def to_quantized(self, group_size: int = 64, bits: int = 8):
+        if bits != 8:
+            raise ValueError("GLM MLA latent KV cache only supports int8.")
+        if self.group_size == group_size:
+            return self
+        quant_cache = BatchQuantizedGlmMlaKVCache(
+            self.left_padding,
+            group_size=group_size,
+            bits=bits,
+        )
+        quant_cache.offset = self.offset
+        quant_cache._idx = self._idx
+        quant_cache._right_padding = self._right_padding
+        if self.keys is not None:
+            latent = self.dequantize_keys()
+            quant_cache.keys = mx.quantize(latent, group_size=group_size, bits=bits)
+            quant_cache.values = self.values[..., : self._idx, :]
+        return quant_cache
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(lambda a, x: a + x.nbytes, self.keys, 0) + self.values.nbytes
 
 
 class BatchRotatingKVCache(_BaseCache):

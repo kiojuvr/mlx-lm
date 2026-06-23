@@ -1564,9 +1564,67 @@ def _extend_cache(cache_a, cache_b):
         return cache_b
     if not cache_b:
         return cache_a
+    if not _glm_mla_kv_caches_compatible(cache_a, cache_b):
+        raise ValueError(
+            "Cannot merge quantized and unquantized GLM MLA KV caches in one "
+            "continuous batch."
+        )
     for ca, cb in zip(cache_a, cache_b):
         ca.extend(cb)
     return cache_a
+
+
+_GLM_MLA_FP_CACHE_TYPES = {"GlmMlaKVCache", "BatchGlmMlaKVCache"}
+_GLM_MLA_QUANTIZED_CACHE_TYPES = {
+    "QuantizedGlmMlaKVCache",
+    "BatchQuantizedGlmMlaKVCache",
+}
+
+
+def _iter_nested_caches(caches):
+    for c in caches or []:
+        if isinstance(c, CacheList):
+            yield from _iter_nested_caches(c.caches)
+        else:
+            yield c
+
+
+def _glm_mla_kv_cache_modes(caches):
+    modes = set()
+    for c in _iter_nested_caches(caches):
+        cache_type = type(c).__name__
+        if cache_type in _GLM_MLA_FP_CACHE_TYPES:
+            modes.add("fp")
+        elif cache_type in _GLM_MLA_QUANTIZED_CACHE_TYPES:
+            modes.add("quantized")
+    return modes
+
+
+def _glm_mla_kv_caches_compatible(cache_a, cache_b):
+    modes_a = _glm_mla_kv_cache_modes(cache_a)
+    modes_b = _glm_mla_kv_cache_modes(cache_b)
+    return not (
+        ("quantized" in modes_a and "fp" in modes_b)
+        or ("fp" in modes_a and "quantized" in modes_b)
+    )
+
+
+def _glm_mla_kv_caches_mixed(cache_a, cache_b):
+    modes_a = _glm_mla_kv_cache_modes(cache_a)
+    modes_b = _glm_mla_kv_cache_modes(cache_b)
+    return (
+        ("quantized" in modes_a and "fp" in modes_b)
+        or ("fp" in modes_a and "quantized" in modes_b)
+    )
+
+
+def _glm_mla_kv_cache_kind(caches):
+    modes = _glm_mla_kv_cache_modes(caches)
+    if not modes:
+        return "none"
+    if len(modes) == 1:
+        return next(iter(modes))
+    return "mixed"
 
 
 def _build_trie(sequences):
@@ -1706,6 +1764,9 @@ class PromptProcessingBatch:
         ] = None,
         state_machines: Optional[List[SequenceStateMachine]] = None,
         max_tokens: Optional[List[int]] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
     ):
         self.model = model
         self.uids = uids
@@ -1728,6 +1789,9 @@ class PromptProcessingBatch:
             if max_tokens is not None
             else [DEFAULT_MAX_TOKENS] * len(self.uids)
         )
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
 
     def __len__(self):
         return len(self.uids)
@@ -1767,7 +1831,18 @@ class PromptProcessingBatch:
         new_batch.logits_processors = list(self.logits_processors)
         new_batch.state_machines = list(self.state_machines)
         new_batch.max_tokens = list(self.max_tokens)
+        new_batch.kv_bits = self.kv_bits
+        new_batch.kv_group_size = self.kv_group_size
+        new_batch.quantized_kv_start = self.quantized_kv_start
         return new_batch
+
+    def _maybe_quantize_cache(self):
+        maybe_quantize_kv_cache(
+            self.prompt_cache,
+            quantized_kv_start=self.quantized_kv_start,
+            kv_group_size=self.kv_group_size,
+            kv_bits=self.kv_bits,
+        )
 
     def split(self, indices: List[int]):
         indices = sorted(indices)
@@ -1834,6 +1909,7 @@ class PromptProcessingBatch:
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
+            self._maybe_quantize_cache()
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
@@ -1870,6 +1946,9 @@ class PromptProcessingBatch:
             self.logits_processors,
             self.state_machines,
             self.max_tokens,
+            self.kv_bits,
+            self.kv_group_size,
+            self.quantized_kv_start,
         )
 
         self.uids = []
@@ -1887,6 +1966,9 @@ class PromptProcessingBatch:
         model: nn.Module,
         fallback_sampler: Callable[[mx.array], mx.array],
         prefill_step_size: int = 2048,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
     ):
         return cls(
             model=model,
@@ -1899,6 +1981,9 @@ class PromptProcessingBatch:
             logits_processors=[],
             max_tokens=[],
             state_machines=[],
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
         )
 
 
@@ -1935,6 +2020,9 @@ class GenerationBatch:
         ],
         state_machines: List[SequenceStateMachine],
         max_tokens: List[int],
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
     ):
         self.model = model
         self.uids = uids
@@ -1946,6 +2034,9 @@ class GenerationBatch:
         self.logits_processors = logits_processors
         self.state_machines = state_machines
         self.max_tokens = max_tokens
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
 
         if self.samplers and len(self.samplers) != len(self.uids):
             raise ValueError("Insufficient number of samplers provided")
@@ -1993,6 +2084,14 @@ class GenerationBatch:
         self._num_tokens.extend(batch._num_tokens)
         self._matcher_states.extend(batch._matcher_states)
 
+    def _maybe_quantize_cache(self):
+        maybe_quantize_kv_cache(
+            self.prompt_cache,
+            quantized_kv_start=self.quantized_kv_start,
+            kv_group_size=self.kv_group_size,
+            kv_bits=self.kv_bits,
+        )
+
     def _step(self) -> Tuple[List[int], List[mx.array]]:
         """
         Perform a single generation step.
@@ -2007,6 +2106,7 @@ class GenerationBatch:
         # Forward pass
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
+        self._maybe_quantize_cache()
 
         # Logits processors
         token_context = []
@@ -2144,6 +2244,9 @@ class GenerationBatch:
         cls,
         model: nn.Module,
         fallback_sampler: Callable[[mx.array], mx.array],
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
     ):
         return cls(
             model=model,
@@ -2156,6 +2259,9 @@ class GenerationBatch:
             logits_processors=[],
             max_tokens=[],
             state_machines=[],
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
         )
 
 
@@ -2184,6 +2290,9 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
         stream=None,
     ):
         self.model = model
@@ -2195,6 +2304,9 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
 
         self._stream = stream or generation_stream
 
@@ -2207,10 +2319,27 @@ class BatchGenerator:
             self.model,
             self.sampler,
             prefill_step_size=prefill_step_size,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
         )
-        self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
+        self._generation_batch = GenerationBatch.empty(
+            self.model,
+            self.sampler,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+        )
         self._unprocessed_sequences = deque()
         self._currently_processing = []
+        self._insert_times = {}
+        self._waiting_for_compatible_batch = set()
+        self._admission_counters = {
+            "glm_mla_quantized_batch_admitted": 0,
+            "glm_mla_quantized_batch_rejected_mixed_cache": 0,
+            "glm_mla_waited_for_compatible_batch": 0,
+        }
+        self._admission_events = []
 
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
@@ -2257,6 +2386,8 @@ class BatchGenerator:
             stats.generation_time += gen_time
             stats.generation_tps = stats.generation_tokens / stats.generation_time
             stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
+            stats.admission_stats = self.admission_stats
+            stats.admission_events = list(self._admission_events)
 
     def insert(
         self,
@@ -2322,10 +2453,12 @@ class BatchGenerator:
             if len(seq[-1]) != 1:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
+            uid = self._uid_count
             self._unprocessed_sequences.append(
-                (self._uid_count, seq, m, c, at, s, lp, sm)
+                (uid, seq, m, c, at, s, lp, sm)
             )
-            uids.append(self._uid_count)
+            self._insert_times[uid] = time.perf_counter()
+            uids.append(uid)
             self._uid_count += 1
 
         return uids
@@ -2388,9 +2521,17 @@ class BatchGenerator:
             keep[stage].remove(idx)
 
         if len(keep[0]) < len(self._unprocessed_sequences):
+            removed_uids = {
+                seq[0]
+                for i, seq in enumerate(self._unprocessed_sequences)
+                if i not in keep[0]
+            }
             self._unprocessed_sequences = deque(
                 x for i, x in enumerate(self._unprocessed_sequences) if i in keep[0]
             )
+            for uid in removed_uids:
+                self._insert_times.pop(uid, None)
+                self._waiting_for_compatible_batch.discard(uid)
         if len(keep[1]) < len(self._prompt_batch):
             self._prompt_batch.filter(sorted(keep[1]))
             self._currently_processing = [
@@ -2408,7 +2549,42 @@ class BatchGenerator:
         total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
         return total
 
-    def _make_batch(self, n: int):
+    @property
+    def admission_stats(self):
+        active_cache = (
+            self._prompt_batch.prompt_cache + self._generation_batch.prompt_cache
+        )
+        return {
+            **self._admission_counters,
+            "active_batch_cache_kind": _glm_mla_kv_cache_kind(active_cache),
+            "active_batch_size": len(self._prompt_batch)
+            + len(self._generation_batch),
+            "queued_request_count": len(self._unprocessed_sequences),
+        }
+
+    def _record_admission_event(
+        self,
+        *,
+        uid: int,
+        event: str,
+        candidate_cache_kind: str,
+        active_cache_kind: str,
+    ):
+        now = time.perf_counter()
+        self._admission_events.append(
+            {
+                "uid": uid,
+                "event": event,
+                "wait_seconds": now - self._insert_times.get(uid, now),
+                "candidate_cache_kind": candidate_cache_kind,
+                "active_batch_cache_kind": active_cache_kind,
+                "active_batch_size": len(self._prompt_batch)
+                + len(self._generation_batch),
+                "queued_request_count": len(self._unprocessed_sequences),
+            }
+        )
+
+    def _make_batch(self, sequences):
         uids = []
         caches = []
         tokens = []
@@ -2416,8 +2592,7 @@ class BatchGenerator:
         logits_processors = []
         max_tokens = []
         state_machines = []
-        for _ in range(n):
-            sequence = self._unprocessed_sequences.popleft()
+        for sequence in sequences:
             uids.append(sequence[0])
             caches.append(sequence[3])
             tokens.append(sequence[4])
@@ -2425,6 +2600,8 @@ class BatchGenerator:
             logits_processors.append(sequence[6])
             max_tokens.append(sequence[2])
             state_machines.append(sequence[7])
+            self._insert_times.pop(sequence[0], None)
+            self._waiting_for_compatible_batch.discard(sequence[0])
             self._currently_processing.append(
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
@@ -2440,7 +2617,87 @@ class BatchGenerator:
             logits_processors=logits_processors,
             state_machines=state_machines,
             max_tokens=max_tokens,
+            kv_bits=self.kv_bits,
+            kv_group_size=self.kv_group_size,
+            quantized_kv_start=self.quantized_kv_start,
         )
+
+    def _can_admit_sequence(self, sequence):
+        candidate_cache = sequence[3]
+        return _glm_mla_kv_caches_compatible(
+            self._prompt_batch.prompt_cache,
+            candidate_cache,
+        ) and _glm_mla_kv_caches_compatible(
+            self._generation_batch.prompt_cache,
+            candidate_cache,
+        )
+
+    def _can_admit_with_selected_sequences(self, sequence, selected):
+        candidate_cache = sequence[3]
+        return all(
+            _glm_mla_kv_caches_compatible(candidate_cache, selected_sequence[3])
+            for selected_sequence in selected
+        )
+
+    def _select_compatible_sequences(self, limit: int):
+        if limit <= 0:
+            return []
+
+        selected = []
+        remaining = deque()
+        active_cache = (
+            self._prompt_batch.prompt_cache + self._generation_batch.prompt_cache
+        )
+        active_cache_kind = _glm_mla_kv_cache_kind(active_cache)
+
+        for sequence in self._unprocessed_sequences:
+            candidate_cache_kind = _glm_mla_kv_cache_kind(sequence[3])
+            can_admit = (
+                len(selected) < limit
+                and self._can_admit_sequence(sequence)
+                and self._can_admit_with_selected_sequences(sequence, selected)
+            )
+            if can_admit:
+                selected.append(sequence)
+                if (
+                    active_cache_kind == "quantized"
+                    or candidate_cache_kind == "quantized"
+                ):
+                    self._admission_counters[
+                        "glm_mla_quantized_batch_admitted"
+                    ] += 1
+                self._record_admission_event(
+                    uid=sequence[0],
+                    event="admitted",
+                    candidate_cache_kind=candidate_cache_kind,
+                    active_cache_kind=active_cache_kind,
+                )
+            else:
+                remaining.append(sequence)
+                if _glm_mla_kv_caches_mixed(active_cache, sequence[3]) or any(
+                    _glm_mla_kv_caches_mixed(
+                        selected_sequence[3],
+                        sequence[3],
+                    )
+                    for selected_sequence in selected
+                ):
+                    self._admission_counters[
+                        "glm_mla_quantized_batch_rejected_mixed_cache"
+                    ] += 1
+                    if sequence[0] not in self._waiting_for_compatible_batch:
+                        self._waiting_for_compatible_batch.add(sequence[0])
+                        self._admission_counters[
+                            "glm_mla_waited_for_compatible_batch"
+                        ] += 1
+                    self._record_admission_event(
+                        uid=sequence[0],
+                        event="rejected_mixed_cache",
+                        candidate_cache_kind=candidate_cache_kind,
+                        active_cache_kind=active_cache_kind,
+                    )
+
+        self._unprocessed_sequences = remaining
+        return selected
 
     def _next(self):
         generation_responses = []
@@ -2464,8 +2721,9 @@ class BatchGenerator:
             self.completion_batch_size - len(self._generation_batch),
             len(self._unprocessed_sequences),
         )
-        if n > 0:
-            self._prompt_batch.extend(self._make_batch(n))
+        selected = self._select_compatible_sequences(n)
+        if selected:
+            self._prompt_batch.extend(self._make_batch(selected))
 
         # Split the prompt sequences to the ones moving to generation and the rest
         keep = []
