@@ -57,6 +57,8 @@ DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 PROMPT_CHECKPOINT_DEBUG_ENV = "MLX_LM_PROMPT_CHECKPOINT_DEBUG"
+PROMPT_CHECKPOINT_FRONTIER_MIN_TOKENS = 8192
+PROMPT_CHECKPOINT_FRONTIER_STRIDE_TOKENS = 16384
 
 
 def _prompt_checkpoint_debug(message):
@@ -94,6 +96,31 @@ def _checkpoint_store_lengths(lengths, total_tokens):
         result.append(length)
     result.sort()
     return result
+
+
+def _checkpoint_frontier_lengths(
+    total_tokens,
+    min_tokens=PROMPT_CHECKPOINT_FRONTIER_MIN_TOKENS,
+    stride_tokens=PROMPT_CHECKPOINT_FRONTIER_STRIDE_TOKENS,
+):
+    try:
+        min_tokens = int(min_tokens)
+        stride_tokens = int(stride_tokens)
+    except (TypeError, ValueError):
+        return []
+    if total_tokens <= 1 or min_tokens <= 0 or stride_tokens <= 0:
+        return []
+
+    first = max(2, min_tokens)
+    if first >= total_tokens:
+        return []
+
+    frontiers = {first}
+    start = ((first + stride_tokens - 1) // stride_tokens) * stride_tokens
+    for length in range(start, total_tokens, stride_tokens):
+        if length >= first:
+            frontiers.add(length)
+    return sorted(frontiers)
 
 
 def str2bool(string):
@@ -369,6 +396,12 @@ def generate_step(
     prompt_checkpoint_initial_cached_tokens: int = 0,
     prompt_checkpoint_store_prefix_lengths: Optional[Sequence[int]] = None,
     prompt_checkpoint_allow_existing_cache: bool = False,
+    prompt_checkpoint_frontier_min_tokens: int = (
+        PROMPT_CHECKPOINT_FRONTIER_MIN_TOKENS
+    ),
+    prompt_checkpoint_frontier_stride_tokens: int = (
+        PROMPT_CHECKPOINT_FRONTIER_STRIDE_TOKENS
+    ),
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -412,6 +445,10 @@ def generate_step(
         prompt_checkpoint_allow_existing_cache (bool): Treat a supplied
           ``prompt_cache`` as server-managed and allow disk checkpoint lookup to
           replace it when a longer disk prefix exists.
+        prompt_checkpoint_frontier_min_tokens (int): First automatic long-prompt
+          frontier to save. Defaults to 8192 tokens.
+        prompt_checkpoint_frontier_stride_tokens (int): Token stride for
+          automatic frontiers after the first one. Defaults to 16384 tokens.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -456,6 +493,16 @@ def generate_step(
     prompt_checkpoint_hit = False
     prompt_checkpoint_hit_kind = None
     prompt_checkpoint_cached_tokens = 0
+    prompt_checkpoint_disk_cached_tokens = 0
+    prompt_checkpoint_resolution = "miss"
+    prompt_checkpoint_lookup_stats = {
+        "files_scanned": 0,
+        "candidate_files_scanned": 0,
+        "candidate_lengths_scanned": 0,
+        "prefix_hashes_computed": 0,
+        "matched_candidates": 0,
+    }
+    prompt_checkpoint_lookup_seconds = 0.0
     prompt_checkpoint_initial_cached_tokens = max(
         0, min(int(prompt_checkpoint_initial_cached_tokens), total_prompt_tokens)
     )
@@ -474,18 +521,30 @@ def generate_step(
     if prompt_checkpoint_existing_cache:
         prompt_checkpoint_cached_tokens = prompt_checkpoint_initial_cached_tokens
 
+    _prompt_checkpoint_debug(
+        "request "
+        f"total_prompt_tokens={total_prompt_tokens} "
+        f"server_cached_tokens={prompt_checkpoint_initial_cached_tokens if prompt_checkpoint_existing_cache else 0} "
+        f"prefill_step_size={prefill_step_size}"
+    )
+
     if not prompt_checkpoint:
+        prompt_checkpoint_resolution = "disabled"
         _prompt_checkpoint_debug("checkpoint disabled")
     elif input_embeddings is not None:
+        prompt_checkpoint_resolution = "input-embeddings"
         _prompt_checkpoint_debug("skip input_embeddings active")
     elif prompt_cache is not None and not prompt_checkpoint_allow_existing_cache:
+        prompt_checkpoint_resolution = "explicit-cache"
         _prompt_checkpoint_debug("skip explicit prompt_cache active")
     elif prompt_checkpoint_existing_cache:
+        prompt_checkpoint_resolution = "server-cache"
         _prompt_checkpoint_debug(
             "server prompt_cache coexistence "
             f"cached_tokens={prompt_checkpoint_initial_cached_tokens}"
         )
     elif total_prompt_tokens <= 1:
+        prompt_checkpoint_resolution = "too-short"
         _prompt_checkpoint_debug(
             f"skip prefix too short prefix_length={total_prompt_tokens}"
         )
@@ -504,9 +563,28 @@ def generate_step(
         _prompt_checkpoint_debug(
             "lookup "
             f"file={prompt_checkpoint_basename} "
-            f"prefix_length={total_prompt_tokens}"
+            f"prefix_length={total_prompt_tokens} "
+            f"server_cached_tokens={prompt_checkpoint_initial_cached_tokens}"
         )
-        all_candidates = cache.find_prompt_checkpoint_prefix(checkpoint_full_prompt)
+        lookup_t0 = time.perf_counter()
+        all_candidates, prompt_checkpoint_lookup_stats = (
+            cache.find_prompt_checkpoint_prefix(
+                checkpoint_full_prompt,
+                return_stats=True,
+            )
+        )
+        prompt_checkpoint_lookup_seconds = time.perf_counter() - lookup_t0
+        _prompt_checkpoint_debug(
+            "lookup result "
+            f"file={prompt_checkpoint_basename} "
+            f"prefix_length={total_prompt_tokens} "
+            f"files_scanned={prompt_checkpoint_lookup_stats['files_scanned']} "
+            f"candidates_scanned={prompt_checkpoint_lookup_stats['candidate_files_scanned']} "
+            f"candidate_lengths={prompt_checkpoint_lookup_stats['candidate_lengths_scanned']} "
+            f"matched_candidates={prompt_checkpoint_lookup_stats['matched_candidates']} "
+            f"prefix_hashes={prompt_checkpoint_lookup_stats['prefix_hashes_computed']} "
+            f"lookup_seconds={prompt_checkpoint_lookup_seconds:.6f}"
+        )
         candidates = [
             candidate
             for candidate in all_candidates
@@ -538,8 +616,9 @@ def generate_step(
                         quantized_kv_start=quantized_kv_start,
                     )
                 )
+                load_t0 = time.perf_counter()
                 try:
-                    prompt_cache = cache.load_prompt_checkpoint(
+                    prompt_cache, checkpoint_metadata = cache.load_prompt_checkpoint(
                         candidate_path,
                         prefix_tokens=candidate_prefix,
                         checkpoint_namespace=cache.DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
@@ -548,7 +627,9 @@ def generate_step(
                             expected_glm_mla_kv_quantization
                         ),
                         expected_glm_mla_kv_settings=expected_glm_mla_kv_settings,
+                        return_metadata=True,
                     )
+                    load_seconds = time.perf_counter() - load_t0
                     if candidate_length == total_prompt_tokens:
                         prompt = mx.array(checkpoint_full_prompt[-1:])
                         prompt_checkpoint_cached_tokens = total_prompt_tokens - 1
@@ -556,31 +637,45 @@ def generate_step(
                     else:
                         prompt = mx.array(checkpoint_full_prompt[candidate_length:])
                         prompt_checkpoint_cached_tokens = candidate_length
-                        prompt_checkpoint_hit_kind = "prefix"
+                        prompt_checkpoint_hit_kind = checkpoint_metadata.get(
+                            "checkpoint_label",
+                            "prefix",
+                        )
+                        if prompt_checkpoint_hit_kind not in ("prefix", "frontier"):
+                            prompt_checkpoint_hit_kind = "prefix"
+                    prompt_checkpoint_disk_cached_tokens = (
+                        prompt_checkpoint_cached_tokens
+                    )
+                    prompt_checkpoint_resolution = prompt_checkpoint_hit_kind
                     prompt_checkpoint_hit = True
                     _prompt_checkpoint_debug(
                         f"{prompt_checkpoint_hit_kind} hit "
                         f"file={candidate_basename} "
                         f"prefix_length={candidate_length} "
-                        f"cached_tokens={prompt_checkpoint_cached_tokens}"
+                        f"cached_tokens={prompt_checkpoint_cached_tokens} "
+                        f"load_seconds={load_seconds:.6f}"
                     )
                     break
                 except cache.PromptCacheCheckpointError:
+                    load_seconds = time.perf_counter() - load_t0
                     rejected = True
                     # A rejected checkpoint is a safe cache miss here: never reuse it.
                     _prompt_checkpoint_debug(
                         "miss rejected "
                         f"file={candidate_basename} "
                         f"prefix_length={candidate_length} "
+                        f"load_seconds={load_seconds:.6f} "
                         "error=PromptCacheCheckpointError"
                     )
             if not prompt_checkpoint_hit and not rejected:
+                prompt_checkpoint_resolution = "miss"
                 _prompt_checkpoint_debug(
                     "miss no usable prefix "
                     f"file={prompt_checkpoint_basename} "
                     f"prefix_length={total_prompt_tokens}"
                 )
         elif all_candidates:
+            prompt_checkpoint_resolution = "server-cache-covered"
             _prompt_checkpoint_debug(
                 "miss covered by server prompt_cache "
                 f"file={os.path.basename(all_candidates[0][2])} "
@@ -588,11 +683,35 @@ def generate_step(
                 f"cached_tokens={prompt_checkpoint_initial_cached_tokens}"
             )
         else:
+            prompt_checkpoint_resolution = "miss"
             _prompt_checkpoint_debug(
                 "miss file does not exist "
                 f"file={prompt_checkpoint_basename} "
                 f"prefix_length={total_prompt_tokens}"
             )
+
+    if not prompt_checkpoint_hit and prompt_checkpoint_resolution in (
+        "server-cache",
+        "miss",
+    ):
+        if prompt_checkpoint_initial_cached_tokens > 0:
+            prompt_checkpoint_resolution = "server-cache"
+    fresh_prompt_tokens = max(total_prompt_tokens - prompt_checkpoint_cached_tokens, 0)
+    fresh_prefill_tokens = max(fresh_prompt_tokens - 1, 0)
+    _prompt_checkpoint_debug(
+        "prefill summary "
+        f"total_prompt_tokens={total_prompt_tokens} "
+        f"server_cached_tokens={prompt_checkpoint_initial_cached_tokens if prompt_checkpoint_existing_cache else 0} "
+        f"disk_cached_tokens={prompt_checkpoint_disk_cached_tokens} "
+        f"fresh_prompt_tokens={fresh_prompt_tokens} "
+        f"fresh_prefill_tokens={fresh_prefill_tokens} "
+        f"prefill_step_size={prefill_step_size} "
+        f"resolution={prompt_checkpoint_resolution} "
+        f"files_scanned={prompt_checkpoint_lookup_stats['files_scanned']} "
+        f"candidates_scanned={prompt_checkpoint_lookup_stats['candidate_files_scanned']} "
+        f"matched_candidates={prompt_checkpoint_lookup_stats['matched_candidates']} "
+        f"lookup_seconds={prompt_checkpoint_lookup_seconds:.6f}"
+    )
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -613,17 +732,32 @@ def generate_step(
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     prompt_checkpoint_pending_store_lengths = []
+    prompt_checkpoint_store_labels = {}
     if prompt_checkpoint_path is not None and prompt_checkpoint_exact_tokens is not None:
-        prompt_checkpoint_pending_store_lengths = [
+        for length in _checkpoint_frontier_lengths(
+            total_prompt_tokens,
+            prompt_checkpoint_frontier_min_tokens,
+            prompt_checkpoint_frontier_stride_tokens,
+        ):
+            prompt_checkpoint_store_labels[length] = "frontier"
+        for length in _checkpoint_store_lengths(
+            prompt_checkpoint_store_prefix_lengths,
+            total_prompt_tokens,
+        ):
+            prompt_checkpoint_store_labels[length] = "prefix"
+        prompt_checkpoint_pending_store_lengths = sorted(
             length
-            for length in _checkpoint_store_lengths(
-                prompt_checkpoint_store_prefix_lengths,
-                total_prompt_tokens,
-            )
+            for length in prompt_checkpoint_store_labels
             if length > prompt_checkpoint_cached_tokens
-        ]
+        )
+        if prompt_checkpoint_pending_store_lengths:
+            _prompt_checkpoint_debug(
+                "store schedule "
+                f"prefix_lengths={prompt_checkpoint_pending_store_lengths}"
+            )
 
     def _save_prompt_checkpoint(prefix_tokens, checkpoint_path, label):
+        save_t0 = time.perf_counter()
         try:
             cache.ensure_glm52_local_cache_dirs()
             cache.save_prompt_checkpoint(
@@ -635,18 +769,23 @@ def generate_step(
                 kv_bits=kv_bits,
                 kv_group_size=kv_group_size,
                 quantized_kv_start=quantized_kv_start,
+                metadata={"checkpoint_label": label},
             )
+            save_seconds = time.perf_counter() - save_t0
             _prompt_checkpoint_debug(
                 f"save {label} success "
                 f"file={os.path.basename(checkpoint_path)} "
-                f"prefix_length={len(prefix_tokens)}"
+                f"prefix_length={len(prefix_tokens)} "
+                f"save_seconds={save_seconds:.6f}"
             )
             return True
         except Exception as exc:
+            save_seconds = time.perf_counter() - save_t0
             _prompt_checkpoint_debug(
                 f"save {label} failure swallowed "
                 f"file={os.path.basename(checkpoint_path)} "
                 f"prefix_length={len(prefix_tokens)} "
+                f"save_seconds={save_seconds:.6f} "
                 f"error={type(exc).__name__}"
             )
             return False
@@ -699,6 +838,8 @@ def generate_step(
                 ):
                     n_to_process = store_length - prompt_processed_tokens
                     break
+            chunk_start_tokens = prompt_processed_tokens
+            chunk_t0 = time.perf_counter()
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
@@ -709,7 +850,17 @@ def generate_step(
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
+            chunk_seconds = time.perf_counter() - chunk_t0
             prompt_processed_tokens += n_to_process
+            _prompt_checkpoint_debug(
+                "prefill chunk "
+                f"start_tokens={chunk_start_tokens} "
+                f"chunk_tokens={n_to_process} "
+                f"processed_tokens={prompt_processed_tokens} "
+                f"total_prompt_tokens={total_prompt_tokens} "
+                f"prefill_step_size={prefill_step_size} "
+                f"chunk_seconds={chunk_seconds:.6f}"
+            )
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
             input_embeddings = (
@@ -733,7 +884,7 @@ def generate_step(
                 _save_prompt_checkpoint(
                     store_prefix,
                     cache.prompt_checkpoint_file(store_prefix),
-                    "prefix",
+                    prompt_checkpoint_store_labels.get(store_length, "prefix"),
                 )
             mx.clear_cache()
 

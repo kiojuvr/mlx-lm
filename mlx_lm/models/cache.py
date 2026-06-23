@@ -251,7 +251,12 @@ def _parse_prompt_checkpoint_name(name):
     return hash_part, prefix_length
 
 
-def find_prompt_checkpoint_prefix(prefix_tokens, *, min_prefix_length=2):
+def find_prompt_checkpoint_prefix(
+    prefix_tokens,
+    *,
+    min_prefix_length=2,
+    return_stats=False,
+):
     """
     Find checkpoint files whose token prefix is a prefix of ``prefix_tokens``.
 
@@ -261,28 +266,42 @@ def find_prompt_checkpoint_prefix(prefix_tokens, *, min_prefix_length=2):
     checkpoints when a longer file is malformed or rejected.
     """
     tokens = _token_list(prefix_tokens)
+    stats = {
+        "files_scanned": 0,
+        "candidate_files_scanned": 0,
+        "candidate_lengths_scanned": 0,
+        "prefix_hashes_computed": 0,
+        "matched_candidates": 0,
+    }
     try:
         names = os.listdir(glm52_prompt_checkpoints_dir())
     except OSError:
-        return []
+        return ([], stats) if return_stats else []
 
-    candidates = []
-    seen_lengths = set()
+    by_length = {}
     for name in names:
+        stats["files_scanned"] += 1
         parsed = _parse_prompt_checkpoint_name(name)
         if parsed is None:
             continue
         hash_part, prefix_length = parsed
         if (
-            prefix_length in seen_lengths
-            or prefix_length < min_prefix_length
+            prefix_length < min_prefix_length
             or prefix_length > len(tokens)
         ):
             continue
+        stats["candidate_files_scanned"] += 1
+        by_length.setdefault(prefix_length, {})[hash_part] = name
+
+    candidates = []
+    for prefix_length in sorted(by_length, reverse=True):
+        stats["candidate_lengths_scanned"] += 1
         prefix = tokens[:prefix_length]
-        if hash_part != prompt_prefix_hash(prefix):
+        prefix_hash = prompt_prefix_hash(prefix)
+        stats["prefix_hashes_computed"] += 1
+        name = by_length[prefix_length].get(prefix_hash)
+        if name is None:
             continue
-        seen_lengths.add(prefix_length)
         candidates.append(
             (
                 prefix_length,
@@ -290,8 +309,8 @@ def find_prompt_checkpoint_prefix(prefix_tokens, *, min_prefix_length=2):
                 os.path.join(glm52_prompt_checkpoints_dir(), name),
             )
         )
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates
+    stats["matched_candidates"] = len(candidates)
+    return (candidates, stats) if return_stats else candidates
 
 
 def _model_config_dict(model):
