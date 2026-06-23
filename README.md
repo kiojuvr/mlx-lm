@@ -34,7 +34,7 @@ Example local path when downloaded through LM Studio:
       --kv-bits 8 \
       --kv-group-size 64 \
       --quantized-kv-start 4096 \
-      --temp 0.2 \
+      --temp 0.4 \
       --top-p 0.95
 
 ### Server example
@@ -46,7 +46,7 @@ Example local path when downloaded through LM Studio:
       --kv-bits 8 \
       --kv-group-size 64 \
       --quantized-kv-start 4096 \
-      --temp 0.2 \
+      --temp 0.4 \
       --top-p 0.95
 
 ### Local runtime cache
