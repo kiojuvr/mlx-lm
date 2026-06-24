@@ -423,6 +423,7 @@ def generate_step(
     prompt_checkpoint_initial_cached_tokens: int = 0,
     prompt_checkpoint_store_prefix_lengths: Optional[Sequence[int]] = None,
     prompt_checkpoint_allow_existing_cache: bool = False,
+    prompt_checkpoint_save_exact: bool = True,
     prompt_checkpoint_frontier_min_tokens: int = (
         PROMPT_CHECKPOINT_FRONTIER_MIN_TOKENS
     ),
@@ -472,6 +473,9 @@ def generate_step(
         prompt_checkpoint_allow_existing_cache (bool): Treat a supplied
           ``prompt_cache`` as server-managed and allow disk checkpoint lookup to
           replace it when a longer disk prefix exists.
+        prompt_checkpoint_save_exact (bool): If ``True``, save the final exact
+          prompt checkpoint after prefill. Set ``False`` to store configured
+          prefix/frontier checkpoints without adding a full-prompt exact hit.
         prompt_checkpoint_frontier_min_tokens (int): First automatic long-prompt
           frontier to save. Defaults to 8192 tokens.
         prompt_checkpoint_frontier_stride_tokens (int): Token stride for
@@ -1110,11 +1114,18 @@ def generate_step(
             and prompt_checkpoint_exact_tokens is not None
             and prompt_checkpoint_hit_kind != "exact"
         ):
-            _save_prompt_checkpoint(
-                prompt_checkpoint_exact_tokens,
-                prompt_checkpoint_path,
-                "exact",
-            )
+            if prompt_checkpoint_save_exact:
+                _save_prompt_checkpoint(
+                    prompt_checkpoint_exact_tokens,
+                    prompt_checkpoint_path,
+                    "exact",
+                )
+            else:
+                _prompt_checkpoint_debug(
+                    "save exact skipped disabled "
+                    f"file={os.path.basename(prompt_checkpoint_path)} "
+                    f"prefix_length={len(prompt_checkpoint_exact_tokens)}"
+                )
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
@@ -1382,6 +1393,7 @@ def stream_generate(
         else:
             _prompt_checkpoint_debug("checkpoint disabled")
         kwargs.pop("prompt_checkpoint", None)
+        kwargs.pop("prompt_checkpoint_save_exact", None)
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(

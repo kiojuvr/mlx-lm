@@ -2,12 +2,14 @@
 """Lightweight GLM-5.2 prefill benchmark for long coding prompts."""
 
 import argparse
+import csv
 import json
 import logging
 import os
 import re
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -17,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mlx_lm.generate import PROMPT_CHECKPOINT_DEBUG_ENV, BatchGenerator, BatchStats
 from mlx_lm.generate import stream_generate
+from mlx_lm.models import cache as prompt_cache
+from mlx_lm.models import glm_moe_dsa
 from mlx_lm.utils import load
 
 
@@ -70,6 +74,12 @@ def encode(tokenizer, text):
     return tokenizer.encode(text)
 
 
+def prompt_to_tokens(tokenizer, prompt):
+    if isinstance(prompt, str):
+        return encode(tokenizer, prompt)
+    return [int(token) for token in prompt]
+
+
 def build_prompt_text(tokenizer, target_tokens, prefix_text=""):
     header = (
         "You are reviewing a large coding-agent context. "
@@ -83,6 +93,12 @@ def build_prompt_text(tokenizer, target_tokens, prefix_text=""):
         i += 1
         text = header + body
     return text
+
+
+def build_prompt_tokens(tokenizer, target_tokens, prefix_text=""):
+    return encode(tokenizer, build_prompt_text(tokenizer, target_tokens, prefix_text))[
+        :target_tokens
+    ]
 
 
 def build_queued_prompt_texts(tokenizer, args):
@@ -107,25 +123,90 @@ def build_queued_prompt_texts(tokenizer, args):
 
 def extract_checkpoint_summary(messages):
     summary = {
+        "checkpoint_total_prompt_tokens": None,
+        "server_cached_tokens": None,
+        "disk_cached_tokens": None,
+        "fresh_prompt_tokens": None,
+        "fresh_prefill_tokens": None,
+        "checkpoint_prefill_step_size": None,
         "checkpoint_resolution": None,
         "checkpoint_lookup_seconds": None,
+        "checkpoint_files_scanned": None,
+        "checkpoint_candidates_scanned": None,
+        "checkpoint_matched_candidates": None,
+        "checkpoint_manifest_entries": None,
+        "checkpoint_manifest_bootstrap": None,
         "checkpoint_events": len(messages),
     }
     for message in messages:
         if "prefill summary " not in message:
             continue
-        resolution = re.search(r"resolution=([^ ]+)", message)
-        lookup_seconds = re.search(r"lookup_seconds=([0-9.]+)", message)
-        if resolution:
-            summary["checkpoint_resolution"] = resolution.group(1)
-        if lookup_seconds:
-            summary["checkpoint_lookup_seconds"] = float(lookup_seconds.group(1))
+        for key, value in re.findall(r"([a-z_]+)=([^ ]+)", message):
+            output_key = {
+                "total_prompt_tokens": "checkpoint_total_prompt_tokens",
+                "prefill_step_size": "checkpoint_prefill_step_size",
+                "files_scanned": "checkpoint_files_scanned",
+                "candidates_scanned": "checkpoint_candidates_scanned",
+                "matched_candidates": "checkpoint_matched_candidates",
+                "manifest_entries": "checkpoint_manifest_entries",
+                "manifest_bootstrap": "checkpoint_manifest_bootstrap",
+                "lookup_seconds": "checkpoint_lookup_seconds",
+                "resolution": "checkpoint_resolution",
+            }.get(key, key)
+            if output_key not in summary:
+                continue
+            if output_key == "checkpoint_resolution":
+                summary[output_key] = value
+            elif output_key == "checkpoint_lookup_seconds":
+                summary[output_key] = float(value)
+            else:
+                summary[output_key] = int(value)
     return summary
 
 
-def run_once(model, tokenizer, text, args, case_name):
+def configure_glm_dsa_fast_prefill(args):
+    if args.fast_prefill == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+    elif args.fast_prefill == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+    if args.fast_prefill_query_chunk is not None:
+        os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
+            args.fast_prefill_query_chunk
+        )
+    if args.prefill_profile:
+        os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ENV] = "1"
+
+
+def reset_glm_dsa_profile():
+    glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+
+def collect_glm_dsa_profile(args):
+    profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+    stage_values = {}
+    for stage, values in profile["stages"].items():
+        key = f"glm_dsa_{stage}_seconds"
+        stage_values[key] = values["seconds"] if args.prefill_profile else None
+        stage_values[f"glm_dsa_{stage}_count"] = values["count"]
+    return {
+        "glm_dsa_fast_prefill": args.fast_prefill,
+        "glm_dsa_fast_prefill_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            "default-off",
+        ),
+        "glm_dsa_fast_prefill_query_chunk": os.environ.get(
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            "default",
+        ),
+        "glm_dsa_fast_prefill_hits": profile["fast_prefill_hits"],
+        "glm_dsa_fast_prefill_fallback_reasons": profile["fallback_reasons"],
+        **stage_values,
+    }
+
+
+def run_once(model, tokenizer, prompt, args, case_name):
     tokenize_t0 = time.perf_counter()
-    tokens = encode(tokenizer, text)
+    tokens = prompt_to_tokens(tokenizer, prompt)
     if args.target_tokens is not None:
         tokens = tokens[: args.target_tokens]
     tokenize_seconds = time.perf_counter() - tokenize_t0
@@ -143,6 +224,7 @@ def run_once(model, tokenizer, text, args, case_name):
         mx.reset_peak_memory()
     mx.clear_cache()
     mx.synchronize()
+    reset_glm_dsa_profile()
 
     ttft_t0 = time.perf_counter()
     response = None
@@ -157,6 +239,16 @@ def run_once(model, tokenizer, text, args, case_name):
             kv_group_size=args.kv_group_size,
             quantized_kv_start=args.quantized_kv_start,
             prompt_checkpoint=not args.no_prompt_checkpoint,
+            prompt_checkpoint_store_prefix_lengths=args.checkpoint_store_prefix_lengths,
+            prompt_checkpoint_save_exact=(
+                args.checkpoint_save_exact == "enabled"
+            ),
+            prompt_checkpoint_frontier_min_tokens=(
+                args.checkpoint_frontier_min_tokens
+            ),
+            prompt_checkpoint_frontier_stride_tokens=(
+                args.checkpoint_frontier_stride_tokens
+            ),
             prompt_progress_callback=lambda done, total: progress_events.append(
                 (done, total, time.perf_counter())
             ),
@@ -176,10 +268,17 @@ def run_once(model, tokenizer, text, args, case_name):
         raise RuntimeError(f"{case_name}: generation produced no response")
 
     checkpoint = extract_checkpoint_summary(capture.messages)
+    glm_profile = collect_glm_dsa_profile(args)
     return {
         "case": case_name,
         "mode": "single",
         "batch_size": 1,
+        "requested_total_tokens": args.target_tokens,
+        "stored_prefix_tokens": None,
+        "expected_reused_prefix_tokens": None,
+        "checkpoint_expected_match": None,
+        "checkpoint_cache_dir": args.resolved_checkpoint_cache_dir,
+        "checkpoint_save_exact": args.checkpoint_save_exact,
         "prompt_tokens": len(tokens),
         "tokenize_seconds": tokenize_seconds,
         "ttft_seconds": ttft_seconds,
@@ -188,6 +287,7 @@ def run_once(model, tokenizer, text, args, case_name):
         "progress_events": len(progress_events),
         "finish_reason": response.finish_reason,
         **checkpoint,
+        **glm_profile,
     }
 
 
@@ -220,6 +320,7 @@ def run_batch_once(model, tokenizer, text, args, case_name):
         mx.reset_peak_memory()
     mx.clear_cache()
     mx.synchronize()
+    reset_glm_dsa_profile()
 
     stats = BatchStats()
     responses = {}
@@ -256,6 +357,12 @@ def run_batch_once(model, tokenizer, text, args, case_name):
         "batch_size": args.batch_size,
         "prefill_batch_size": prefill_batch_size,
         "completion_batch_size": completion_batch_size,
+        "requested_total_tokens": args.target_tokens,
+        "stored_prefix_tokens": None,
+        "expected_reused_prefix_tokens": None,
+        "checkpoint_expected_match": None,
+        "checkpoint_cache_dir": args.resolved_checkpoint_cache_dir,
+        "checkpoint_save_exact": args.checkpoint_save_exact,
         "prompt_tokens": sum(len(p) for p in prompts),
         "prompt_tokens_per_request": [len(p) for p in prompts],
         "tokenize_seconds": tokenize_seconds,
@@ -267,7 +374,18 @@ def run_batch_once(model, tokenizer, text, args, case_name):
             sorted({str(r.finish_reason) for r in responses.values()})
         ),
         "checkpoint_resolution": "batch-n/a",
+        "checkpoint_total_prompt_tokens": None,
+        "server_cached_tokens": None,
+        "disk_cached_tokens": None,
+        "fresh_prompt_tokens": None,
+        "fresh_prefill_tokens": None,
+        "checkpoint_prefill_step_size": None,
         "checkpoint_lookup_seconds": None,
+        "checkpoint_files_scanned": None,
+        "checkpoint_candidates_scanned": None,
+        "checkpoint_matched_candidates": None,
+        "checkpoint_manifest_entries": None,
+        "checkpoint_manifest_bootstrap": None,
         "checkpoint_events": 0,
         "ttft_p50_seconds": first_response_seconds,
         "ttft_p95_seconds": first_response_seconds,
@@ -289,6 +407,7 @@ def run_batch_once(model, tokenizer, text, args, case_name):
         ),
         "active_batch_size_max": active_batch_size_max,
         **admission_stats,
+        **collect_glm_dsa_profile(args),
     }
 
 
@@ -319,6 +438,7 @@ def run_queued_once(model, tokenizer, _text, args, case_name):
         mx.reset_peak_memory()
     mx.clear_cache()
     mx.synchronize()
+    reset_glm_dsa_profile()
 
     stats = BatchStats()
     responses = {}
@@ -373,6 +493,12 @@ def run_queued_once(model, tokenizer, _text, args, case_name):
         "batch_size": args.batch_size,
         "prefill_batch_size": prefill_batch_size,
         "completion_batch_size": completion_batch_size,
+        "requested_total_tokens": None,
+        "stored_prefix_tokens": None,
+        "expected_reused_prefix_tokens": None,
+        "checkpoint_expected_match": None,
+        "checkpoint_cache_dir": args.resolved_checkpoint_cache_dir,
+        "checkpoint_save_exact": args.checkpoint_save_exact,
         "queued_requests": len(prompts),
         "prompt_tokens": sum(len(p) for p in prompts),
         "prompt_tokens_per_request": [len(p) for p in prompts],
@@ -387,12 +513,24 @@ def run_queued_once(model, tokenizer, _text, args, case_name):
             sorted({str(r.finish_reason) for r in responses.values()})
         ),
         "checkpoint_resolution": "batch-n/a",
+        "checkpoint_total_prompt_tokens": None,
+        "server_cached_tokens": None,
+        "disk_cached_tokens": None,
+        "fresh_prompt_tokens": None,
+        "fresh_prefill_tokens": None,
+        "checkpoint_prefill_step_size": None,
         "checkpoint_lookup_seconds": None,
+        "checkpoint_files_scanned": None,
+        "checkpoint_candidates_scanned": None,
+        "checkpoint_matched_candidates": None,
+        "checkpoint_manifest_entries": None,
+        "checkpoint_manifest_bootstrap": None,
         "checkpoint_events": 0,
         "admission_wait_p50_seconds": percentile(wait_seconds, 50),
         "admission_wait_p95_seconds": percentile(wait_seconds, 95),
         "active_batch_size_max": max(active_sizes) if active_sizes else 0,
         **admission_stats,
+        **collect_glm_dsa_profile(args),
     }
     result["admission_events"] = admission_events
     result["active_batch_size_samples"] = active_samples
@@ -417,13 +555,41 @@ def summarize_repeats(rows):
     return summaries
 
 
-def print_table(rows):
+def format_output_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return str(value)
+
+
+def print_table(rows, output_format):
     headers = [
         "case",
         "mode",
         "batch_size",
         "prefill_batch_size",
         "completion_batch_size",
+        "requested_total_tokens",
+        "stored_prefix_tokens",
+        "expected_reused_prefix_tokens",
+        "disk_cached_tokens",
+        "fresh_prompt_tokens",
+        "fresh_prefill_tokens",
+        "checkpoint_expected_match",
+        "checkpoint_total_prompt_tokens",
+        "server_cached_tokens",
+        "checkpoint_prefill_step_size",
+        "checkpoint_cache_dir",
+        "checkpoint_save_exact",
+        "checkpoint_lookup_seconds",
+        "checkpoint_files_scanned",
+        "checkpoint_candidates_scanned",
+        "checkpoint_matched_candidates",
+        "checkpoint_manifest_entries",
+        "checkpoint_manifest_bootstrap",
         "prompt_tokens",
         "tokenize_seconds",
         "ttft_seconds",
@@ -440,24 +606,187 @@ def print_table(rows):
         "active_batch_size_max",
         "queued_request_count",
         "checkpoint_resolution",
+        "glm_dsa_fast_prefill",
+        "glm_dsa_fast_prefill_env",
+        "glm_dsa_fast_prefill_query_chunk",
+        "glm_dsa_fast_prefill_hits",
+        "glm_dsa_fast_prefill_fallback_reasons",
+        "glm_dsa_q_projection_seconds",
+        "glm_dsa_kv_cache_update_seconds",
+        "glm_dsa_dsa_indexer_topk_seconds",
+        "glm_dsa_latent_kv_dequantization_seconds",
+        "glm_dsa_latent_kv_projection_seconds",
+        "glm_dsa_sparse_gather_seconds",
+        "glm_dsa_attention_seconds",
+        "glm_dsa_total_prefill_seconds",
     ]
-    print("\t".join(headers))
+    delimiter = "," if output_format == "csv" else "\t"
+    writer = csv.writer(sys.stdout, delimiter=delimiter, lineterminator="\n")
+    writer.writerow(headers)
     for row in rows:
-        print(
-            "\t".join(
-                str(round(row[h], 4))
-                if isinstance(row.get(h), float)
-                else str(row.get(h))
-                for h in headers
-            )
+        writer.writerow([format_output_cell(row.get(h)) for h in headers])
+
+
+def configure_checkpoint_cache_dir(args):
+    if args.mode == "controlled-lcp" and args.checkpoint_cache_dir is None:
+        args.checkpoint_cache_dir = Path(
+            tempfile.mkdtemp(prefix="glm52-lcp-checkpoints-")
         )
+
+    old_cache_dir = os.environ.get(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV)
+    if args.checkpoint_cache_dir is None:
+        args.resolved_checkpoint_cache_dir = None
+        return old_cache_dir
+
+    resolved = args.checkpoint_cache_dir.expanduser().resolve()
+    os.environ[prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV] = str(resolved)
+    args.resolved_checkpoint_cache_dir = str(resolved)
+    return old_cache_dir
+
+
+def restore_checkpoint_cache_dir(old_cache_dir):
+    if old_cache_dir is None:
+        os.environ.pop(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV, None)
+    else:
+        os.environ[prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV] = old_cache_dir
+
+
+def controlled_lcp_lengths(args):
+    prefix_tokens = (
+        args.lcp_prefix_tokens
+        if args.lcp_prefix_tokens is not None
+        else args.repeat_prefix_tokens
+    )
+    suffix_tokens = (
+        args.lcp_suffix_tokens
+        if args.lcp_suffix_tokens is not None
+        else args.repeat_suffix_tokens
+    )
+    if prefix_tokens <= 0:
+        raise ValueError("--lcp-prefix-tokens must be positive")
+    if suffix_tokens <= 0:
+        raise ValueError("--lcp-suffix-tokens must be positive")
+
+    requested_total_tokens = prefix_tokens + suffix_tokens
+    store_lengths = args.checkpoint_store_prefix_lengths or [prefix_tokens]
+    valid_store_lengths = sorted(
+        {
+            int(length)
+            for length in store_lengths
+            if (
+                0 < int(length) < requested_total_tokens
+                and int(length) <= prefix_tokens
+            )
+        }
+    )
+    if not valid_store_lengths:
+        raise ValueError(
+            "controlled LCP requires a store prefix length within the shared prefix"
+        )
+    return prefix_tokens, suffix_tokens, requested_total_tokens, valid_store_lengths
+
+
+def build_controlled_lcp_prompts(tokenizer, prefix_tokens, suffix_tokens):
+    prefix = build_prompt_tokens(tokenizer, prefix_tokens)
+    suffix_a = build_prompt_tokens(
+        tokenizer,
+        suffix_tokens,
+        prefix_text="\n\nControlled LCP seed suffix A.\n",
+    )
+    suffix_b = build_prompt_tokens(
+        tokenizer,
+        suffix_tokens,
+        prefix_text="\n\nControlled LCP measured suffix B.\n",
+    )
+    return prefix + suffix_a, prefix + suffix_b
+
+
+def run_controlled_lcp(model, tokenizer, args):
+    (
+        prefix_tokens,
+        suffix_tokens,
+        requested_total_tokens,
+        store_lengths,
+    ) = controlled_lcp_lengths(args)
+    stored_prefix_tokens = 0 if args.no_prompt_checkpoint else max(store_lengths)
+    expected_reused_prefix_tokens = stored_prefix_tokens
+    seed_prompt, hit_prompt = build_controlled_lcp_prompts(
+        tokenizer,
+        prefix_tokens,
+        suffix_tokens,
+    )
+
+    old_target_tokens = getattr(args, "target_tokens", None)
+    old_store_lengths = args.checkpoint_store_prefix_lengths
+    old_frontier_min = args.checkpoint_frontier_min_tokens
+    args.target_tokens = requested_total_tokens
+    args.checkpoint_store_prefix_lengths = store_lengths
+    args.checkpoint_frontier_min_tokens = max(
+        args.checkpoint_frontier_min_tokens,
+        requested_total_tokens + 1,
+    )
+    try:
+        seed_row = run_once(
+            model,
+            tokenizer,
+            seed_prompt,
+            args,
+            "controlled-lcp-store",
+        )
+        seed_row.update(
+            {
+                "requested_total_tokens": requested_total_tokens,
+                "stored_prefix_tokens": stored_prefix_tokens,
+                "expected_reused_prefix_tokens": 0,
+                "checkpoint_expected_match": (
+                    seed_row.get("disk_cached_tokens") == 0
+                ),
+                "lcp_prefix_tokens": prefix_tokens,
+                "lcp_suffix_tokens": suffix_tokens,
+            }
+        )
+
+        hit_row = run_once(
+            model,
+            tokenizer,
+            hit_prompt,
+            args,
+            "controlled-lcp-hit",
+        )
+        hit_row.update(
+            {
+                "requested_total_tokens": requested_total_tokens,
+                "stored_prefix_tokens": stored_prefix_tokens,
+                "expected_reused_prefix_tokens": expected_reused_prefix_tokens,
+                "checkpoint_expected_match": (
+                    hit_row.get("disk_cached_tokens")
+                    == expected_reused_prefix_tokens
+                ),
+                "lcp_prefix_tokens": prefix_tokens,
+                "lcp_suffix_tokens": suffix_tokens,
+            }
+        )
+        if not args.no_prompt_checkpoint and not hit_row["checkpoint_expected_match"]:
+            raise RuntimeError(
+                "controlled LCP checkpoint mismatch: "
+                f"expected disk_cached_tokens={expected_reused_prefix_tokens}, "
+                f"got {hit_row.get('disk_cached_tokens')} "
+                f"(resolution={hit_row.get('checkpoint_resolution')})"
+            )
+        return [seed_row, hit_row]
+    finally:
+        args.target_tokens = old_target_tokens
+        args.checkpoint_store_prefix_lengths = old_store_lengths
+        args.checkpoint_frontier_min_tokens = old_frontier_min
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local path or HF repo.")
     parser.add_argument(
-        "--mode", choices=("single", "batch", "queued"), default="single"
+        "--mode",
+        choices=("single", "batch", "queued", "controlled-lcp"),
+        default="single",
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--prefill-batch-size", type=int)
@@ -469,69 +798,193 @@ def main():
     parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--repeat-runs", type=int, default=1)
     parser.add_argument("--repeat-prefix-tokens", type=int, default=8192)
+    parser.add_argument("--repeat-suffix-tokens", type=int, default=256)
+    parser.add_argument(
+        "--lcp-prefix-tokens",
+        type=int,
+        help=(
+            "Shared prefix tokens for --mode controlled-lcp. Defaults to "
+            "--repeat-prefix-tokens."
+        ),
+    )
+    parser.add_argument(
+        "--lcp-suffix-tokens",
+        type=int,
+        help=(
+            "Changed suffix tokens for --mode controlled-lcp. Defaults to "
+            "--repeat-suffix-tokens."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--kv-bits", type=int)
     parser.add_argument("--kv-group-size", type=int, default=64)
     parser.add_argument("--quantized-kv-start", type=int, default=0)
+    parser.add_argument(
+        "--checkpoint-store-prefix-lengths",
+        type=parse_lengths,
+        default=None,
+        help=(
+            "Comma-separated token prefix lengths to save as reusable prompt "
+            "checkpoints during single-request runs."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-frontier-min-tokens",
+        type=int,
+        default=8192,
+        help="First automatic frontier checkpoint length for single-request runs.",
+    )
+    parser.add_argument(
+        "--checkpoint-frontier-stride-tokens",
+        type=int,
+        default=16384,
+        help="Stride for automatic frontier checkpoint lengths.",
+    )
+    parser.add_argument(
+        "--checkpoint-save-exact",
+        choices=("enabled", "disabled"),
+        default=None,
+        help=(
+            "Save the final exact prompt checkpoint after prefill. Defaults to "
+            "enabled except in --mode controlled-lcp."
+        ),
+    )
+    parser.add_argument(
+        "--no-save-exact-checkpoint",
+        action="store_const",
+        const="disabled",
+        dest="checkpoint_save_exact",
+        help="Alias for --checkpoint-save-exact disabled.",
+    )
+    parser.add_argument(
+        "--checkpoint-cache-dir",
+        type=Path,
+        help=(
+            "Directory for prompt checkpoint files and manifest for this run. "
+            "In controlled-lcp mode, a private temporary directory is created "
+            "when this is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--fast-prefill",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control GLM DSA sparse prefill fast path. The default leaves "
+            "MLX_LM_GLM_DSA_FAST_PREFILL unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--fast-prefill-query-chunk",
+        type=int,
+        help="Query microbatch size for the GLM DSA sparse prefill gather path.",
+    )
+    parser.add_argument(
+        "--prefill-profile",
+        action="store_true",
+        help=(
+            "Synchronize and report GLM DSA prefill stage timings. This adds "
+            "profiling overhead and is intended for measurement runs."
+        ),
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--no-prompt-checkpoint", action="store_true")
+    parser.add_argument(
+        "--output-format",
+        choices=("tsv", "csv"),
+        default="tsv",
+        help="Tab-separated or comma-separated console table output.",
+    )
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
+    if args.checkpoint_save_exact is None:
+        args.checkpoint_save_exact = (
+            "disabled" if args.mode == "controlled-lcp" else "enabled"
+        )
+    args.target_tokens = None
+    configure_glm_dsa_fast_prefill(args)
+    old_checkpoint_cache_dir = configure_checkpoint_cache_dir(args)
 
-    tokenizer_config = {"trust_remote_code": args.trust_remote_code}
-    model, tokenizer = load(
-        args.model,
-        tokenizer_config=tokenizer_config,
-        trust_remote_code=args.trust_remote_code,
-    )
+    try:
+        tokenizer_config = {"trust_remote_code": args.trust_remote_code}
+        model, tokenizer = load(
+            args.model,
+            tokenizer_config=tokenizer_config,
+            trust_remote_code=args.trust_remote_code,
+        )
 
-    rows = []
-    if args.mode == "queued":
-        runner = run_queued_once
-    elif args.mode == "batch":
-        runner = run_batch_once
-    else:
-        runner = run_once
-    if args.prompt_file:
-        text = args.prompt_file.read_text()
-        args.target_tokens = None
-        for run in range(args.repeat_runs):
-            rows.append(runner(model, tokenizer, text, args, f"file-run-{run + 1}"))
-    elif args.mode == "queued":
-        for run in range(args.repeat_runs):
-            rows.append(runner(model, tokenizer, "", args, f"queued-run-{run + 1}"))
-    else:
-        for length in parse_lengths(args.lengths):
-            args.target_tokens = length
-            text = build_prompt_text(tokenizer, length)
-            for run in range(args.repeat_runs):
-                rows.append(
-                    runner(model, tokenizer, text, args, f"synthetic-{length}")
-                )
-
-        if args.mode == "single" and args.repeat_prefix_tokens > 0:
-            prefix = build_prompt_text(tokenizer, args.repeat_prefix_tokens)
-            for suffix in ("change-a", "change-b"):
-                args.target_tokens = args.repeat_prefix_tokens + 256
-                text = prefix + CODING_SNIPPET.format(i=suffix)
+        rows = []
+        if args.mode == "controlled-lcp":
+            rows.extend(run_controlled_lcp(model, tokenizer, args))
+        else:
+            if args.mode == "queued":
+                runner = run_queued_once
+            elif args.mode == "batch":
+                runner = run_batch_once
+            else:
+                runner = run_once
+            if args.prompt_file:
+                text = args.prompt_file.read_text()
+                args.target_tokens = None
                 for run in range(args.repeat_runs):
                     rows.append(
-                        runner(
-                            model,
-                            tokenizer,
-                            text,
-                            args,
-                            f"repeated-prefix-{suffix}",
-                        )
+                        runner(model, tokenizer, text, args, f"file-run-{run + 1}")
                     )
+            elif args.mode == "queued":
+                for run in range(args.repeat_runs):
+                    rows.append(
+                        runner(model, tokenizer, "", args, f"queued-run-{run + 1}")
+                    )
+            else:
+                for length in parse_lengths(args.lengths):
+                    args.target_tokens = length
+                    text = build_prompt_text(tokenizer, length)
+                    for run in range(args.repeat_runs):
+                        rows.append(
+                            runner(
+                                model,
+                                tokenizer,
+                                text,
+                                args,
+                                f"synthetic-{length}",
+                            )
+                        )
 
-    summaries = summarize_repeats(rows)
-    print_table(summaries)
-    if args.json_output:
-        args.json_output.write_text(
-            json.dumps({"runs": rows, "summary": summaries}, indent=2)
-        )
+                if args.mode == "single" and args.repeat_prefix_tokens > 0:
+                    prefix = build_prompt_text(tokenizer, args.repeat_prefix_tokens)
+                    for suffix in ("change-a", "change-b"):
+                        args.target_tokens = (
+                            args.repeat_prefix_tokens + args.repeat_suffix_tokens
+                        )
+                        text = (
+                            f"{prefix}\n\n"
+                            f"Repeated-prefix request {suffix}:\n"
+                            "Reuse the stable prefix and analyze the changed suffix.\n"
+                        )
+                        snippet_id = suffix
+                        while len(encode(tokenizer, text)) < args.target_tokens:
+                            text += CODING_SNIPPET.format(i=snippet_id)
+                            snippet_id = f"{snippet_id}-next"
+                        for run in range(args.repeat_runs):
+                            rows.append(
+                                runner(
+                                    model,
+                                    tokenizer,
+                                    text,
+                                    args,
+                                    f"repeated-prefix-{suffix}",
+                                )
+                            )
+
+        summaries = summarize_repeats(rows)
+        print_table(summaries, args.output_format)
+        if args.json_output:
+            args.json_output.write_text(
+                json.dumps({"runs": rows, "summary": summaries}, indent=2)
+            )
+    finally:
+        restore_checkpoint_cache_dir(old_checkpoint_cache_dir)
 
 
 if __name__ == "__main__":
