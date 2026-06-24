@@ -27,6 +27,7 @@ from mlx_lm.models.cache import (
     EMPTY_ARRAYS_METADATA_KEY,
     GlmMlaKVCache,
     KVCache,
+    PROMPT_CHECKPOINT_CACHE_DIR_ENV,
     PROMPT_CHECKPOINT_MAX_BYTES_ENV,
     PROMPT_CHECKPOINT_MAX_FILES_ENV,
     PromptCacheCheckpointError,
@@ -35,6 +36,7 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     expected_glm_mla_kv_quantization_metadata,
     expected_glm_mla_kv_settings_metadata,
+    ensure_glm52_local_cache_dirs,
     glm52_kv_cache_dir,
     glm52_local_cache_root,
     glm52_prompt_checkpoints_dir,
@@ -99,6 +101,16 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
 
         self.addCleanup(restore_env)
 
+    def _clear_env(self, name):
+        old_value = os.environ.get(name)
+        os.environ.pop(name, None)
+
+        def restore_env():
+            if old_value is not None:
+                os.environ[name] = old_value
+
+        self.addCleanup(restore_env)
+
     def _filled_kv_cache(self, shape=(1, 2, 4, 8), dtype=mx.float32):
         cache = [KVCache() for _ in range(2)]
         for c in cache:
@@ -108,6 +120,7 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
 
     def test_glm52_local_cache_paths(self):
         self._set_home_to_test_dir()
+        self._clear_env(PROMPT_CHECKPOINT_CACHE_DIR_ENV)
         expected_root = os.path.join(
             self.test_dir,
             ".cache",
@@ -133,6 +146,30 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 f"{prompt_prefix_hash(prompt)}-3.safetensors",
             ),
         )
+
+    def test_prompt_checkpoint_cache_dir_override(self):
+        self._set_home_to_test_dir()
+        override_dir = os.path.join(self.test_dir, "isolated-checkpoints")
+        self._set_env(PROMPT_CHECKPOINT_CACHE_DIR_ENV, override_dir)
+        prompt = [1, 2, 3]
+
+        self.assertEqual(glm52_prompt_checkpoints_dir(), override_dir)
+        self.assertEqual(
+            prompt_checkpoint_file(prompt),
+            os.path.join(
+                override_dir,
+                f"{prompt_prefix_hash(prompt)}-3.safetensors",
+            ),
+        )
+        ensure_glm52_local_cache_dirs()
+        save_prompt_checkpoint(
+            prompt_checkpoint_file(prompt),
+            self._filled_kv_cache(),
+            prefix_tokens=prompt,
+        )
+
+        self.assertTrue(os.path.isdir(override_dir))
+        self.assertFalse(os.path.exists(glm52_kv_cache_dir()))
 
     def test_checkpoint_validates_prefix_namespace_and_model_hint(self):
         cache = self._filled_kv_cache()
@@ -625,6 +662,32 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         for (_, expected), (_, from_hit) in zip(baseline_b, hit_b):
             self.assertTrue(mx.allclose(expected, from_hit).item())
 
+    def test_prompt_checkpoint_can_skip_final_exact_save(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        stable_prefix = [1, 2, 3, 4]
+        prompt = mx.array(stable_prefix + [10, 11, 12])
+
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(
+                generate_step(
+                    prompt,
+                    model,
+                    max_tokens=1,
+                    prefill_step_size=2,
+                    prompt_checkpoint_store_prefix_lengths=[len(stable_prefix)],
+                    prompt_checkpoint_save_exact=False,
+                )
+            )
+
+        output = "\n".join(logs.output)
+        self.assertTrue(os.path.exists(prompt_checkpoint_file(stable_prefix)))
+        self.assertFalse(os.path.exists(prompt_checkpoint_file(prompt.tolist())))
+        self.assertIn("save prefix success", output)
+        self.assertIn("save exact skipped disabled", output)
+        self.assertNotIn("save exact success", output)
+
     def test_long_prompt_saves_multiple_frontier_checkpoints(self):
         self._set_home_to_test_dir()
         self._set_prompt_checkpoint_debug()
@@ -739,6 +802,94 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertEqual([tok for tok, _ in hit_b], [tok for tok, _ in baseline_b])
         for (_, expected), (_, from_hit) in zip(baseline_b, hit_b):
             self.assertTrue(mx.allclose(expected, from_hit).item())
+
+    def test_prompt_checkpoint_token_mismatch_does_not_reuse_frontier(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        prompt_a = list(range(1, 16))
+        prompt_b = [999] + list(range(2, 16))
+
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    mx.array(prompt_a),
+                    model,
+                    max_tokens=1,
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        progress = []
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(
+                generate_step(
+                    mx.array(prompt_b),
+                    model,
+                    max_tokens=1,
+                    prompt_progress_callback=lambda processed, total: progress.append(
+                        (processed, total)
+                    ),
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        output = "\n".join(logs.output)
+        self.assertIn("miss file does not exist", output)
+        self.assertIn("matched_candidates=0", output)
+        self.assertNotIn("prompt checkpoint: frontier hit", output)
+        self.assertEqual(progress[0], (0, len(prompt_b)))
+
+    def test_prompt_checkpoint_incompatible_glm_dsa_metadata_rejects_frontier(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model_a = self._make_glm_moe_dsa_model(pattern="FSFS")
+        model_b = self._make_glm_moe_dsa_model(pattern="FFFF")
+        common = list(range(1, 13))
+        prompt_a = common + [101, 102, 103]
+        prompt_b = common + [201, 202, 203]
+
+        baseline_b = list(
+            generate_step(
+                mx.array(prompt_b),
+                model_b,
+                max_tokens=1,
+                prompt_checkpoint=False,
+                prefill_step_size=5,
+            )
+        )
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    mx.array(prompt_a),
+                    model_a,
+                    max_tokens=1,
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        progress = []
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            outputs = list(
+                generate_step(
+                    mx.array(prompt_b),
+                    model_b,
+                    max_tokens=1,
+                    prompt_progress_callback=lambda processed, total: progress.append(
+                        (processed, total)
+                    ),
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        output = "\n".join(logs.output)
+        self.assertIn("miss rejected", output)
+        self.assertNotIn("prompt checkpoint: frontier hit", output)
+        self.assertIn("fresh_prefill_tokens=14", output)
+        self.assertEqual(progress[0], (0, len(prompt_b)))
+        self.assertEqual([tok for tok, _ in outputs], [tok for tok, _ in baseline_b])
+        for (_, expected), (_, actual) in zip(baseline_b, outputs):
+            self.assertTrue(mx.allclose(expected, actual).item())
 
     def test_server_prompt_cache_coverage_wins_over_disk_frontier(self):
         self._set_home_to_test_dir()

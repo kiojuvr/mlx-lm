@@ -62,17 +62,98 @@ Do not pass `--model-name` for this OpenCode setup unless you have explicitly ve
 
 `--temp 0.4` and `--top-p 0.95` are recommended as conservative default sampling settings for coding-agent and long-context workflows. In local use, lower-temperature sampling helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
 
-`--kv-bits 8` is not a cold-prefill speedup by itself. Its value is that GLM MLA int8 KV cache can now be used with continuous batching, which makes long-context queued serving more practical and gives memory/concurrency headroom.
+`--kv-bits 8` is not a cold-prefill speedup by itself. Its value is that GLM MLA int8 KV cache can now be used with continuous batching, which makes long-context queued serving more practical and gives memory/concurrency headroom. It is most useful for long-running local serving where KV memory and concurrency matter.
 
-Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For this machine, `--prompt-concurrency 2` and `--decode-concurrency 2` were the best default balance. Avoid setting decode concurrency higher than prompt concurrency for fresh long-prefix workloads unless you are comfortable with mixed-cache rejection churn.
+Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. Keep it enabled for normal serving. For this machine, `--prompt-concurrency 2` and `--decode-concurrency 2` were the best default balance. Avoid `--prompt-concurrency 4` as a default: it barely improved TPS at 4096 tokens, but roughly doubled TTFT and added 6 to 9GB peak memory. Also avoid decode concurrency higher than prompt concurrency for fresh long-prefix workloads unless you are comfortable with mixed-cache rejection churn; one q8/p2/c4 run hit 90 rejections and p95 wait around 195s.
 
-Keep prompt checkpointing enabled. It is the dominant TTFT win for repeated prefixes: 4096/8192 exact hits dropped from ~23s/~52s to ~0.2s. 
+### Prompt checkpoints and LCP reuse
 
-**Interpretation** 
-kv_bits=8 does not materially improve cold prefill speed. It helps by enabling continuous batching with long GLM MLA contexts and gives modest memory headroom, especially as contexts grow. It is most useful for long-running local serving where KV memory and concurrency matter. Avoid prompt-concurrency=4 as a default. It barely improves TPS at 4096, but roughly doubles TTFT and adds 6 to 9GB peak memory. Also avoid decode-concurrency > prompt-concurrency for fresh long prefixes unless you are comfortable with mixed-cache rejection churn; q8/p2/c4 hit 90 rejections and p95 wait ~195s. 
+This fork automatically stores trusted local GLM-5.2 prompt checkpoints and reuses the longest exact token prefix it can validate. The lookup is deterministic longest-common-prefix reuse, not fuzzy matching:
 
-**Bottleneck Hypothesis** 
-The bottleneck is still long-context prefill itself: later 32k chunks climbed to ~40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.
+- exact full-prompt hits replay the last prompt token and skip almost all prefill;
+- prefix/frontier hits restore cached KV/DSA state for the shared prefix and prefill only the changed suffix;
+- disabled checkpointing reports `checkpoint_resolution=disabled`, `disk_cached_tokens=0`, and a full fresh prefill;
+- mismatched tokens, incompatible GLM DSA metadata, incompatible GLM MLA KV settings, malformed checkpoints, or missing files fall back to a normal miss.
+
+Benchmark-backed measurements on this local fork showed exact 4096/8192-token checkpoint hits dropping TTFT from roughly 23s/52s to roughly 0.2s. Controlled LCP runs are the clean way to measure partial reuse: for example, an 8192-token cached prefix plus a 2048-token suffix should report `expected_reused_prefix_tokens=8192`, `disk_cached_tokens=8192`, `fresh_prompt_tokens=2048`, and `checkpoint_expected_match=true`.
+
+Use `--no-prompt-checkpoint` only for cold or disabled-baseline measurements. Use `--checkpoint-save-exact disabled` or `--no-save-exact-checkpoint` when you want to store only configured prefix/frontier checkpoints without also creating a final exact full-prompt checkpoint.
+
+### Controlled LCP benchmark examples
+
+Set `MODEL` once:
+
+```sh
+MODEL="$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"
+```
+
+Disabled baseline with the same controlled-LCP row schema:
+
+```sh
+LCP_DISABLED_DIR="$(mktemp -d)"
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode controlled-lcp \
+  --lcp-prefix-tokens 8192 --lcp-suffix-tokens 2048 \
+  --max-tokens 1 --prefill-step-size 2048 \
+  --fast-prefill disabled \
+  --checkpoint-cache-dir "$LCP_DISABLED_DIR" \
+  --no-prompt-checkpoint \
+  --json-output glm52-lcp-disabled-8192-2048.json
+```
+
+6144-token prefix reuse plus a 2048-token suffix:
+
+```sh
+LCP_6144_DIR="$(mktemp -d)"
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode controlled-lcp \
+  --lcp-prefix-tokens 6144 --lcp-suffix-tokens 2048 \
+  --max-tokens 1 --prefill-step-size 2048 \
+  --fast-prefill disabled \
+  --checkpoint-cache-dir "$LCP_6144_DIR" \
+  --checkpoint-save-exact disabled \
+  --json-output glm52-lcp-6144-2048.json
+```
+
+8192-token prefix reuse plus a 2048-token suffix:
+
+```sh
+LCP_8192_DIR="$(mktemp -d)"
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode controlled-lcp \
+  --lcp-prefix-tokens 8192 --lcp-suffix-tokens 2048 \
+  --max-tokens 1 --prefill-step-size 2048 \
+  --fast-prefill disabled \
+  --checkpoint-cache-dir "$LCP_8192_DIR" \
+  --checkpoint-save-exact disabled \
+  --json-output glm52-lcp-8192-2048.json
+```
+
+Same 8192+2048 reuse path with GLM MLA int8 KV cache:
+
+```sh
+LCP_INT8_DIR="$(mktemp -d)"
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode controlled-lcp \
+  --lcp-prefix-tokens 8192 --lcp-suffix-tokens 2048 \
+  --max-tokens 1 --prefill-step-size 2048 \
+  --fast-prefill disabled \
+  --kv-bits 8 --kv-group-size 64 --quantized-kv-start 4096 \
+  --checkpoint-cache-dir "$LCP_INT8_DIR" \
+  --checkpoint-save-exact disabled \
+  --json-output glm52-lcp-int8-8192-2048.json
+```
+
+The controlled benchmark raises on checkpoint-enabled prefix/exact rows when actual `disk_cached_tokens` differs from the expected prefix length. Disabled baseline rows are valid comparison rows and should report zero expected and actual disk reuse.
+
+On the tested Mac Studio M3 Ultra 512GB setup, a controlled 10240-token run with an 8192-token cached prefix and a 2048-token fresh suffix reduced TTFT from roughly 71.6s full fresh prefill to roughly 17.8s prefix reuse.
+
+### Fast sparse DSA prefill caveat
+
+The benchmark exposes an opt-in GLM DSA sparse prefill path with `--fast-prefill enabled` and `--fast-prefill-query-chunk`. It is useful for profiling DSA/top-k behavior, but it is not the recommended speed path today. Local 4k profiling showed the exact sparse gather path was slower than the fallback at the GLM-5.2 default `index_topk=2048`; selected K/V gather and sparse attention dominated. The practical TTFT win for repeated coding-agent prefixes is checkpoint reuse.
+
+**Bottleneck hypothesis**
+The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.
 
 ### OpenCode configuration example
 
@@ -118,10 +199,20 @@ Prompt checkpoints are stored under:
 
 A `kv/` directory is also reserved under the same root.
 
+For benchmark runs, prefer an isolated checkpoint directory so measurements do not touch normal serving cache state:
+
+    --checkpoint-cache-dir "$(mktemp -d)"
+
+The benchmark option maps to the `MLX_LM_PROMPT_CHECKPOINT_CACHE_DIR` environment override. It redirects the prompt checkpoint files and manifest only; the default serving cache remains under `~/.cache/mlx-lm/glm52-local/`.
+
 When changing model weights, quantization, tokenizer, adapters, GLM implementation details, or KV quantization settings, invalidate the local runtime cache by moving or deleting the shared root:
 
     mv ~/.cache/mlx-lm/glm52-local \
        ~/.cache/mlx-lm/glm52-local.bak.$(date +%Y%m%d_%H%M%S)
+
+To clear only prompt checkpoints while keeping the reserved cache root:
+
+    rm -rf ~/.cache/mlx-lm/glm52-local/prompt-checkpoints
 
 #### Prompt checkpoint retention limits
 

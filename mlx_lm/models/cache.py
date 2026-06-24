@@ -29,6 +29,7 @@ KV_RUNTIME_CACHE_DIR = "kv"
 EMPTY_ARRAYS_METADATA_KEY = "__mlx_lm_prompt_cache_empty_arrays_v1__"
 PROMPT_CHECKPOINT_MANIFEST_NAME = "manifest.json"
 PROMPT_CHECKPOINT_MANIFEST_VERSION = 1
+PROMPT_CHECKPOINT_CACHE_DIR_ENV = "MLX_LM_PROMPT_CHECKPOINT_CACHE_DIR"
 PROMPT_CHECKPOINT_MAX_FILES_ENV = "MLX_LM_PROMPT_CHECKPOINT_MAX_FILES"
 PROMPT_CHECKPOINT_MAX_BYTES_ENV = "MLX_LM_PROMPT_CHECKPOINT_MAX_BYTES"
 DEFAULT_PROMPT_CHECKPOINT_MAX_FILES = 256
@@ -65,7 +66,17 @@ def glm52_local_cache_root():
     return os.path.expanduser(GLM52_LOCAL_CACHE_ROOT)
 
 
+def prompt_checkpoint_cache_dir_override():
+    path = os.environ.get(PROMPT_CHECKPOINT_CACHE_DIR_ENV)
+    if not path:
+        return None
+    return os.path.abspath(os.path.expanduser(path))
+
+
 def glm52_prompt_checkpoints_dir():
+    override = prompt_checkpoint_cache_dir_override()
+    if override is not None:
+        return override
     return os.path.join(glm52_local_cache_root(), PROMPT_CHECKPOINTS_CACHE_DIR)
 
 
@@ -79,7 +90,8 @@ def glm52_kv_cache_dir():
 
 def ensure_glm52_local_cache_dirs():
     os.makedirs(glm52_prompt_checkpoints_dir(), exist_ok=True)
-    os.makedirs(glm52_kv_cache_dir(), exist_ok=True)
+    if prompt_checkpoint_cache_dir_override() is None:
+        os.makedirs(glm52_kv_cache_dir(), exist_ok=True)
 
 
 def _is_empty_array(value):

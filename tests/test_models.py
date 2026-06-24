@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import os
 import unittest
 
 import mlx.core as mx
@@ -375,6 +376,180 @@ class TestModels(unittest.TestCase):
 
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
+
+    def _make_glm_moe_dsa_model(
+        self,
+        *,
+        index_topk=4,
+        index_topk_pattern="FS",
+        kv_lora_rank=64,
+        num_hidden_layers=2,
+    ):
+        from mlx_lm.models import glm_moe_dsa
+
+        args = glm_moe_dsa.ModelArgs(
+            model_type="glm_moe_dsa",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=index_topk,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=kv_lora_rank,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0},
+            attention_bias=False,
+            index_topk_pattern=index_topk_pattern,
+        )
+        return glm_moe_dsa.Model(args)
+
+    def _restore_env(self, saved):
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_glm_moe_dsa_fast_prefill_matches_fallback(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        prefix = mx.array([[1, 2, 3, 4]])
+        suffix = mx.array([[5, 6, 7, 8]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+            slow_cache = make_prompt_cache(model)
+            model(prefix, cache=slow_cache)
+            slow_logits = model(suffix, cache=slow_cache)
+
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+            fast_cache = make_prompt_cache(model)
+            model(prefix, cache=fast_cache)
+            fast_logits = model(suffix, cache=fast_cache)
+            mx.eval(slow_logits, fast_logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertGreater(profile["fast_prefill_hits"], 0)
+            self.assertTrue(mx.allclose(slow_logits, fast_logits, rtol=1e-4, atol=1e-4))
+        finally:
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_fast_prefill_matches_quantized_cache_fallback(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        model.set_dtype(mx.float16)
+        prefix = mx.array([[1, 2, 3, 4]])
+        suffix = mx.array([[5, 6, 7, 8]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+
+        def quantized_prompt_cache():
+            return [
+                layer_cache.to_quantized(group_size=64, bits=8)
+                for layer_cache in make_prompt_cache(model)
+            ]
+
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+            slow_cache = quantized_prompt_cache()
+            model(prefix, cache=slow_cache)
+            slow_logits = model(suffix, cache=slow_cache)
+
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+            fast_cache = quantized_prompt_cache()
+            model(prefix, cache=fast_cache)
+            fast_logits = model(suffix, cache=fast_cache)
+            mx.eval(slow_logits, fast_logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertGreater(profile["fast_prefill_hits"], 0)
+            self.assertTrue(mx.allclose(slow_logits, fast_logits, rtol=5e-2, atol=5e-2))
+        finally:
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_fast_prefill_decode_uses_fallback(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        env_key = glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "1"
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+            cache = make_prompt_cache(model)
+            logits = model(mx.array([[1, 2, 3, 4, 5, 6, 7, 8]]), cache=cache)
+            nxt = mx.argmax(logits[0, -1:, :], keepdims=True)
+            decode_logits = model(nxt, cache=cache)
+            mx.eval(decode_logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertGreaterEqual(profile["fallback_reasons"].get("decode", 0), 1)
+            self.assertTrue(mx.all(mx.isfinite(decode_logits)).item())
+        finally:
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_fast_prefill_unsupported_batch_falls_back(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model(index_topk_pattern="F", num_hidden_layers=1)
+        env_key = glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "1"
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+            cache = make_prompt_cache(model)
+            logits = model(
+                mx.array(
+                    [
+                        [1, 2, 3, 4, 5, 6, 7, 8],
+                        [2, 3, 4, 5, 6, 7, 8, 9],
+                    ]
+                ),
+                cache=cache,
+            )
+            mx.eval(logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertGreaterEqual(
+                profile["fallback_reasons"].get("batch_size_not_one", 0),
+                1,
+            )
+            self.assertTrue(mx.all(mx.isfinite(logits)).item())
+        finally:
+            self._restore_env(saved_env)
 
     def test_llama(self):
         from mlx_lm.models import llama
