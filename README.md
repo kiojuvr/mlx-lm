@@ -41,10 +41,49 @@ MLX_METAL_FAST_SYNCH=1 python -m mlx_lm generate \
 
 ### Recommended GLM-5.2 serving settings
 
-For long-running local GLM-5.2 serving on Apple silicon, the recommended starting point is:
+For long-context latency on Apple silicon, especially when 200K+ token prompts
+are common rather than exceptional, the recommended starting point is:
 
 ```
-MLX_METAL_FAST_SYNCH=1 python -m mlx_lm server \
+MLX_LM_PROMPT_CHECKPOINT_DEBUG=1 \
+MLX_METAL_FAST_SYNCH=1 \
+MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 \
+python -m mlx_lm server \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --temp 0.4 \
+  --top-p 0.95 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 4096 \
+  --prefill-step-size 1024 \
+  --prefill-max-qk-tokens 67108864 \
+  --prompt-concurrency 1 \
+  --decode-concurrency 1 \
+  --disable-batching \
+  --loop-guard-ngram-size 64 \
+  --loop-guard-repeats 3 \
+  --loop-guard-min-tokens 256
+```
+
+Do not pass `--model-name` for this OpenCode setup unless you have explicitly verified that you need request-facing model-name aliasing. The normal single-model local server workflow loads the model from `--model` and serves OpenCode requests through `/v1/chat/completions`.
+
+`--temp 0.4` and `--top-p 0.95` are recommended as conservative default sampling settings for coding-agent and long-context workflows. In local use, lower-temperature sampling helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
+
+`--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it. If the model still enters near-duplicate but non-exact loops, lower request sampling first (`temperature`, `top_p`) and add a small request-side `repetition_penalty` such as `1.05` to `1.10` when your client supports it.
+
+`--kv-bits 8` is not a prefill-compute speedup by itself. Its value is that GLM MLA int8 KV cache reduces long-context KV memory and keeps 200K+ prompts inside the intended memory envelope.
+
+Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that writes and reuses disk prompt checkpoints, including frontier checkpoints. `--prefill-step-size 1024` is the safer long-context default, while `--prefill-max-qk-tokens 67108864` shrinks only the chunks whose query-by-context product would get too large. Try `--prefill-step-size 2048` only after checking peak memory and Metal stability on your real prompt distribution. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery still appears, retry with `--prefill-step-size 512`.
+
+For shorter mixed workloads where throughput matters more than per-request TTFT
+and disk frontier checkpoints are less important, continuous batching can still
+be useful:
+
+```
+MLX_METAL_FAST_SYNCH=1 \
+python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
   --port 8000 \
@@ -58,13 +97,11 @@ MLX_METAL_FAST_SYNCH=1 python -m mlx_lm server \
   --decode-concurrency 2
 ```
 
-Do not pass `--model-name` for this OpenCode setup unless you have explicitly verified that you need request-facing model-name aliasing. The normal single-model local server workflow loads the model from `--model` and serves OpenCode requests through `/v1/chat/completions`.
-
-`--temp 0.4` and `--top-p 0.95` are recommended as conservative default sampling settings for coding-agent and long-context workflows. In local use, lower-temperature sampling helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
-
-`--kv-bits 8` is not a cold-prefill speedup by itself. Its value is that GLM MLA int8 KV cache can now be used with continuous batching, which makes long-context queued serving more practical and gives memory/concurrency headroom. It is most useful for long-running local serving where KV memory and concurrency matter.
-
-Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. Keep it enabled for normal serving. For this machine, `--prompt-concurrency 2` and `--decode-concurrency 2` were the best default balance. Avoid `--prompt-concurrency 4` as a default: it barely improved TPS at 4096 tokens, but roughly doubled TTFT and added 6 to 9GB peak memory. Also avoid decode concurrency higher than prompt concurrency for fresh long-prefix workloads unless you are comfortable with mixed-cache rejection churn; one q8/p2/c4 run hit 90 rejections and p95 wait around 195s.
+Avoid `--prompt-concurrency 4` as a default: it barely improved TPS at 4096
+tokens, but roughly doubled TTFT and added 6 to 9GB peak memory. Also avoid
+decode concurrency higher than prompt concurrency for fresh long-prefix
+workloads unless you are comfortable with mixed-cache rejection churn; one
+q8/p2/c4 run hit 90 rejections and p95 wait around 195s.
 
 ### Prompt checkpoints and LCP reuse
 
@@ -150,7 +187,7 @@ On the tested Mac Studio M3 Ultra 512GB setup, a controlled 10240-token run with
 
 ### Fast sparse DSA prefill caveat
 
-The benchmark exposes an opt-in GLM DSA sparse prefill path with `--fast-prefill enabled` and `--fast-prefill-query-chunk`. It is useful for profiling DSA/top-k behavior, but it is not the recommended speed path today. Local 4k profiling showed the exact sparse gather path was slower than the fallback at the GLM-5.2 default `index_topk=2048`; selected K/V gather and sparse attention dominated. The practical TTFT win for repeated coding-agent prefixes is checkpoint reuse.
+GLM DSA sparse prefill is enabled by default because the old dense fallback materialized full `(heads, query_length, context_length)` prefill tensors and could OOM well below the advertised long-context envelope. To avoid the exact sparse path becoming pathologically slow too early, it now waits until the effective context reaches `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072). For sparse chunks, MLA attention stays in latent space and avoids selected K/V projection; long chunks whose causal prefix already covers the full top-k set also skip the redundant selected-mask gather. Use `--fast-prefill disabled` only for short-context comparison runs. `--fast-prefill-query-chunk` controls selected-query microbatches, and `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK` controls the DSA indexer key block size. The practical TTFT win for repeated coding-agent prefixes is still checkpoint reuse.
 
 **Bottleneck hypothesis**
 The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.

@@ -173,6 +173,14 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
         )
+    if args.fast_prefill_key_block is not None:
+        os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV] = str(
+            args.fast_prefill_key_block
+        )
+    if args.fast_prefill_min_context is not None:
+        os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = str(
+            args.fast_prefill_min_context
+        )
     if args.prefill_profile:
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ENV] = "1"
 
@@ -192,10 +200,18 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_fast_prefill": args.fast_prefill,
         "glm_dsa_fast_prefill_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
-            "default-off",
+            "default-on",
         ),
         "glm_dsa_fast_prefill_query_chunk": os.environ.get(
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            "default",
+        ),
+        "glm_dsa_fast_prefill_key_block": os.environ.get(
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV,
+            "default",
+        ),
+        "glm_dsa_sparse_prefill_min_context": os.environ.get(
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
             "default",
         ),
         "glm_dsa_fast_prefill_hits": profile["fast_prefill_hits"],
@@ -609,6 +625,8 @@ def print_table(rows, output_format):
         "glm_dsa_fast_prefill",
         "glm_dsa_fast_prefill_env",
         "glm_dsa_fast_prefill_query_chunk",
+        "glm_dsa_fast_prefill_key_block",
+        "glm_dsa_sparse_prefill_min_context",
         "glm_dsa_fast_prefill_hits",
         "glm_dsa_fast_prefill_fallback_reasons",
         "glm_dsa_q_projection_seconds",
@@ -872,13 +890,26 @@ def main():
         default="default",
         help=(
             "Control GLM DSA sparse prefill fast path. The default leaves "
-            "MLX_LM_GLM_DSA_FAST_PREFILL unchanged; unset means disabled."
+            "MLX_LM_GLM_DSA_FAST_PREFILL unchanged; unset means enabled."
         ),
     )
     parser.add_argument(
         "--fast-prefill-query-chunk",
         type=int,
         help="Query microbatch size for the GLM DSA sparse prefill gather path.",
+    )
+    parser.add_argument(
+        "--fast-prefill-key-block",
+        type=int,
+        help="Key block size for the GLM DSA sparse prefill indexer path.",
+    )
+    parser.add_argument(
+        "--fast-prefill-min-context",
+        type=int,
+        help=(
+            "Minimum effective context length before using the GLM DSA sparse "
+            "prefill path."
+        ),
     )
     parser.add_argument(
         "--prefill-profile",

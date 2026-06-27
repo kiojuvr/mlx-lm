@@ -35,6 +35,7 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
+    DEFAULT_PREFILL_MAX_QK_TOKENS,
     SequenceStateMachine,
     stream_generate,
 )
@@ -223,6 +224,43 @@ class GenerationContext:
 
     def stop(self):
         self._should_stop = True
+
+
+class TokenLoopGuard:
+    def __init__(self, ngram_size: int = 64, repeats: int = 3, min_tokens: int = 256):
+        self.ngram_size = max(0, int(ngram_size))
+        self.repeats = max(0, int(repeats))
+        self.min_tokens = max(0, int(min_tokens))
+        self.tokens = []
+
+    @property
+    def enabled(self):
+        return self.ngram_size > 0 and self.repeats > 1
+
+    def append(self, token: int) -> bool:
+        self.tokens.append(int(token))
+        return self.has_loop()
+
+    def has_loop(self) -> bool:
+        if not self.enabled or len(self.tokens) < self.min_tokens:
+            return False
+        ngram_sizes = [8, 16, 32, 64, self.ngram_size]
+        seen = set()
+        for ngram_size in ngram_sizes:
+            if ngram_size in seen or ngram_size <= 0 or ngram_size > self.ngram_size:
+                continue
+            seen.add(ngram_size)
+            window_size = ngram_size * self.repeats
+            if len(self.tokens) < window_size:
+                continue
+            tail = self.tokens[-window_size:]
+            first = tail[:ngram_size]
+            if all(
+                tail[i : i + ngram_size] == first
+                for i in range(ngram_size, window_size, ngram_size)
+            ):
+                return True
+        return False
 
 
 @dataclass
@@ -701,6 +739,8 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
+        if getattr(self.model_provider.cli_args, "disable_batching", False):
+            return False
         kv_bits = self.model_provider.cli_args.kv_bits
         kv_batchable = kv_bits is None or (
             kv_bits == 8 and model_has_glm_mla_kv_cache(self.model_provider.model)
@@ -1030,6 +1070,7 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                prefill_max_qk_tokens=self.cli_args.prefill_max_qk_tokens,
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
@@ -1080,13 +1121,21 @@ class ResponseGenerator:
         request: CompletionRequest,
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        idle_callback: Optional[Callable[[], None]] = None,
     ):
         response_queue = Queue()
         self.requests.put((response_queue, request, generation_args))
 
         def _inner():
             while True:
-                response = response_queue.get()
+                if idle_callback is None:
+                    response = response_queue.get()
+                else:
+                    try:
+                        response = response_queue.get(timeout=15)
+                    except QueueEmpty:
+                        idle_callback()
+                        continue
                 if response is None:
                     break
                 if isinstance(response, Exception):
@@ -1123,6 +1172,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.response_generator = response_generator
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
         super().__init__(*args, **kwargs)
+
+    def _write_response_bytes(self, data: bytes, *, flush: bool = True) -> bool:
+        try:
+            self.wfile.write(data)
+            if flush:
+                self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            if not getattr(self, "_client_disconnected_logged", False):
+                logging.info("Client disconnected while writing response: %s", e)
+                self._client_disconnected_logged = True
+            return False
 
     def _set_cors_headers(self):
         allowed_origins = self.response_generator.cli_args.allowed_origins
@@ -1462,14 +1523,31 @@ class APIHandler(BaseHTTPRequestHandler):
             chat_template_kwargs=self.chat_template_kwargs,
         )
 
+        client_connected = True
+        ctx = None
+
+        def stream_write(data: bytes) -> bool:
+            nonlocal client_connected
+            if not client_connected:
+                return False
+            if self._write_response_bytes(data):
+                return True
+            client_connected = False
+            if ctx is not None:
+                ctx.stop()
+            return False
+
         # Keep connection allive during long prompt processing (and also log
         # the progress)
         def keepalive_callback(processed, total):
             logging.info(f"Prompt processing progress: {processed}/{total}")
             if self.stream:
                 msg = f": keepalive {processed}/{total}\n\n".encode()
-                self.wfile.write(msg)
-                self.wfile.flush()
+                stream_write(msg)
+
+        def idle_callback():
+            if self.stream:
+                stream_write(b": keepalive decode\n\n")
 
         # Create the token generator
         try:
@@ -1477,6 +1555,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 request,
                 args,
                 progress_callback=keepalive_callback,
+                idle_callback=idle_callback,
             )
         except Exception as e:
             self._set_completion_headers(404)
@@ -1507,6 +1586,11 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        loop_guard = TokenLoopGuard(
+            self.response_generator.cli_args.loop_guard_ngram_size,
+            self.response_generator.cli_args.loop_guard_repeats,
+            self.response_generator.cli_args.loop_guard_min_tokens,
+        )
 
         try:
             for gen in response:
@@ -1531,6 +1615,17 @@ class APIHandler(BaseHTTPRequestHandler):
                     token_logprobs.append(gen.logprob)
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
+                if loop_guard.append(gen.token):
+                    logging.warning(
+                        "Stopping generation after detecting repeated token loop "
+                        "(ngram_size=%s repeats=%s generated_tokens=%s)",
+                        loop_guard.ngram_size,
+                        loop_guard.repeats,
+                        len(tokens),
+                    )
+                    finish_reason = "stop"
+                    ctx.stop()
+                    break
 
                 if (
                     self.stream
@@ -1543,8 +1638,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         tool_calls=tool_formatter(tool_calls),
                         reasoning_text=reasoning_text,
                     )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
-                    self.wfile.flush()
+                    if not stream_write(f"data: {json.dumps(resp)}\n\n".encode()):
+                        break
                     reasoning_text = ""
                     text = ""
                     tool_calls = []
@@ -1562,27 +1657,27 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason = "tool_calls"
 
             if self.stream:
-                resp = self.generate_response(
-                    text,
-                    finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
-                    reasoning_text=reasoning_text,
-                )
-                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
-                self.wfile.flush()
-                if (
-                    self.stream_options is not None
-                    and self.stream_options["include_usage"]
-                ):
-                    resp = self.completion_usage_response(
-                        len(ctx.prompt),
-                        len(tokens),
-                        ctx.prompt_cache_count,
+                if client_connected:
+                    resp = self.generate_response(
+                        text,
+                        finish_reason,
+                        tool_calls=tool_formatter(tool_calls),
+                        reasoning_text=reasoning_text,
                     )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
-                    self.wfile.flush()
-                self.wfile.write("data: [DONE]\n\n".encode())
-                self.wfile.flush()
+                    stream_write(f"data: {json.dumps(resp)}\n\n".encode())
+                    if (
+                        self.stream_options is not None
+                        and self.stream_options["include_usage"]
+                        and client_connected
+                    ):
+                        resp = self.completion_usage_response(
+                            len(ctx.prompt),
+                            len(tokens),
+                            ctx.prompt_cache_count,
+                        )
+                        stream_write(f"data: {json.dumps(resp)}\n\n".encode())
+                    if client_connected:
+                        stream_write(b"data: [DONE]\n\n")
             else:
                 resp = self.generate_response(
                     text,
@@ -1603,8 +1698,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 response_json = json.dumps(resp).encode()
                 self.send_header("Content-Length", str(len(response_json)))
                 self.end_headers()
-                self.wfile.write(response_json)
-                self.wfile.flush()
+                self._write_response_bytes(response_json)
         finally:
             ctx.stop()
 
@@ -1785,15 +1879,35 @@ class APIHandler(BaseHTTPRequestHandler):
             chat_template_kwargs=self.chat_template_kwargs,
         )
 
+        client_connected = True
+        ctx = None
+
+        def stream_write(data: bytes) -> bool:
+            nonlocal client_connected
+            if not client_connected:
+                return False
+            if self._write_response_bytes(data):
+                return True
+            client_connected = False
+            if ctx is not None:
+                ctx.stop()
+            return False
+
         def keepalive_callback(processed, total):
             logging.info(f"Prompt processing progress: {processed}/{total}")
             if self.stream:
-                self.wfile.write(f": keepalive {processed}/{total}\n\n".encode())
-                self.wfile.flush()
+                stream_write(f": keepalive {processed}/{total}\n\n".encode())
+
+        def idle_callback():
+            if self.stream:
+                stream_write(b": keepalive decode\n\n")
 
         try:
             ctx, response_gen = self.response_generator.generate(
-                request, args, progress_callback=keepalive_callback
+                request,
+                args,
+                progress_callback=keepalive_callback,
+                idle_callback=idle_callback,
             )
         except Exception as e:
             import traceback
@@ -1815,45 +1929,66 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         tool_calls_raw = []
         made_tool_call = False
+        loop_guard = TokenLoopGuard(
+            self.response_generator.cli_args.loop_guard_ngram_size,
+            self.response_generator.cli_args.loop_guard_repeats,
+            self.response_generator.cli_args.loop_guard_min_tokens,
+        )
 
         if self.stream:
             self._set_stream_headers(200)
             self.end_headers()
-            self.wfile.write(self._sse_event("response.created", {
+            if not stream_write(self._sse_event("response.created", {
                 "type": "response.created",
                 "response": {
                     "id": self.request_id, "object": "response",
                     "status": "in_progress", "model": self.requested_model, "output": [],
                 },
-            }))
-            self.wfile.write(self._sse_event("response.output_item.added", {
+            })):
+                ctx.stop()
+                return
+            if not stream_write(self._sse_event("response.output_item.added", {
                 "type": "response.output_item.added", "output_index": 0,
                 "item": {"id": msg_id, "type": "message", "role": "assistant",
                          "content": [], "status": "in_progress"},
-            }))
-            self.wfile.write(self._sse_event("response.content_part.added", {
+            })):
+                ctx.stop()
+                return
+            if not stream_write(self._sse_event("response.content_part.added", {
                 "type": "response.content_part.added", "item_id": msg_id,
                 "output_index": 0, "content_index": 0,
                 "part": {"type": "output_text", "text": ""},
-            }))
-            self.wfile.flush()
+            })):
+                ctx.stop()
+                return
 
         try:
             for gen in response_gen:
                 tokens.append(gen.token)
+                if loop_guard.append(gen.token):
+                    logging.warning(
+                        "Stopping generation after detecting repeated token loop "
+                        "(ngram_size=%s repeats=%s generated_tokens=%s)",
+                        loop_guard.ngram_size,
+                        loop_guard.repeats,
+                        len(tokens),
+                    )
+                    finish_reason = "stop"
+                    ctx.stop()
+                    break
                 if gen.state == "tool":
                     tool_text += gen.text
                 elif gen.state == "reasoning":
                     if gen.text:
                         reasoning_text += gen.text
                         if self.stream:
-                            self.wfile.write(self._sse_event(
+                            if not stream_write(self._sse_event(
                                 "response.reasoning_text.delta", {
                                     "type": "response.reasoning_text.delta",
                                     "item_id": msg_id, "output_index": 0,
                                     "content_index": 0, "delta": gen.text,
-                                }))
-                            self.wfile.flush()
+                                })):
+                                break
                 elif gen.state == "normal":
                     if prev_state == "tool":
                         tool_calls_raw.append(tool_text)
@@ -1862,13 +1997,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     if gen.text:
                         full_text += gen.text
                         if self.stream:
-                            self.wfile.write(self._sse_event(
+                            if not stream_write(self._sse_event(
                                 "response.output_text.delta", {
                                     "type": "response.output_text.delta",
                                     "item_id": msg_id, "output_index": 0,
                                     "content_index": 0, "delta": gen.text,
-                                }))
-                            self.wfile.flush()
+                                })):
+                                break
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
                 prev_state = gen.state
@@ -1880,6 +2015,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason = "tool_calls"
         finally:
             ctx.stop()
+
+        if not client_connected:
+            return
 
         # Strip leaked special tokens
         import re as _re
@@ -1958,40 +2096,40 @@ class APIHandler(BaseHTTPRequestHandler):
             output_items.append(fc_item)
 
         if self.stream:
-            self.wfile.write(self._sse_event("response.output_text.done", {
+            stream_write(self._sse_event("response.output_text.done", {
                 "type": "response.output_text.done", "item_id": msg_id,
                 "output_index": 0, "content_index": 0, "text": full_text,
             }))
-            self.wfile.write(self._sse_event("response.content_part.done", {
+            stream_write(self._sse_event("response.content_part.done", {
                 "type": "response.content_part.done", "item_id": msg_id,
                 "output_index": 0, "content_index": 0,
                 "part": {"type": "output_text", "text": full_text, "annotations": []},
             }))
-            self.wfile.write(self._sse_event("response.output_item.done", {
+            stream_write(self._sse_event("response.output_item.done", {
                 "type": "response.output_item.done", "output_index": 0, "item": text_item,
             }))
             for i, fc_item in enumerate(
                 item for item in output_items if item["type"] == "function_call"
             ):
                 tc_idx = output_index + i
-                self.wfile.write(self._sse_event("response.output_item.added", {
+                stream_write(self._sse_event("response.output_item.added", {
                     "type": "response.output_item.added", "output_index": tc_idx,
                     "item": {**fc_item, "arguments": "", "status": "in_progress"},
                 }))
-                self.wfile.write(self._sse_event("response.function_call_arguments.delta", {
+                stream_write(self._sse_event("response.function_call_arguments.delta", {
                     "type": "response.function_call_arguments.delta",
                     "item_id": fc_item["id"], "output_index": tc_idx,
                     "delta": fc_item["arguments"],
                 }))
-                self.wfile.write(self._sse_event("response.function_call_arguments.done", {
+                stream_write(self._sse_event("response.function_call_arguments.done", {
                     "type": "response.function_call_arguments.done",
                     "item_id": fc_item["id"], "output_index": tc_idx,
                     "arguments": fc_item["arguments"],
                 }))
-                self.wfile.write(self._sse_event("response.output_item.done", {
+                stream_write(self._sse_event("response.output_item.done", {
                     "type": "response.output_item.done", "output_index": tc_idx, "item": fc_item,
                 }))
-            self.wfile.write(self._sse_event("response.completed", {
+            stream_write(self._sse_event("response.completed", {
                 "type": "response.completed",
                 "response": {
                     "id": self.request_id, "object": "response", "status": "completed",
@@ -1999,7 +2137,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     "end_turn": finish_reason != "tool_calls",
                 },
             }))
-            self.wfile.flush()
         else:
             resp = {
                 "id": self.request_id, "object": "response", "created_at": self.created,
@@ -2015,8 +2152,7 @@ class APIHandler(BaseHTTPRequestHandler):
             resp_bytes = json.dumps(resp).encode()
             self.send_header("Content-Length", str(len(resp_bytes)))
             self.end_headers()
-            self.wfile.write(resp_bytes)
-            self.wfile.flush()
+            self._write_response_bytes(resp_bytes)
 
     def _sse_event(self, event: str, data: dict) -> bytes:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
@@ -2290,6 +2426,27 @@ def setup_arg_parser():
         help="Default maximum number of tokens to generate (default: 512)",
     )
     parser.add_argument(
+        "--loop-guard-ngram-size",
+        type=int,
+        default=64,
+        help=(
+            "Stop generation when an exact repeated token n-gram loop is "
+            "detected. Use 0 to disable (default: 64)."
+        ),
+    )
+    parser.add_argument(
+        "--loop-guard-repeats",
+        type=int,
+        default=3,
+        help="Number of consecutive repeated n-grams that trigger the loop guard.",
+    )
+    parser.add_argument(
+        "--loop-guard-min-tokens",
+        type=int,
+        default=256,
+        help="Minimum generated tokens before the loop guard can stop generation.",
+    )
+    parser.add_argument(
         "--chat-template-args",
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
@@ -2308,10 +2465,29 @@ def setup_arg_parser():
         help="When a request is batchable then process that many prompts in parallel",
     )
     parser.add_argument(
+        "--disable-batching",
+        action="store_true",
+        help=(
+            "Disable continuous batching and serve requests sequentially. "
+            "Useful for latency-focused long-context serving that relies on "
+            "disk prompt checkpoint save/reuse."
+        ),
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--prefill-max-qk-tokens",
+        type=int,
+        default=DEFAULT_PREFILL_MAX_QK_TOKENS,
+        help=(
+            "Maximum chunk_tokens * effective_context_tokens for sequential "
+            "prefill. Use 0 to disable context-aware step shrinking "
+            f"(default: {DEFAULT_PREFILL_MAX_QK_TOKENS})."
+        ),
     )
     parser.add_argument(
         "--kv-bits",

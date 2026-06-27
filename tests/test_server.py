@@ -18,6 +18,7 @@ from mlx_lm.server import (
     LRUPromptCache,
     Response,
     ResponseGenerator,
+    TokenLoopGuard,
     _process_control_tokens,
     setup_arg_parser,
 )
@@ -54,13 +55,18 @@ class DummyModelProvider:
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
+                "prefill_max_qk_tokens": 67_108_864,
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "disable_batching": False,
                 "kv_bits": None,
                 "kv_group_size": 64,
                 "quantized_kv_start": 0,
+                "loop_guard_ngram_size": 64,
+                "loop_guard_repeats": 3,
+                "loop_guard_min_tokens": 256,
             },
         )
 
@@ -163,6 +169,28 @@ class TestProcessControlTokens(unittest.TestCase):
         )
 
 
+class TestTokenLoopGuard(unittest.TestCase):
+    def test_detects_exact_repeated_ngram(self):
+        guard = TokenLoopGuard(ngram_size=4, repeats=3, min_tokens=0)
+        results = [guard.append(t) for t in [1, 2, 3, 4] * 3]
+
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+
+    def test_min_tokens_delays_detection(self):
+        guard = TokenLoopGuard(ngram_size=4, repeats=3, min_tokens=16)
+        tokens = [9, 8, 7, 6] + [1, 2, 3, 4] * 3
+        results = [guard.append(t) for t in tokens]
+
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+
+    def test_disabled_when_ngram_size_is_zero(self):
+        guard = TokenLoopGuard(ngram_size=0, repeats=3, min_tokens=0)
+
+        self.assertFalse(any(guard.append(t) for t in [1, 2, 3, 4] * 5))
+
+
 class TestServerCLI(unittest.TestCase):
     def test_setup_arg_parser_accepts_kv_options(self):
         args = setup_arg_parser().parse_args(
@@ -186,6 +214,37 @@ class TestServerCLI(unittest.TestCase):
         self.assertIsNone(args.kv_bits)
         self.assertEqual(args.kv_group_size, 64)
         self.assertEqual(args.quantized_kv_start, 0)
+        self.assertFalse(args.disable_batching)
+        self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
+        self.assertEqual(args.loop_guard_ngram_size, 64)
+        self.assertEqual(args.loop_guard_repeats, 3)
+        self.assertEqual(args.loop_guard_min_tokens, 256)
+
+    def test_setup_arg_parser_disable_batching(self):
+        args = setup_arg_parser().parse_args(["--disable-batching"])
+
+        self.assertTrue(args.disable_batching)
+
+    def test_setup_arg_parser_prefill_max_qk_tokens(self):
+        args = setup_arg_parser().parse_args(["--prefill-max-qk-tokens", "0"])
+
+        self.assertEqual(args.prefill_max_qk_tokens, 0)
+
+    def test_setup_arg_parser_loop_guard_options(self):
+        args = setup_arg_parser().parse_args(
+            [
+                "--loop-guard-ngram-size",
+                "32",
+                "--loop-guard-repeats",
+                "4",
+                "--loop-guard-min-tokens",
+                "128",
+            ]
+        )
+
+        self.assertEqual(args.loop_guard_ngram_size, 32)
+        self.assertEqual(args.loop_guard_repeats, 4)
+        self.assertEqual(args.loop_guard_min_tokens, 128)
 
     def test_glm_kv_bits_can_use_batch_generation_path(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
@@ -220,10 +279,14 @@ class TestServerCLI(unittest.TestCase):
         )
         self.assertTrue(generator._is_batchable(args))
 
+        generator.model_provider.cli_args.disable_batching = True
+        self.assertFalse(generator._is_batchable(args))
+
     def test_single_request_passes_prompt_checkpoint_coexistence_args(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         cli_args = types.SimpleNamespace(
             prefill_step_size=2048,
+            prefill_max_qk_tokens=67_108_864,
             kv_bits=8,
             kv_group_size=64,
             quantized_kv_start=4096,
@@ -321,6 +384,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 2)
         self.assertEqual(captured["prompt_checkpoint_store_prefix_lengths"], [3])
         self.assertTrue(captured["prompt_checkpoint_allow_existing_cache"])
+        self.assertEqual(captured["prefill_max_qk_tokens"], 67_108_864)
         self.assertEqual(captured["kv_bits"], 8)
         self.assertEqual(captured["kv_group_size"], 64)
         self.assertEqual(captured["quantized_kv_start"], 4096)

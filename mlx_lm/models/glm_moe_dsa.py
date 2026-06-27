@@ -10,7 +10,14 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, GlmMlaKVCache, KVCache, QuantizedGlmMlaKVCache
+from .cache import (
+    BatchGlmMlaKVCache,
+    BatchQuantizedGlmMlaKVCache,
+    CacheList,
+    GlmMlaKVCache,
+    KVCache,
+    QuantizedGlmMlaKVCache,
+)
 from .deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
@@ -22,6 +29,10 @@ from .deepseek_v32 import Model as DSV32Model
 GLM_DSA_FAST_PREFILL_ENV = "MLX_LM_GLM_DSA_FAST_PREFILL"
 GLM_DSA_FAST_PREFILL_DEBUG_ENV = "MLX_LM_GLM_DSA_FAST_PREFILL_DEBUG"
 GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV = "MLX_LM_GLM_DSA_FAST_PREFILL_QUERY_CHUNK"
+GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV = "MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK"
+GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV = (
+    "MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT"
+)
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 
 _PROFILE_STAGES = (
@@ -35,6 +46,8 @@ _PROFILE_STAGES = (
     "total_prefill",
 )
 _DEFAULT_FAST_PREFILL_QUERY_CHUNK = 16
+_DEFAULT_FAST_PREFILL_KEY_BLOCK = 8192
+_DEFAULT_SPARSE_PREFILL_MIN_CONTEXT = 131072
 _FAST_PREFILL_LARGE_TOPK_WARNING = 1024
 _LOGGER = logging.getLogger(__name__)
 _GLM_DSA_PREFILL_PROFILE = None
@@ -49,7 +62,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _fast_prefill_enabled() -> bool:
-    return _env_flag(GLM_DSA_FAST_PREFILL_ENV, False)
+    return _env_flag(GLM_DSA_FAST_PREFILL_ENV, True)
 
 
 def _prefill_profile_enabled() -> bool:
@@ -68,6 +81,27 @@ def _fast_prefill_query_chunk_size(sequence_length: int) -> int:
         except ValueError:
             pass
     return min(sequence_length, _DEFAULT_FAST_PREFILL_QUERY_CHUNK)
+
+
+def _fast_prefill_key_block_size(sequence_length: int, topk: int) -> int:
+    raw_value = os.environ.get(GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV)
+    default = max(topk, _DEFAULT_FAST_PREFILL_KEY_BLOCK)
+    if raw_value is not None:
+        try:
+            default = int(raw_value)
+        except ValueError:
+            pass
+    return max(topk, min(sequence_length, default))
+
+
+def _sparse_prefill_min_context_length() -> int:
+    raw_value = os.environ.get(GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV)
+    if raw_value is not None:
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            pass
+    return _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT
 
 
 def _new_profile():
@@ -131,8 +165,8 @@ def _warn_fast_prefill_large_topk(topk: int):
     _WARNED_FAST_PREFILL_LARGE_TOPK = True
     _LOGGER.warning(
         "GLM DSA exact sparse prefill is enabled with topk=%s. "
-        "This path is an opt-in diagnostic path and was slower than fallback "
-        "in GLM-5.2 4k profiling at index_topk=2048.",
+        "This memory-bounded path avoids full-context dense prefill tensors, "
+        "but can be slower than the old dense fallback at short context.",
         topk,
     )
 
@@ -170,12 +204,18 @@ def _scalar_int(value):
     if isinstance(value, int):
         return value
     if hasattr(value, "shape"):
-        if value.shape != ():
+        size = 1
+        for dim in value.shape:
+            size *= dim
+        if value.shape != () and size != 1:
             return None
         try:
             return int(value.item())
         except Exception:
-            return None
+            try:
+                return int(value.tolist()[0])
+            except Exception:
+                return None
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -187,6 +227,11 @@ def _gather_sequence_by_flat_index(x: mx.array, indices: mx.array) -> mx.array:
     iB, iH, L, K = indices.shape
     if iB != B:
         raise ValueError("top-k batch dimension does not match K/V batch dimension")
+    if H == 1 and iH != 1:
+        offsets = mx.arange(B).reshape(B, 1, 1, 1) * S
+        offsets = mx.broadcast_to(offsets, (B, iH, 1, 1))
+        flat_indices = indices + offsets
+        return mx.take(x.reshape(B * S, D), flat_indices, axis=0)
     if iH == 1 and H != 1:
         indices = mx.broadcast_to(indices, (B, H, L, K))
     elif iH != H:
@@ -194,6 +239,58 @@ def _gather_sequence_by_flat_index(x: mx.array, indices: mx.array) -> mx.array:
     offsets = mx.arange(B * H).reshape(B, H, 1, 1) * S
     flat_indices = indices + offsets
     return mx.take(x.reshape(B * H * S, D), flat_indices, axis=0)
+
+
+def _slice_attention_mask(
+    mask: Optional[mx.array],
+    query_start: int,
+    query_stop: int,
+    key_start: int,
+    key_stop: int,
+):
+    if mask is None:
+        return None
+    if len(mask.shape) == 2:
+        return mask[query_start:query_stop, key_start:key_stop]
+    return mask[..., query_start:query_stop, key_start:key_stop]
+
+
+def _gather_attention_mask(mask: Optional[mx.array], indices: mx.array):
+    if mask is None:
+        return None
+    B, iH, L, K = indices.shape
+    if len(mask.shape) == 2:
+        mL, S = mask.shape
+        if mL != L:
+            raise ValueError("mask query dimension does not match top-k indices")
+        offsets = mx.arange(L).reshape(1, 1, L, 1) * S
+        return mx.take(mask.reshape(mL * S), indices + offsets, axis=0)
+    if len(mask.shape) != 4:
+        raise ValueError("unsupported attention mask rank for sparse gather")
+
+    mB, mH, mL, S = mask.shape
+    if mB != B or mL != L:
+        raise ValueError("mask shape does not match top-k indices")
+    if mH == 1 and iH != 1:
+        offsets = (mx.arange(B).reshape(B, 1, 1, 1) * mL) + mx.arange(L).reshape(
+            1, 1, L, 1
+        )
+        offsets = offsets * S
+        offsets = mx.broadcast_to(offsets, (B, iH, L, 1))
+        return mx.take(mask.reshape(B * mL * S), indices + offsets, axis=0)
+    if iH == 1 and mH != 1:
+        indices = mx.broadcast_to(indices, (B, mH, L, K))
+    elif iH != mH:
+        raise ValueError("mask head dimension does not match top-k indices")
+    offsets = (
+        mx.arange(B * mH).reshape(B, mH, 1, 1) * mL
+        + mx.arange(L).reshape(1, 1, L, 1)
+    ) * S
+    return mx.take(mask.reshape(B * mH * mL * S), indices + offsets, axis=0)
+
+
+def _has_full_topk_causal_prefix(total_context: int, query_length: int, topk: int):
+    return total_context - query_length + 1 >= topk
 
 
 @dataclass
@@ -265,6 +362,134 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if self.skip_topk:
             self.indexer = None
 
+    def _indexer_topk(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any] = None,
+    ):
+        indexer = self.indexer
+        b, s, _ = x.shape
+        q = indexer.wq_b(qr)
+        q = q.reshape(b, s, indexer.n_heads, indexer.head_dim).swapaxes(1, 2)
+        k = indexer.wk(x)
+        k = indexer.k_norm(k)
+        k = mx.reshape(k, (b, 1, s, indexer.head_dim))
+
+        offset = cache.offset if cache is not None else 0
+        q = indexer.rope(q, offset=offset)
+        k = indexer.rope(k, offset=offset)
+
+        if cache is not None:
+            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0], dtype=k.dtype))
+        if k.shape[2] <= indexer.index_topk:
+            return None
+        if (
+            _fast_prefill_enabled()
+            and b == 1
+            and s > 1
+            and k.shape[2] >= _sparse_prefill_min_context_length()
+        ):
+            return self._block_indexer_topk(q, x, k, mask)
+        return self._dense_indexer_topk(q, x, k, mask)
+
+    def _dense_indexer_topk(
+        self,
+        q: mx.array,
+        x: mx.array,
+        k: mx.array,
+        mask: Optional[mx.array],
+    ):
+        indexer = self.indexer
+        scores = q @ k.swapaxes(-1, -2)
+        scores = mx.maximum(scores, 0)
+        weights = indexer.weights_proj(x) * (
+            indexer.n_heads**-0.5 * indexer.softmax_scale
+        )
+        weights = weights.swapaxes(-1, -2)[..., None]
+        scores = scores * weights
+        scores = scores.sum(axis=1, keepdims=True)
+        if mask is not None:
+            scores = mx.where(mask, scores, -float("inf"))
+        return mx.argpartition(scores, kth=-indexer.index_topk, axis=-1)[
+            ..., -indexer.index_topk :
+        ]
+
+    def _block_indexer_topk(
+        self,
+        q: mx.array,
+        x: mx.array,
+        k: mx.array,
+        mask: Optional[mx.array],
+    ):
+        indexer = self.indexer
+        B, _, L, _ = q.shape
+        total_length = k.shape[2]
+        topk = indexer.index_topk
+        query_chunk = _fast_prefill_query_chunk_size(L)
+        key_block = _fast_prefill_key_block_size(total_length, topk)
+        weights = indexer.weights_proj(x) * (
+            indexer.n_heads**-0.5 * indexer.softmax_scale
+        )
+        weights = weights.swapaxes(-1, -2)[..., None]
+
+        all_indices = []
+        for q_start in range(0, L, query_chunk):
+            q_stop = min(q_start + query_chunk, L)
+            q_chunk = q[:, :, q_start:q_stop, :]
+            weight_chunk = weights[:, :, q_start:q_stop, :]
+            best_scores = None
+            best_indices = None
+
+            for k_start in range(0, total_length, key_block):
+                k_stop = min(k_start + key_block, total_length)
+                k_block = k[:, :, k_start:k_stop, :]
+                block_scores = q_chunk @ k_block.swapaxes(-1, -2)
+                block_scores = mx.maximum(block_scores, 0)
+                block_scores = block_scores * weight_chunk
+                block_scores = block_scores.sum(axis=1, keepdims=True)
+                mask_block = _slice_attention_mask(
+                    mask, q_start, q_stop, k_start, k_stop
+                )
+                if mask_block is not None:
+                    block_scores = mx.where(mask_block, block_scores, -float("inf"))
+
+                block_len = block_scores.shape[-1]
+                if block_len > topk:
+                    block_local_indices = mx.argpartition(
+                        block_scores, kth=-topk, axis=-1
+                    )[..., -topk:]
+                    block_scores = mx.take_along_axis(
+                        block_scores, block_local_indices, axis=-1
+                    )
+                else:
+                    block_local_indices = mx.broadcast_to(
+                        mx.arange(block_len).reshape(1, 1, 1, block_len),
+                        block_scores.shape,
+                    )
+                block_indices = block_local_indices + k_start
+
+                if best_scores is None:
+                    best_scores = block_scores
+                    best_indices = block_indices
+                else:
+                    best_scores = mx.concatenate([best_scores, block_scores], axis=-1)
+                    best_indices = mx.concatenate(
+                        [best_indices, block_indices], axis=-1
+                    )
+
+                if best_scores.shape[-1] > topk:
+                    keep = mx.argpartition(best_scores, kth=-topk, axis=-1)[
+                        ..., -topk:
+                    ]
+                    best_scores = mx.take_along_axis(best_scores, keep, axis=-1)
+                    best_indices = mx.take_along_axis(best_indices, keep, axis=-1)
+
+            all_indices.append(best_indices)
+
+        return mx.concatenate(all_indices, axis=2)
+
     def _fast_prefill_decision(
         self,
         *,
@@ -272,7 +497,6 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         L: int,
         cache: Optional[Any],
         topk_indices: Optional[mx.array],
-        kv_latent: mx.array,
         k_pe: mx.array,
     ):
         if not _fast_prefill_enabled():
@@ -291,7 +515,13 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "no_mla_cache"
         if B != 1:
             return False, "batch_size_not_one"
-        if not isinstance(kv_cache, (GlmMlaKVCache, QuantizedGlmMlaKVCache)):
+        supported_cache_types = (
+            GlmMlaKVCache,
+            QuantizedGlmMlaKVCache,
+            BatchGlmMlaKVCache,
+            BatchQuantizedGlmMlaKVCache,
+        )
+        if not isinstance(kv_cache, supported_cache_types):
             return False, f"unsupported_cache:{type(kv_cache).__name__}"
         if len(topk_indices.shape) != 4:
             return False, "topk_rank"
@@ -302,15 +532,17 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         K = topk_indices.shape[-1]
         if K <= 0:
             return False, "empty_topk"
-        if K > kv_latent.shape[2]:
+        if K > k_pe.shape[2]:
             return False, "topk_exceeds_context"
-        if kv_latent.shape[1] != 1 or k_pe.shape[1] != 1:
+        if k_pe.shape[2] < _sparse_prefill_min_context_length():
+            return False, "below_sparse_min_context"
+        if not _has_full_topk_causal_prefix(k_pe.shape[2], L, K):
+            return False, "causal_prefix_shorter_than_topk"
+        if k_pe.shape[1] != 1:
             return False, "unsupported_kv_heads"
         offset = _scalar_int(kv_cache.offset)
         if offset is None:
             return False, "non_scalar_offset"
-        if offset + 1 < K:
-            return False, "causal_prefix_shorter_than_topk"
         _warn_fast_prefill_large_topk(K)
         return True, "fast"
 
@@ -318,32 +550,38 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         self,
         q_nope: mx.array,
         q_pe: mx.array,
-        kv_latent: mx.array,
+        kv_cache: Any,
+        kv_latent: Any,
         k_pe: mx.array,
         topk_indices: mx.array,
+        mask: Optional[mx.array],
     ):
         _, _, L, _ = q_nope.shape
         query_chunk = _fast_prefill_query_chunk_size(L)
-
-        k, v = _profile_stage(
-            "latent_kv_projection",
-            lambda: (
-                self.embed_q(kv_latent, transpose=False),
-                self.unembed_out(kv_latent),
-            ),
-        )
+        topk = topk_indices.shape[-1]
+        gather_mask = mask
+        if (
+            isinstance(kv_cache, (GlmMlaKVCache, QuantizedGlmMlaKVCache))
+            and _has_full_topk_causal_prefix(k_pe.shape[2], L, topk)
+        ):
+            gather_mask = None
 
         outputs = []
         for start in range(0, L, query_chunk):
             stop = min(start + query_chunk, L)
             chunk_topk = topk_indices[:, :, start:stop, :]
 
-            k_selected, v_selected, k_pe_selected = _profile_stage(
+            latent_selected, k_pe_selected, mask_selected = _profile_stage(
                 "sparse_gather",
                 lambda chunk_topk=chunk_topk: (
-                    _gather_sequence_by_flat_index(k, chunk_topk),
-                    _gather_sequence_by_flat_index(v, chunk_topk),
+                    self._gather_cached_latent(kv_cache, kv_latent, chunk_topk),
                     _gather_sequence_by_flat_index(k_pe, chunk_topk),
+                    _gather_attention_mask(
+                        None if gather_mask is None else _slice_attention_mask(
+                            gather_mask, start, stop, 0, k_pe.shape[2]
+                        ),
+                        chunk_topk,
+                    ),
                 ),
             )
 
@@ -354,43 +592,71 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     "attention",
                     lambda q_nope_chunk=q_nope_chunk,
                     q_pe_chunk=q_pe_chunk,
-                    k_selected=k_selected,
-                    v_selected=v_selected,
+                    latent_selected=latent_selected,
                     k_pe_selected=k_pe_selected: self._fast_sparse_attention_chunk(
                         q_nope_chunk,
                         q_pe_chunk,
-                        k_selected,
-                        v_selected,
+                        latent_selected,
                         k_pe_selected,
+                        mask_selected,
                     ),
                 )
             )
 
         return mx.concatenate(outputs, axis=2)
 
+    def _gather_cached_latent(
+        self,
+        kv_cache: Any,
+        kv_latent: Any,
+        topk_indices: mx.array,
+    ):
+        if isinstance(kv_cache, (QuantizedGlmMlaKVCache, BatchQuantizedGlmMlaKVCache)):
+            selected = tuple(
+                _gather_sequence_by_flat_index(q, topk_indices) for q in kv_latent
+            )
+            return _profile_stage(
+                "latent_kv_dequantization",
+                lambda selected=selected: kv_cache.dequantize_keys(selected),
+            )
+        return _gather_sequence_by_flat_index(kv_latent, topk_indices)
+
     def _fast_sparse_attention_chunk(
         self,
         q_nope: mx.array,
         q_pe: mx.array,
-        k_selected: mx.array,
-        v_selected: mx.array,
+        latent_selected: mx.array,
         k_pe_selected: mx.array,
+        mask_selected: Optional[mx.array],
     ):
         B, H, L, D = q_nope.shape
-        K = k_selected.shape[-2]
-        V = v_selected.shape[-1]
+        K = latent_selected.shape[-2]
+        R = latent_selected.shape[-1]
+        if latent_selected.shape[1] == 1 and H != 1:
+            latent_selected = mx.broadcast_to(latent_selected, (B, H, L, K, R))
         pe_scores = mx.sum(
             (q_pe * self.scale)[..., None, :] * k_pe_selected,
             axis=-1,
         )
+        if mask_selected is not None:
+            pe_scores = mx.where(
+                mask_selected,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+        q_nope = _profile_stage(
+            "latent_kv_projection",
+            lambda: self.embed_q(q_nope),
+        )
         output = mx.fast.scaled_dot_product_attention(
-            q_nope.reshape(B * H * L, 1, 1, D),
-            k_selected.reshape(B * H * L, 1, K, D),
-            v_selected.reshape(B * H * L, 1, K, V),
+            q_nope.reshape(B * H * L, 1, 1, R),
+            latent_selected.reshape(B * H * L, 1, K, R),
+            latent_selected.reshape(B * H * L, 1, K, R),
             scale=self.scale,
             mask=pe_scores.reshape(B * H * L, 1, 1, K),
         )
-        return output.reshape(B, H, L, V)
+        output = output.reshape(B, H, L, R)
+        return _profile_stage("latent_kv_projection", lambda: self.unembed_out(output))
 
     def __call__(
         self,
@@ -437,19 +703,27 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         (kv_latent, k_pe), q_pe = _profile_stage("kv_cache_update", update_kv_cache)
 
-        if cache is not None:
-            if hasattr(cache[0], "dequantize_keys"):
-                kv_latent = _profile_stage(
-                    "latent_kv_dequantization",
-                    lambda: cache[0].dequantize_keys(kv_latent),
-                )
-        else:
+        kv_cache = cache[0] if cache is not None else None
+        kv_latent_dequantized = not hasattr(kv_cache, "dequantize_keys")
+
+        def ensure_kv_latent_dequantized():
+            nonlocal kv_latent, kv_latent_dequantized
+            if kv_latent_dequantized:
+                return kv_latent
+            kv_latent = _profile_stage(
+                "latent_kv_dequantization",
+                lambda: kv_cache.dequantize_keys(kv_latent),
+            )
+            kv_latent_dequantized = True
+            return kv_latent
+
+        if cache is None:
             cache = [None] * 2
 
         if self.indexer is not None:
             topk_indices = _profile_stage(
                 "dsa_indexer_topk",
-                lambda: self.indexer(x, qr, mask, cache=cache[1]),
+                lambda: self._indexer_topk(x, qr, mask, cache=cache[1]),
             )
         else:
             topk_indices = prev_topk_indices
@@ -458,30 +732,27 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if topk_indices is not None:
             if L == 1:
                 _record_fast_prefill_decision(False, "decode")
-                idx = topk_indices[:, :, 0, :, None]
-                kv_latent = mx.take_along_axis(
-                    kv_latent,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
-                    axis=2,
+                gathered_latent = self._gather_cached_latent(
+                    kv_cache, kv_latent, topk_indices
                 )
-                k_pe = mx.take_along_axis(
-                    k_pe,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
-                    axis=2,
-                )
+                kv_latent = gathered_latent[:, :, 0, :, :]
+                kv_latent_dequantized = True
+                k_pe = _gather_sequence_by_flat_index(k_pe, topk_indices)[
+                    :, :, 0, :, :
+                ]
                 if mask is not None:
-                    mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+                    mask = _gather_attention_mask(mask, topk_indices)
             else:
                 fast_sparse_prefill, reason = self._fast_prefill_decision(
                     B=B,
                     L=L,
                     cache=cache,
                     topk_indices=topk_indices,
-                    kv_latent=kv_latent,
                     k_pe=k_pe,
                 )
                 _record_fast_prefill_decision(fast_sparse_prefill, reason)
                 if not fast_sparse_prefill:
+                    ensure_kv_latent_dequantized()
                     shape = list(topk_indices.shape)
                     shape[-1] = kv_latent.shape[2]
                     sparse_mask = mx.zeros(shape, dtype=mx.bool_)
@@ -511,11 +782,14 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             output = self._fast_sparse_prefill_attention(
                 q_nope,
                 q_pe,
+                kv_cache,
                 kv_latent,
                 k_pe,
                 topk_indices,
+                mask,
             )
         else:
+            ensure_kv_latent_dequantized()
             pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
             if mask is not None:
                 pe_scores = mx.where(

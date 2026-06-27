@@ -10,6 +10,7 @@ from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
     SequenceStateMachine,
+    _effective_prefill_step_size,
     batch_generate,
     generate,
     generate_step,
@@ -18,6 +19,29 @@ from mlx_lm.generate import (
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
+
+
+class TestGenerateUtilities(unittest.TestCase):
+    def test_effective_prefill_step_size_caps_long_context(self):
+        step = _effective_prefill_step_size(
+            requested_step_size=1024,
+            remaining_tokens=2000,
+            processed_tokens=200_000,
+            prefill_max_qk_tokens=67_108_864,
+        )
+
+        self.assertLess(step, 1024)
+        self.assertLessEqual(step * (200_000 + step), 67_108_864)
+
+    def test_effective_prefill_step_size_can_be_disabled(self):
+        step = _effective_prefill_step_size(
+            requested_step_size=1024,
+            remaining_tokens=2000,
+            processed_tokens=200_000,
+            prefill_max_qk_tokens=0,
+        )
+
+        self.assertEqual(step, 1024)
 
 
 class TestGenerate(unittest.TestCase):

@@ -439,6 +439,7 @@ class TestModels(unittest.TestCase):
         env_keys = [
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
         ]
         saved_env = {key: os.environ.get(key) for key in env_keys}
         try:
@@ -449,6 +450,7 @@ class TestModels(unittest.TestCase):
 
             os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
             os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
             glm_moe_dsa.reset_glm_dsa_prefill_profile()
             fast_cache = make_prompt_cache(model)
             model(prefix, cache=fast_cache)
@@ -471,6 +473,7 @@ class TestModels(unittest.TestCase):
         env_keys = [
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
         ]
         saved_env = {key: os.environ.get(key) for key in env_keys}
 
@@ -488,6 +491,7 @@ class TestModels(unittest.TestCase):
 
             os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
             os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
             glm_moe_dsa.reset_glm_dsa_prefill_profile()
             fast_cache = quantized_prompt_cache()
             model(prefix, cache=fast_cache)
@@ -497,6 +501,118 @@ class TestModels(unittest.TestCase):
             profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
             self.assertGreater(profile["fast_prefill_hits"], 0)
             self.assertTrue(mx.allclose(slow_logits, fast_logits, rtol=5e-2, atol=5e-2))
+        finally:
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_quantized_fast_prefill_dequantizes_selected_kv(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        model.set_dtype(mx.float16)
+        prefix = mx.array([[1, 2, 3, 4]])
+        suffix = mx.array([[5, 6, 7, 8]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        original_dequantize_keys = QuantizedGlmMlaKVCache.dequantize_keys
+        dequantized_key_shapes = []
+
+        def recording_dequantize_keys(cache, keys=None):
+            if keys is not None:
+                dequantized_key_shapes.append(keys[0].shape)
+            return original_dequantize_keys(cache, keys)
+
+        def quantized_prompt_cache():
+            return [
+                layer_cache.to_quantized(group_size=64, bits=8)
+                for layer_cache in make_prompt_cache(model)
+            ]
+
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV] = "4"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
+            QuantizedGlmMlaKVCache.dequantize_keys = recording_dequantize_keys
+            prompt_cache = quantized_prompt_cache()
+            model(prefix, cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            dequantized_key_shapes.clear()
+
+            logits = model(suffix, cache=prompt_cache)
+            mx.eval(logits)
+
+            self.assertTrue(dequantized_key_shapes)
+            self.assertTrue(all(len(shape) == 5 for shape in dequantized_key_shapes))
+            self.assertTrue(
+                all(
+                    shape[-2] == model.args.index_topk
+                    for shape in dequantized_key_shapes
+                )
+            )
+        finally:
+            QuantizedGlmMlaKVCache.dequantize_keys = original_dequantize_keys
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_sparse_prefill_waits_for_min_context(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        prefix = mx.array([[1, 2, 3, 4]])
+        suffix = mx.array([[5, 6, 7, 8]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "32768"
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+            prompt_cache = make_prompt_cache(model)
+            model(prefix, cache=prompt_cache)
+            logits = model(suffix, cache=prompt_cache)
+            mx.eval(logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["fast_prefill_hits"], 0)
+            self.assertGreaterEqual(
+                profile["fallback_reasons"].get("below_sparse_min_context", 0),
+                1,
+            )
+        finally:
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_sparse_prefill_needs_full_topk_causal_prefix(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model(index_topk_pattern="F", num_hidden_layers=1)
+        prefix = mx.array([[1]])
+        suffix = mx.array([[2, 3, 4, 5, 6]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+            prompt_cache = make_prompt_cache(model)
+            model(prefix, cache=prompt_cache)
+            logits = model(suffix, cache=prompt_cache)
+            mx.eval(logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["fast_prefill_hits"], 0)
+            self.assertGreaterEqual(
+                profile["fallback_reasons"].get("causal_prefix_shorter_than_topk", 0),
+                1,
+            )
         finally:
             self._restore_env(saved_env)
 

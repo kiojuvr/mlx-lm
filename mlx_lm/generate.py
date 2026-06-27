@@ -63,6 +63,7 @@ PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN_ENV = (
     "MLX_LM_PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN"
 )
 PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN = 16
+DEFAULT_PREFILL_MAX_QK_TOKENS = 67_108_864
 
 
 def _prompt_checkpoint_debug(message):
@@ -136,6 +137,27 @@ def _prompt_checkpoint_env_int(name, default):
     except (TypeError, ValueError):
         return default
     return value if value >= 0 else default
+
+
+def _effective_prefill_step_size(
+    requested_step_size: int,
+    remaining_tokens: int,
+    processed_tokens: int,
+    prefill_max_qk_tokens: Optional[int],
+) -> int:
+    step_size = min(requested_step_size, remaining_tokens)
+    if prefill_max_qk_tokens is None or prefill_max_qk_tokens <= 0:
+        return step_size
+    if step_size <= 1:
+        return step_size
+
+    max_qk_tokens = max(1, int(prefill_max_qk_tokens))
+    while (
+        step_size > 1
+        and step_size * max(processed_tokens + step_size, 1) > max_qk_tokens
+    ):
+        step_size = max(1, max_qk_tokens // max(processed_tokens + step_size, 1))
+    return max(1, step_size)
 
 
 def _checkpoint_limit_frontier_lengths(lengths, max_frontiers):
@@ -413,6 +435,7 @@ def generate_step(
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
+    prefill_max_qk_tokens: Optional[int] = None,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
@@ -449,6 +472,9 @@ def generate_step(
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
           provided, the cache will be updated in place.
         prefill_step_size (int): Step size for processing the prompt.
+        prefill_max_qk_tokens (int, optional): If set, cap each prompt prefill
+          chunk so ``chunk_tokens * effective_context_tokens`` stays below this
+          value. This lets long-context dense fallback shrink before it OOMs.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
@@ -768,6 +794,7 @@ def generate_step(
         f"fresh_prompt_tokens={fresh_prompt_tokens} "
         f"fresh_prefill_tokens={fresh_prefill_tokens} "
         f"prefill_step_size={prefill_step_size} "
+        f"prefill_max_qk_tokens={prefill_max_qk_tokens} "
         f"resolution={prompt_checkpoint_resolution} "
         f"files_scanned={prompt_checkpoint_lookup_stats['files_scanned']} "
         f"candidates_scanned={prompt_checkpoint_lookup_stats['candidate_files_scanned']} "
@@ -1052,7 +1079,12 @@ def generate_step(
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
+            n_to_process = _effective_prefill_step_size(
+                prefill_step_size,
+                remaining,
+                prompt_processed_tokens,
+                prefill_max_qk_tokens,
+            )
             for store_length in prompt_checkpoint_pending_store_lengths:
                 if prompt_processed_tokens < store_length <= (
                     prompt_processed_tokens + n_to_process
@@ -1080,6 +1112,8 @@ def generate_step(
                 f"processed_tokens={prompt_processed_tokens} "
                 f"total_prompt_tokens={total_prompt_tokens} "
                 f"prefill_step_size={prefill_step_size} "
+                f"effective_prefill_step_size={n_to_process} "
+                f"prefill_max_qk_tokens={prefill_max_qk_tokens} "
                 f"chunk_seconds={chunk_seconds:.6f}"
             )
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)

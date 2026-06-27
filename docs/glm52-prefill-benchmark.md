@@ -52,48 +52,67 @@ full-prompt checkpoint.
 ## GLM DSA Sparse Prefill Fast Path
 
 This branch adds an exact, GLM-5.2-specific sparse prefill path for DSA/MLA
-layers. The existing DSA indexer still computes `topk_indices`; the new path
-uses those indices to avoid building the old multi-token sparse attention mask
-and to avoid computing full `(heads, query_length, context_length)` attention
-scores after top-k selection.
+layers. The DSA indexer computes `topk_indices` in query/key blocks, and the
+attention path uses those indices to avoid building the old multi-token sparse
+attention mask and full `(heads, query_length, context_length)` prefill tensors.
 
 The implementation order is intentionally conservative:
 
 - update the MLA latent KV cache using the existing cache classes;
-- fully dequantize int8 latent KV when the GLM MLA cache is quantized;
-- project the full effective latent KV cache to attention K/V once;
 - process query tokens in microbatches;
-- gather projected K/V and RoPE K per query microbatch with flattened sequence
-  indices, producing selected tensors shaped like `(B, H, L_micro, topk, D)`;
-- compute exact sparse attention over the selected top-k positions.
+- gather only the selected top-k latent KV and RoPE K per query microbatch;
+- dequantize only selected int8 latent KV when the GLM MLA cache is quantized;
+- absorb the non-RoPE query into the MLA latent space, avoiding selected K/V
+  projection;
+- compute exact sparse attention over selected latent KV and project only the
+  output back to value-head space.
 
-The fast path is opt-in. Enable it with:
+The fast path is on by default, but it waits until the effective context reaches
+`MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072) before using exact
+sparse attention. This keeps short and early prefill chunks on the faster
+dense fallback while retaining the memory-bounded sparse path for longer
+contexts. Disable it only for short-context comparison runs with:
 
 ```sh
-MLX_LM_GLM_DSA_FAST_PREFILL=1 python ...
+MLX_LM_GLM_DSA_FAST_PREFILL=0 python ...
 ```
 
-The benchmark exposes the same switch as `--fast-prefill enabled`. The query
+The benchmark exposes the same switch as `--fast-prefill disabled`. The query
 microbatch size defaults to 16 and can be tuned with:
 
 ```sh
 MLX_LM_GLM_DSA_FAST_PREFILL_QUERY_CHUNK=32 python ...
 ```
 
+The DSA indexer key block defaults to `max(index_topk, 8192)` and can be tuned
+with:
+
+```sh
+MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=8192 python ...
+```
+
+The sparse handoff point can be tuned with:
+
+```sh
+MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 python ...
+```
+
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:
 
-- `disabled`: `MLX_LM_GLM_DSA_FAST_PREFILL` is unset/false or
-  `--fast-prefill disabled` is used;
+- `disabled`: `MLX_LM_GLM_DSA_FAST_PREFILL` is false or `--fast-prefill disabled`
+  is used;
 - `no_topk_indices`: the indexer did not return sparse indices, usually because
   the current effective context is not larger than `index_topk`;
 - `decode`: `L == 1`, preserving the existing decode gather path;
 - `batch_size_not_one`: batched prompt prefill remains on the old path for now;
-- `unsupported_cache:*`: cache type is not single-request `GlmMlaKVCache` or
-  `QuantizedGlmMlaKVCache`;
-- `non_scalar_offset`: batch or padded cache offsets that need mask semantics;
-- `causal_prefix_shorter_than_topk`: early chunks where some query tokens have
-  fewer valid causal positions than `topk`;
+- `below_sparse_min_context`: the effective context is still below
+  `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT`;
+- `causal_prefix_shorter_than_topk`: early chunks where the first query token
+  has fewer valid causal keys than `index_topk`;
+- `unsupported_cache:*`: cache type is not a GLM MLA KV cache supported by the
+  sparse path;
+- `non_scalar_offset`: cache offsets that cannot be resolved to one value;
 - `topk_shape`, `topk_heads`, `topk_rank`, `topk_exceeds_context`, and
   `unsupported_kv_heads`: shape/layout guards.
 
@@ -321,20 +340,59 @@ The benchmark-visible admission fields are:
 
 ## Recommended GLM-5.2 Settings
 
-For long coding-agent workloads on this fork:
+For latency-focused long-context coding-agent workloads on this fork, especially
+when 200K+ token prompts are common:
 
 ```sh
-MLX_METAL_FAST_SYNCH=1 python -m mlx_lm server \
+MLX_LM_PROMPT_CHECKPOINT_DEBUG=1 \
+MLX_METAL_FAST_SYNCH=1 \
+MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 \
+python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
   --port 8000 \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
-  --prefill-step-size 2048
+  --prefill-step-size 1024 \
+  --prefill-max-qk-tokens 67108864 \
+  --prompt-concurrency 1 \
+  --decode-concurrency 1 \
+  --disable-batching \
+  --loop-guard-ngram-size 64 \
+  --loop-guard-repeats 3 \
+  --loop-guard-min-tokens 256
 ```
 
-Use larger `--prefill-step-size` values only after checking peak memory and TTFT on your workload. The default `2048` is conservative for stability.
+This keeps requests on the single-request checkpoint path, which is the lowest
+TTFT path for repeated or partially reused long prompts. Use
+`--prefill-step-size 2048` only after checking peak memory and Metal stability
+on your real prompt distribution. `--prefill-max-qk-tokens` keeps dense fallback
+chunks below the configured query-by-context budget and can be set to `0` to
+disable context-aware step shrinking.
+
+The loop guard is intentionally a decode-time fuse, not a sampling replacement:
+it stops exact repeated token n-grams after the configured minimum generated
+token count. If a client can pass request parameters, combine it with conservative
+sampling and a small `repetition_penalty` for prompts that still produce
+near-duplicate reasoning loops.
+
+For shorter mixed workloads where throughput matters more than per-request TTFT,
+continuous batching remains available:
+
+```sh
+MLX_METAL_FAST_SYNCH=1 \
+python -m mlx_lm server \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 4096 \
+  --prefill-step-size 2048 \
+  --prompt-concurrency 2 \
+  --decode-concurrency 2
+```
 
 ## Validation In This Pass
 
@@ -342,9 +400,13 @@ Unit validation covered:
 
 - exact GLM DSA fast prefill output closeness against the fallback path
 - exact GLM DSA fast prefill output closeness with `QuantizedGlmMlaKVCache`
+- sparse prefill waiting until the configured minimum effective context
+- sparse prefill falling back while the causal prefix is shorter than top-k
 - `L == 1` decode staying on the existing decode path
 - unsupported batched prompt prefill falling back instead of crashing
 - prompt checkpoint token-prefix mismatch staying a full miss
+- server CLI defaults for context-aware prefill chunk shrinking and decode loop
+  guard options
 - incompatible GLM DSA checkpoint metadata being rejected before reuse
 - isolated prompt-checkpoint cache directories via `--checkpoint-cache-dir`
 - storing prefix checkpoints while skipping final exact checkpoint saves
@@ -366,10 +428,10 @@ Local 4k GLM-5.2 measurements on
 | enabled | 32 | no | 98.4812 | 41.6202 | 404.9708 | 78 | n/a | n/a | n/a |
 
 `--fast-prefill-query-chunk 128` ran out of Metal memory on the second prefill
-chunk. Because the exact sparse gather path is slower than fallback at the
-GLM-5.2 default `index_topk=2048`, it remains opt-in. The profile shows the new
-dominant costs are selected K/V gather and per-query sparse attention, not
-latent KV projection or dequantization.
+chunk. The old dense fallback can still be useful for short-context comparison
+runs, but long-context serving should keep the memory-bounded sparse path
+enabled. The profile shows the new dominant costs are selected K/V gather and
+per-query sparse attention, not latent KV projection or dequantization.
 
 Local short GLM-5.2 benchmark smoke with
 `avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw`, `--lengths 128`,
