@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 import pickle
 import platform
 import socket
@@ -41,6 +42,7 @@ from .generate import (
 )
 from .models.cache import (
     LRUPromptCache,
+    PROMPT_CHECKPOINT_CACHE_DIR_ENV,
     make_prompt_cache,
     model_has_glm_mla_kv_cache,
 )
@@ -2329,6 +2331,16 @@ def run(
         response_generator.join()
 
 
+def configure_checkpoint_cache_dir(args):
+    checkpoint_cache_dir = getattr(args, "checkpoint_cache_dir", None)
+    if checkpoint_cache_dir is None:
+        return None
+    resolved = Path(checkpoint_cache_dir).expanduser().resolve()
+    os.environ[PROMPT_CHECKPOINT_CACHE_DIR_ENV] = str(resolved)
+    logging.info("Prompt checkpoint cache dir override: %s", resolved)
+    return str(resolved)
+
+
 def setup_arg_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
@@ -2490,6 +2502,16 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--checkpoint-cache-dir",
+        type=Path,
+        help=(
+            "Directory for prompt checkpoint files and manifest. Equivalent "
+            f"to setting {PROMPT_CHECKPOINT_CACHE_DIR_ENV}; use an empty "
+            "directory after model, tokenizer, quantization, or GLM runtime "
+            "changes."
+        ),
+    )
+    parser.add_argument(
         "--kv-bits",
         type=int,
         default=None,
@@ -2539,6 +2561,7 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    configure_checkpoint_cache_dir(args)
     run(args.host, args.port, ModelProvider(args))
 
 

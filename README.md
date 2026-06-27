@@ -59,6 +59,7 @@ python -m mlx_lm server \
   --quantized-kv-start 4096 \
   --prefill-step-size 1024 \
   --prefill-max-qk-tokens 67108864 \
+  --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
@@ -240,7 +241,11 @@ For benchmark runs, prefer an isolated checkpoint directory so measurements do n
 
     --checkpoint-cache-dir "$(mktemp -d)"
 
-The benchmark option maps to the `MLX_LM_PROMPT_CHECKPOINT_CACHE_DIR` environment override. It redirects the prompt checkpoint files and manifest only; the default serving cache remains under `~/.cache/mlx-lm/glm52-local/`.
+The server and benchmark `--checkpoint-cache-dir` option maps to the `MLX_LM_PROMPT_CHECKPOINT_CACHE_DIR` environment override. It redirects the prompt checkpoint files and manifest only; no model math, cache tensor layout, or checkpoint validation rules change. For example, to keep prompt checkpoints on the USB SSD:
+
+    --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints
+
+Use an empty checkpoint directory after changing model weights, quantization, tokenizer, adapters, GLM implementation details, or KV quantization settings. Reusing stale prompt checkpoints from a different runtime is the main way a path move can look like a generation-quality regression.
 
 When changing model weights, quantization, tokenizer, adapters, GLM implementation details, or KV quantization settings, invalidate the local runtime cache by moving or deleting the shared root:
 

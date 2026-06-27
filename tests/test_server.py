@@ -3,16 +3,19 @@
 import http
 import io
 import json
+import os
+import tempfile
 import threading
 import types
 import unittest
 import unittest.mock as mock
+from pathlib import Path
 from queue import Queue
 
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, PROMPT_CHECKPOINT_CACHE_DIR_ENV
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
@@ -20,6 +23,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     TokenLoopGuard,
     _process_control_tokens,
+    configure_checkpoint_cache_dir,
     setup_arg_parser,
 )
 from mlx_lm.utils import load
@@ -216,6 +220,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.quantized_kv_start, 0)
         self.assertFalse(args.disable_batching)
         self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
+        self.assertIsNone(args.checkpoint_cache_dir)
         self.assertEqual(args.loop_guard_ngram_size, 64)
         self.assertEqual(args.loop_guard_repeats, 3)
         self.assertEqual(args.loop_guard_min_tokens, 256)
@@ -229,6 +234,33 @@ class TestServerCLI(unittest.TestCase):
         args = setup_arg_parser().parse_args(["--prefill-max-qk-tokens", "0"])
 
         self.assertEqual(args.prefill_max_qk_tokens, 0)
+
+    def test_setup_arg_parser_checkpoint_cache_dir(self):
+        args = setup_arg_parser().parse_args(
+            ["--checkpoint-cache-dir", "/tmp/glm52-checkpoints"]
+        )
+
+        self.assertEqual(args.checkpoint_cache_dir, Path("/tmp/glm52-checkpoints"))
+
+    def test_configure_checkpoint_cache_dir_sets_env(self):
+        old_value = os.environ.get(PROMPT_CHECKPOINT_CACHE_DIR_ENV)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                checkpoint_dir = Path(tmpdir) / "prompt-checkpoints"
+                resolved = configure_checkpoint_cache_dir(
+                    types.SimpleNamespace(checkpoint_cache_dir=checkpoint_dir)
+                )
+
+                self.assertEqual(resolved, str(checkpoint_dir.resolve()))
+                self.assertEqual(
+                    os.environ[PROMPT_CHECKPOINT_CACHE_DIR_ENV],
+                    str(checkpoint_dir.resolve()),
+                )
+        finally:
+            if old_value is None:
+                os.environ.pop(PROMPT_CHECKPOINT_CACHE_DIR_ENV, None)
+            else:
+                os.environ[PROMPT_CHECKPOINT_CACHE_DIR_ENV] = old_value
 
     def test_setup_arg_parser_loop_guard_options(self):
         args = setup_arg_parser().parse_args(

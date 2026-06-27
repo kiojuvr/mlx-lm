@@ -45,6 +45,9 @@ The benchmark reports:
 Use `--no-prompt-checkpoint` for cold prefill measurements. Use
 `--checkpoint-cache-dir "$(mktemp -d)"` when measuring checkpoint behavior so a
 run does not touch the normal `~/.cache/mlx-lm/glm52-local` checkpoint cache.
+The server exposes the same option; it maps to the existing
+`MLX_LM_PROMPT_CHECKPOINT_CACHE_DIR` environment override and changes only the
+prompt checkpoint file location.
 Use `--checkpoint-save-exact disabled` or `--no-save-exact-checkpoint` when you
 want configured prefix/frontier checkpoints without also saving the final exact
 full-prompt checkpoint.
@@ -356,6 +359,7 @@ python -m mlx_lm server \
   --quantized-kv-start 4096 \
   --prefill-step-size 1024 \
   --prefill-max-qk-tokens 67108864 \
+  --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
