@@ -37,6 +37,8 @@ The benchmark reports:
 - controlled LCP fields: requested total tokens, stored prefix tokens, expected
   reused prefix tokens, actual `disk_cached_tokens`, `fresh_prompt_tokens`, and
   `fresh_prefill_tokens`
+- policy-sweep fields: `policy_name`, `policy_store_prefix_tokens`,
+  `policy_reused_ratio`, and `policy_fresh_prefill_ratio`
 - GLM DSA sparse prefill fast-path hits and fallback reasons
 - optional GLM DSA stage timings for q projection, KV cache update,
   DSA top-k, latent KV dequantization, latent K/V projection, sparse gather,
@@ -267,6 +269,29 @@ python benchmarks/glm52_prefill_benchmark.py \
   --checkpoint-save-exact disabled \
   --json-output glm52-lcp-int8-8192-2048.json
 
+# Policy sweep for ds4-style checkpoint tuning. Each candidate gets an isolated
+# checkpoint directory under POLICY_DIR. The default candidates compare disabled
+# baseline, the derived ds4 boundary, and the full shared prefix when distinct.
+POLICY_DIR="$(mktemp -d)"
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode policy-sweep \
+  --lcp-prefix-tokens 8192 --lcp-suffix-tokens 2048 \
+  --max-tokens 1 --prefill-step-size 2048 \
+  --fast-prefill disabled \
+  --checkpoint-cache-dir "$POLICY_DIR" \
+  --json-output glm52-policy-sweep-8192-2048.json
+
+# Explicit policy candidates use name:length. Length 0 is the disabled baseline.
+POLICY_CUSTOM_DIR="$(mktemp -d)"
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode policy-sweep \
+  --lcp-prefix-tokens 8192 --lcp-suffix-tokens 2048 \
+  --policy-candidates disabled:0,prefix-6144:6144,prefix-8192:8192 \
+  --max-tokens 1 --prefill-step-size 2048 \
+  --fast-prefill disabled \
+  --checkpoint-cache-dir "$POLICY_CUSTOM_DIR" \
+  --json-output glm52-policy-custom-8192-2048.json
+
 # Queued serving workload with repeated coding-agent prefixes:
 # exercises admission waiting and the conservative fp/int8 guard. Use
 # --max-tokens > 1 so active quantized decode batches stay alive long enough for
@@ -282,6 +307,19 @@ python benchmarks/glm52_prefill_benchmark.py \
   --no-prompt-checkpoint \
   --json-output glm52-queued-int8.json
 ```
+
+Policy sweep JSON contains store/hit pairs for every candidate. Prefer the
+smallest candidate that keeps `checkpoint_expected_match` true and leaves
+`fresh_prefill_tokens` within the latency budget. For coding-agent continuation
+workloads, the ds4-style default generally means:
+
+- keep prefix checkpoints aligned to stable boundaries instead of exact prompt
+  tails;
+- keep continued checkpoints at the rounded interval boundary;
+- avoid storing many nearby variants that differ only in the last unstable
+  tokens;
+- use `checkpoint_lookup_seconds` and `checkpoint_manifest_entries` to check
+  whether the manifest is becoming the bottleneck.
 
 Controlled LCP JSON contains both the store run and measured hit run. The hit
 row should have `checkpoint_expected_match: true`, and the actual disk hit
@@ -360,6 +398,13 @@ python -m mlx_lm server \
   --prefill-step-size 1024 \
   --prefill-max-qk-tokens 67108864 \
   --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
+  --checkpoint-min-tokens 512 \
+  --checkpoint-cold-max-tokens 30000 \
+  --checkpoint-boundary-trim-tokens 32 \
+  --checkpoint-boundary-align-tokens 2048 \
+  --checkpoint-continued-interval-tokens 10000 \
+  --checkpoint-shutdown-save-limit 4 \
+  --checkpoint-max-age-seconds 0 \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
@@ -374,6 +419,12 @@ TTFT path for repeated or partially reused long prompts. Use
 on your real prompt distribution. `--prefill-max-qk-tokens` keeps dense fallback
 chunks below the configured query-by-context budget and can be set to `0` to
 disable context-aware step shrinking.
+
+The checkpoint defaults above are the current ds4-style policy: save stable
+boundaries rather than unstable tails, round continued checkpoints to a roughly
+10K-token interval, and preserve a few live RAM frontiers on shutdown. Set
+`--checkpoint-max-age-seconds` only after measuring real cache hit windows; the
+default keeps age eviction off and lets file/byte budgets control pruning.
 
 The loop guard is intentionally a decode-time fuse, not a sampling replacement:
 it stops exact repeated token n-grams after the configured minimum generated

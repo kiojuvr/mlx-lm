@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -38,16 +39,42 @@ from .generate import (
     BatchGenerator,
     DEFAULT_PREFILL_MAX_QK_TOKENS,
     SequenceStateMachine,
+    _prompt_checkpoint_debug,
     stream_generate,
 )
 from .models.cache import (
+    DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
     LRUPromptCache,
     PROMPT_CHECKPOINT_CACHE_DIR_ENV,
+    PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY,
+    DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+    PromptCacheCheckpointError,
+    can_trim_prompt_cache,
+    expected_glm_mla_kv_quantization_metadata,
+    expected_glm_mla_kv_settings_metadata,
+    find_prompt_checkpoint_rendered_prefix,
+    load_prompt_checkpoint_with_metadata_prefix,
     make_prompt_cache,
     model_has_glm_mla_kv_cache,
+    prompt_checkpoint_file,
+    prompt_checkpoint_prefix_tokens_metadata,
+    prompt_checkpoint_rendered_prefix_metadata,
+    prune_prompt_checkpoints,
+    rendered_prompt_bytes,
+    save_prompt_checkpoint,
+    trim_prompt_cache,
+    update_prompt_checkpoint_manifest,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
+
+
+DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS = 512
+DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS = 30_000
+DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS = 32
+DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS = 2048
+DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS = 10_000
+DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT = 4
 
 
 def get_system_fingerprint():
@@ -153,7 +180,8 @@ def process_message_content(messages):
             for tool_call in tool_calls:
                 if func := tool_call.get("function"):
                     if args := func.get("arguments"):
-                        func["arguments"] = json.loads(args)
+                        if isinstance(args, str):
+                            func["arguments"] = json.loads(args)
 
 
 @dataclass
@@ -226,6 +254,193 @@ class GenerationContext:
 
     def stop(self):
         self._should_stop = True
+
+
+@dataclass
+class RenderedPromptCheckpoint:
+    prompt_cache: List[Any]
+    prefix_tokens: List[int]
+    suffix_tokens: List[int]
+    kind: str
+    rendered_prefix_bytes: int
+
+    @property
+    def prompt(self):
+        return self.prefix_tokens + self.suffix_tokens
+
+    @property
+    def cached_tokens(self):
+        return len(self.prefix_tokens)
+
+
+def _prompt_checkpoint_policy_int(args, name, default):
+    value = getattr(args, name, default)
+    if value is None:
+        value = default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, int(default))
+
+
+def _prompt_checkpoint_max_age_seconds(args):
+    return _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_max_age_seconds",
+        DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+    )
+
+
+def _prompt_checkpoint_boundary_store_length(
+    token_count,
+    *,
+    min_tokens=DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+    trim_tokens=DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
+    align_tokens=DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
+):
+    try:
+        token_count = max(0, int(token_count))
+        min_tokens = max(0, int(min_tokens))
+        trim_tokens = max(0, int(trim_tokens))
+        align_tokens = max(0, int(align_tokens))
+    except (TypeError, ValueError):
+        return 0
+    if token_count == 0:
+        return 0
+
+    if token_count > min_tokens + trim_tokens:
+        stable_length = token_count - trim_tokens
+        if align_tokens > 0:
+            stable_length -= stable_length % align_tokens
+        if stable_length >= min_tokens:
+            return stable_length
+    return token_count
+
+
+def _prompt_checkpoint_cold_prefix_length(args, token_count):
+    min_tokens = _prompt_checkpoint_policy_int(
+        args, "checkpoint_min_tokens", DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS
+    )
+    cold_max_tokens = _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_cold_max_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+    )
+    trim_tokens = _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_boundary_trim_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
+    )
+    align_tokens = _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_boundary_align_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
+    )
+
+    try:
+        token_count = max(0, int(token_count))
+    except (TypeError, ValueError):
+        return 0
+    if token_count < min_tokens:
+        return 0
+    if cold_max_tokens > 0 and token_count > cold_max_tokens:
+        return 0
+    return _prompt_checkpoint_boundary_store_length(
+        token_count,
+        min_tokens=min_tokens,
+        trim_tokens=trim_tokens,
+        align_tokens=align_tokens,
+    )
+
+
+def _prompt_checkpoint_continued_step(args):
+    interval_tokens = _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_continued_interval_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
+    )
+    align_tokens = _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_boundary_align_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
+    )
+    if interval_tokens <= 0:
+        return 0
+    if align_tokens <= 0:
+        return interval_tokens
+    return ((interval_tokens + align_tokens - 1) // align_tokens) * align_tokens
+
+
+def _prompt_checkpoint_continued_frontier_args(args):
+    continued_step = _prompt_checkpoint_continued_step(args)
+    if continued_step <= 0:
+        return 0, 0
+    return continued_step, continued_step
+
+
+def _prompt_checkpoint_continued_store_length(args, token_count):
+    continued_step = _prompt_checkpoint_continued_step(args)
+    if continued_step <= 0:
+        return 0
+    min_tokens = _prompt_checkpoint_policy_int(
+        args, "checkpoint_min_tokens", DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS
+    )
+    trim_tokens = _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_boundary_trim_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
+    )
+    try:
+        token_count = max(0, int(token_count))
+    except (TypeError, ValueError):
+        return 0
+    if token_count < min_tokens:
+        return 0
+    stable_length = max(0, token_count - trim_tokens)
+    store_length = (stable_length // continued_step) * continued_step
+    return store_length if store_length >= min_tokens else 0
+
+
+def _prompt_checkpoint_store_prefix_lengths(
+    args,
+    prompt,
+    segments,
+    segment_types,
+    initial_cached_tokens=0,
+):
+    try:
+        total_tokens = len(prompt)
+    except TypeError:
+        return []
+    if total_tokens <= 1:
+        return []
+
+    try:
+        initial_cached_tokens = max(0, int(initial_cached_tokens))
+    except (TypeError, ValueError):
+        initial_cached_tokens = 0
+
+    lengths = []
+    seen = set()
+
+    def add(length):
+        if (
+            length is not None
+            and initial_cached_tokens < length < total_tokens
+            and length not in seen
+        ):
+            seen.add(length)
+            lengths.append(length)
+
+    segment_end = 0
+    for segment, segment_type in zip(segments or (), segment_types or ()):
+        segment_end += len(segment)
+        if segment_type == "system":
+            add(segment_end)
+
+    add(_prompt_checkpoint_cold_prefix_length(args, total_tokens))
+    lengths.sort()
+    return lengths
 
 
 class TokenLoopGuard:
@@ -497,15 +712,126 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
+        self._shutdown_complete = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
+        self.shutdown()
 
     def join(self):
         self._generation_thread.join()
+
+    def flush_shutdown_prompt_checkpoints(self):
+        limit = _prompt_checkpoint_policy_int(
+            self.cli_args,
+            "checkpoint_shutdown_save_limit",
+            DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
+        )
+        stats = {
+            "enabled": limit > 0,
+            "limit": limit,
+            "candidates": 0,
+            "attempted": 0,
+            "saved": 0,
+            "skipped": 0,
+        }
+        if limit <= 0:
+            _prompt_checkpoint_debug("shutdown flush skipped disabled")
+            return stats
+        if self.model_provider.draft_model is not None:
+            _prompt_checkpoint_debug("shutdown flush skipped draft model active")
+            return stats
+        if self.model_provider.model is None or self.model_provider.tokenizer is None:
+            _prompt_checkpoint_debug("shutdown flush skipped model not loaded")
+            return stats
+        if not hasattr(self.prompt_cache, "snapshot"):
+            _prompt_checkpoint_debug("shutdown flush skipped cache snapshot unavailable")
+            return stats
+
+        current_model_key = self.model_provider.model_key
+        candidates = [
+            entry
+            for entry in self.prompt_cache.snapshot(newest_first=True)
+            if entry.get("model") == current_model_key
+        ]
+        candidates.sort(
+            key=lambda entry: (
+                len(entry.get("tokens") or ()),
+                entry.get("last_hit_at") or entry.get("created_at") or 0,
+            ),
+            reverse=True,
+        )
+        stats["candidates"] = len(candidates)
+
+        seen_checkpoint_files = set()
+        for entry in candidates:
+            if stats["saved"] >= limit:
+                break
+            tokens = entry.get("tokens") or []
+            store_length = _prompt_checkpoint_continued_store_length(
+                self.cli_args,
+                len(tokens),
+            )
+            if store_length <= 0:
+                stats["skipped"] += 1
+                continue
+            checkpoint_name = os.path.basename(
+                prompt_checkpoint_file(tokens[:store_length])
+            )
+            if checkpoint_name in seen_checkpoint_files:
+                stats["skipped"] += 1
+                continue
+            seen_checkpoint_files.add(checkpoint_name)
+            stats["attempted"] += 1
+            if self._save_continued_prompt_checkpoint(
+                self.model_provider.tokenizer,
+                entry["prompt_cache"],
+                tokens,
+                prompt_token_count=0,
+                rendered_continuation=None,
+            ):
+                stats["saved"] += 1
+
+        _prompt_checkpoint_debug(
+            "shutdown flush complete "
+            f"candidates={stats['candidates']} "
+            f"attempted={stats['attempted']} "
+            f"saved={stats['saved']} "
+            f"skipped={stats['skipped']} "
+            f"limit={limit}"
+        )
+        return stats
+
+    def prune_shutdown_prompt_checkpoints(self):
+        try:
+            stats = prune_prompt_checkpoints(
+                max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
+            )
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "shutdown prune failure swallowed "
+                f"error={type(exc).__name__}"
+            )
+            return None
+        removed = stats.get("removed", [])
+        if removed:
+            _prompt_checkpoint_debug(
+                "shutdown prune removed "
+                f"count={len(removed)} "
+                f"total_files={stats.get('total_files')} "
+                f"total_bytes={stats.get('total_bytes')}"
+            )
+        return stats
+
+    def shutdown(self):
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        self.flush_shutdown_prompt_checkpoints()
+        self.prune_shutdown_prompt_checkpoints()
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -562,7 +888,296 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
-    def _tokenize(self, tokenizer, request, args):
+    def _render_prompt_text(self, tokenizer, request, args):
+        if not hasattr(request, "request_type"):
+            return None
+        if request.request_type != "chat":
+            return request.prompt
+
+        messages = request.messages
+        tools = request.tools
+        role_mapping = request.role_mapping
+        if not tokenizer.has_chat_template:
+            return convert_chat(messages, role_mapping)
+
+        process_message_content(messages)
+        if tools and not tokenizer.has_tool_calling:
+            logging.warning(
+                "Received tools but model does not support tool calling. "
+                "If you think this is an error, file an issue here: "
+                "https://github.com/ml-explore/mlx-lm/issues"
+            )
+        chat_template_args = self.model_provider.cli_args.chat_template_args
+        if args.chat_template_kwargs:
+            chat_template_args = chat_template_args.copy()
+            chat_template_args.update(args.chat_template_kwargs)
+        return tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            tools=tools,
+            **chat_template_args,
+        )
+
+    @staticmethod
+    def _encode_rendered_suffix(tokenizer, rendered_suffix):
+        try:
+            return tokenizer.encode(rendered_suffix, add_special_tokens=False)
+        except TypeError:
+            return tokenizer.encode(rendered_suffix)
+
+    @staticmethod
+    def _decode_checkpoint_prefix(tokenizer, prefix_tokens):
+        decode_kwargs = [
+            {"skip_special_tokens": False, "clean_up_tokenization_spaces": False},
+            {"skip_special_tokens": False},
+            {},
+        ]
+        for decode_kwarg in decode_kwargs:
+            try:
+                return tokenizer.decode(prefix_tokens, **decode_kwarg)
+            except TypeError:
+                continue
+        return tokenizer.decode(prefix_tokens)
+
+    @classmethod
+    def _decode_checkpoint_tokens_bytes(cls, tokenizer, tokens):
+        return rendered_prompt_bytes(cls._decode_checkpoint_prefix(tokenizer, tokens))
+
+    @staticmethod
+    def _initial_state_from_prompt(tokenizer, prompt):
+        initial_state = "normal"
+        if tokenizer.has_thinking:
+            think_start = tokenizer.rfind_think_start(prompt)
+            think_end = tokenizer.rfind_think_end(prompt)
+            if think_start > think_end:
+                initial_state = "reasoning"
+        return initial_state
+
+    def _load_rendered_prompt_checkpoint(self, tokenizer, rendered_prompt):
+        if rendered_prompt is None or self.model_provider.draft_model is not None:
+            return None
+        rendered = rendered_prompt_bytes(rendered_prompt)
+        if not rendered:
+            return None
+
+        candidates, _ = find_prompt_checkpoint_rendered_prefix(
+            rendered,
+            return_stats=True,
+        )
+        _prompt_checkpoint_debug(
+            "rendered lookup result "
+            f"rendered_bytes={len(rendered)} "
+            f"candidates={len(candidates)}"
+        )
+        for rendered_prefix_length, token_prefix_length, checkpoint_path, kind in (
+            candidates
+        ):
+            if kind not in ("prefix", "frontier", "continued"):
+                continue
+            try:
+                rendered_suffix = rendered[rendered_prefix_length:].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            expected_quantization = expected_glm_mla_kv_quantization_metadata(
+                self.model_provider.model,
+                cache_token_length=token_prefix_length,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
+            )
+            expected_settings = expected_glm_mla_kv_settings_metadata(
+                self.model_provider.model,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
+            )
+            try:
+                prompt_cache, prefix_tokens, metadata = (
+                    load_prompt_checkpoint_with_metadata_prefix(
+                        checkpoint_path,
+                        checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                        model=self.model_provider.model,
+                        expected_glm_mla_kv_quantization=expected_quantization,
+                        expected_glm_mla_kv_settings=expected_settings,
+                        return_metadata=True,
+                    )
+                )
+            except PromptCacheCheckpointError:
+                _prompt_checkpoint_debug(
+                    "rendered candidate rejected load "
+                    f"file={os.path.basename(checkpoint_path)} "
+                    f"kind={kind}"
+                )
+                continue
+            checkpoint_label = metadata.get("checkpoint_label", kind)
+            if checkpoint_label not in ("prefix", "frontier", "continued"):
+                continue
+            try:
+                decoded_prefix = self._decode_checkpoint_tokens_bytes(
+                    tokenizer,
+                    prefix_tokens,
+                )
+            except Exception:
+                decoded_prefix = None
+            if decoded_prefix != rendered[:rendered_prefix_length]:
+                _prompt_checkpoint_debug(
+                    "rendered candidate rejected prefix decode mismatch "
+                    f"file={os.path.basename(checkpoint_path)} "
+                    f"kind={checkpoint_label} "
+                    f"prefix_tokens={len(prefix_tokens)} "
+                    f"rendered_prefix_bytes={rendered_prefix_length}"
+                )
+                continue
+            suffix_tokens = self._encode_rendered_suffix(tokenizer, rendered_suffix)
+            try:
+                decoded_suffix = self._decode_checkpoint_tokens_bytes(
+                    tokenizer,
+                    suffix_tokens,
+                )
+            except Exception:
+                decoded_suffix = None
+            if decoded_suffix != rendered[rendered_prefix_length:]:
+                _prompt_checkpoint_debug(
+                    "rendered candidate rejected suffix decode mismatch "
+                    f"file={os.path.basename(checkpoint_path)} "
+                    f"kind={checkpoint_label} "
+                    f"suffix_tokens={len(suffix_tokens)} "
+                    f"rendered_suffix_bytes={len(rendered_suffix.encode('utf-8'))}"
+                )
+                continue
+            try:
+                update_prompt_checkpoint_manifest(
+                    checkpoint_path,
+                    prefix_length=len(prefix_tokens),
+                    kind=checkpoint_label,
+                    metadata=metadata,
+                    hit=True,
+                )
+            except Exception:
+                pass
+            _prompt_checkpoint_debug(
+                "rendered hit "
+                f"file={os.path.basename(checkpoint_path)} "
+                f"kind={checkpoint_label} "
+                f"prefix_tokens={len(prefix_tokens)} "
+                f"suffix_tokens={len(suffix_tokens)} "
+                f"rendered_prefix_bytes={rendered_prefix_length}"
+            )
+            return RenderedPromptCheckpoint(
+                prompt_cache=prompt_cache,
+                prefix_tokens=prefix_tokens,
+                suffix_tokens=suffix_tokens,
+                kind=checkpoint_label,
+                rendered_prefix_bytes=rendered_prefix_length,
+            )
+        return None
+
+    def _save_continued_prompt_checkpoint(
+        self,
+        tokenizer,
+        prompt_cache,
+        cache_key,
+        *,
+        prompt_token_count,
+        rendered_continuation=None,
+    ):
+        if self.model_provider.draft_model is not None:
+            _prompt_checkpoint_debug("save continued skipped draft model active")
+            return False
+        store_length = _prompt_checkpoint_continued_store_length(
+            self.cli_args,
+            len(cache_key),
+        )
+        if store_length <= 0 or store_length <= prompt_token_count:
+            _prompt_checkpoint_debug(
+                "save continued skipped boundary "
+                f"total_tokens={len(cache_key)} "
+                f"prompt_tokens={prompt_token_count} "
+                f"store_length={store_length}"
+            )
+            return False
+
+        trim_tokens = len(cache_key) - store_length
+        checkpoint_cache = copy.deepcopy(prompt_cache)
+        if trim_tokens > 0:
+            if not can_trim_prompt_cache(checkpoint_cache):
+                _prompt_checkpoint_debug("save continued skipped non-trimmable cache")
+                return False
+            if trim_prompt_cache(checkpoint_cache, trim_tokens) != trim_tokens:
+                _prompt_checkpoint_debug(
+                    "save continued skipped trim mismatch "
+                    f"trim_tokens={trim_tokens}"
+                )
+                return False
+
+        prefix_tokens = cache_key[:store_length]
+        metadata = {"checkpoint_label": "continued"}
+        rendered_prefix = None
+        if rendered_continuation is not None:
+            rendered_continuation_bytes = rendered_prompt_bytes(rendered_continuation)
+            try:
+                rendered_prefix = self._decode_checkpoint_prefix(
+                    tokenizer,
+                    prefix_tokens,
+                )
+            except Exception:
+                rendered_prefix = None
+            rendered_prefix_bytes = rendered_prompt_bytes(rendered_prefix)
+            if (
+                not rendered_prefix_bytes
+                or rendered_continuation_bytes is None
+                or not rendered_continuation_bytes.startswith(rendered_prefix_bytes)
+            ):
+                rendered_prefix = None
+        if rendered_prefix is not None:
+            metadata.update(prompt_checkpoint_rendered_prefix_metadata(rendered_prefix))
+            metadata[PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY] = (
+                prompt_checkpoint_prefix_tokens_metadata(prefix_tokens)
+            )
+
+        checkpoint_path = prompt_checkpoint_file(prefix_tokens)
+        try:
+            checkpoint_metadata = save_prompt_checkpoint(
+                checkpoint_path,
+                checkpoint_cache,
+                prefix_tokens=prefix_tokens,
+                checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                model=self.model_provider.model,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
+                metadata=metadata,
+            )
+            update_prompt_checkpoint_manifest(
+                checkpoint_path,
+                prefix_length=store_length,
+                kind="continued",
+                metadata=checkpoint_metadata,
+            )
+            prune_prompt_checkpoints(
+                protected_files=[os.path.basename(checkpoint_path)],
+                max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
+            )
+            _prompt_checkpoint_debug(
+                "save continued success "
+                f"file={os.path.basename(checkpoint_path)} "
+                f"prefix_length={store_length} "
+                f"trim_tokens={trim_tokens} "
+                f"rendered_metadata={int(rendered_prefix is not None)}"
+            )
+            return True
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "save continued failure swallowed "
+                f"file={os.path.basename(checkpoint_path)} "
+                f"prefix_length={store_length} "
+                f"error={type(exc).__name__}"
+            )
+            return False
+
+    def _tokenize(self, tokenizer, request, args, return_rendered=False):
         """Tokenize a request and split the prompt into segments.
 
         Returns a tuple
@@ -576,6 +1191,7 @@ class ResponseGenerator:
             state machine (normal or thinking depending on whether we have tail
             or not)
         """
+        rendered_prompt = None
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
@@ -594,21 +1210,28 @@ class ResponseGenerator:
                 if args.chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
                     chat_template_args.update(args.chat_template_kwargs)
-                template_kwargs = dict(
-                    tools=tools,
-                    tokenize=True,
-                    **chat_template_args,
-                )
+                template_kwargs = dict(tools=tools, **chat_template_args)
                 prompt = tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
+                    tokenize=True,
                     **template_kwargs,
                 )
+                if return_rendered:
+                    rendered_prompt = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **template_kwargs,
+                    )
             else:
-                prompt = tokenizer.encode(convert_chat(messages, role_mapping))
+                rendered_prompt = convert_chat(messages, role_mapping)
+                prompt = tokenizer.encode(rendered_prompt)
                 template_kwargs = None
         else:
             prompt = tokenizer.encode(request.prompt)
+            if return_rendered:
+                return prompt, [prompt], ["assistant"], "normal", request.prompt
             return prompt, [prompt], ["assistant"], "normal"
 
         # If we are here it means we have a chat request so we need to search
@@ -624,6 +1247,8 @@ class ResponseGenerator:
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
+            if return_rendered:
+                return prompt, [prompt], ["assistant"], initial_state, rendered_prompt
             return prompt, [prompt], ["assistant"], initial_state
 
         segments = []
@@ -642,6 +1267,7 @@ class ResponseGenerator:
                 sys_tokens = tokenizer.apply_chat_template(
                     messages[:num_system] + [{"role": "user", "content": ""}],
                     add_generation_prompt=False,
+                    tokenize=True,
                     **template_kwargs,
                 )
             else:
@@ -679,6 +1305,8 @@ class ResponseGenerator:
             segments = [prompt]
             segment_types = ["assistant"]
 
+        if return_rendered:
+            return prompt, segments, segment_types, initial_state, rendered_prompt
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(
@@ -990,6 +1618,9 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
+        if batch_generator is not None:
+            batch_generator.close()
+
     def _serve_single(self, request):
         rqueue, request, args = request
 
@@ -1011,9 +1642,33 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, segments, segment_types, initial_state = self._tokenize(
-                tokenizer, request, args
+            rendered_prompt = self._render_prompt_text(tokenizer, request, args)
+            rendered_checkpoint = self._load_rendered_prompt_checkpoint(
+                tokenizer,
+                rendered_prompt,
             )
+            if rendered_checkpoint is None:
+                tokenized = self._tokenize(
+                    tokenizer,
+                    request,
+                    args,
+                    return_rendered=True,
+                )
+                prompt, segments, segment_types, initial_state, rendered_prompt = (
+                    tokenized
+                )
+            else:
+                prompt = rendered_checkpoint.prompt
+                if rendered_checkpoint.suffix_tokens:
+                    segments = [
+                        rendered_checkpoint.prefix_tokens,
+                        rendered_checkpoint.suffix_tokens,
+                    ]
+                    segment_types = ["system", "user"]
+                else:
+                    segments = [prompt]
+                    segment_types = ["system"]
+                initial_state = self._initial_state_from_prompt(tokenizer, prompt)
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -1042,22 +1697,39 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
+            ram_cache, ram_rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
+            ram_cache_count = len(prompt) - len(ram_rest)
+            if (
+                rendered_checkpoint is not None
+                and rendered_checkpoint.cached_tokens >= ram_cache_count
+            ):
+                cache = rendered_checkpoint.prompt_cache
+                ctx.prompt_cache_count = rendered_checkpoint.cached_tokens
+                rest = prompt[ctx.prompt_cache_count :]
+            else:
+                cache = ram_cache
+                ctx.prompt_cache_count = ram_cache_count
+                rest = ram_rest
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
-            checkpoint_prefix_lengths = []
-            segment_end = 0
-            for segment, segment_type in zip(segments, segment_types):
-                segment_end += len(segment)
-                if segment_type == "system" and segment_end < len(prompt):
-                    checkpoint_prefix_lengths.append(segment_end)
+            checkpoint_prefix_lengths = _prompt_checkpoint_store_prefix_lengths(
+                self.cli_args,
+                prompt,
+                segments,
+                segment_types,
+                ctx.prompt_cache_count,
+            )
+            checkpoint_frontier_min_tokens, checkpoint_frontier_stride_tokens = (
+                _prompt_checkpoint_continued_frontier_args(self.cli_args)
+            )
+            prompt_token_count = len(prompt)
+            generated_text_parts = []
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1080,6 +1752,11 @@ class ResponseGenerator:
                 prompt_checkpoint_initial_cached_tokens=ctx.prompt_cache_count,
                 prompt_checkpoint_store_prefix_lengths=checkpoint_prefix_lengths,
                 prompt_checkpoint_allow_existing_cache=True,
+                prompt_checkpoint_frontier_min_tokens=checkpoint_frontier_min_tokens,
+                prompt_checkpoint_frontier_stride_tokens=(
+                    checkpoint_frontier_stride_tokens
+                ),
+                prompt_checkpoint_rendered_prompt=rendered_prompt,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1099,6 +1776,8 @@ class ResponseGenerator:
                     )
                 )
                 cache_key.append(gen.token)
+                if gen.text:
+                    generated_text_parts.append(gen.text)
 
                 if ctx._should_stop:
                     if self._is_distributed:
@@ -1109,6 +1788,17 @@ class ResponseGenerator:
                     break
 
             rqueue.put(None)
+
+            rendered_continuation = None
+            if rendered_prompt is not None and generated_text_parts:
+                rendered_continuation = rendered_prompt + "".join(generated_text_parts)
+            self._save_continued_prompt_checkpoint(
+                tokenizer,
+                cache,
+                cache_key,
+                prompt_token_count=prompt_token_count,
+                rendered_continuation=rendered_continuation,
+            )
 
             # Save the KV cache again
             self.prompt_cache.insert_cache(
@@ -2311,8 +3001,10 @@ def _run_http_server(
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        httpd.shutdown()
+        pass
+    finally:
         response_generator.stop_and_join()
+        httpd.server_close()
 
 
 def run(
@@ -2323,7 +3015,10 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    prompt_cache = LRUPromptCache(
+        model_provider.cli_args.prompt_cache_size,
+        max_bytes=model_provider.cli_args.prompt_cache_bytes or (1 << 63),
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -2509,6 +3204,76 @@ def setup_arg_parser():
             f"to setting {PROMPT_CHECKPOINT_CACHE_DIR_ENV}; use an empty "
             "directory after model, tokenizer, quantization, or GLM runtime "
             "changes."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-min-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+        help=(
+            "Minimum prompt length for ds4-style prompt checkpoint policy "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-cold-max-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+        help=(
+            "Maximum cold prompt length eligible for an aligned boundary "
+            "checkpoint. Use 0 to disable the maximum "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-boundary-trim-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
+        help=(
+            "Tokens to trim from the tail before aligning cold prompt "
+            "checkpoint boundaries "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-boundary-align-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
+        help=(
+            "Token multiple used for stable prompt checkpoint boundaries. "
+            "Use 0 to disable alignment "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-continued-interval-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
+        help=(
+            "Approximate token interval for automatic long-prompt frontier "
+            "checkpoints. The effective interval is rounded up to "
+            "--checkpoint-boundary-align-tokens. Use 0 to disable "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-max-age-seconds",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+        help=(
+            "Evict prompt checkpoint files that have not been hit or created "
+            "within this many seconds. Use 0 to disable age eviction "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-shutdown-save-limit",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
+        help=(
+            "Maximum number of RAM prompt-cache entries to persist as continued "
+            "checkpoints during server shutdown. Use 0 to disable "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT})."
         ),
     )
     parser.add_argument(

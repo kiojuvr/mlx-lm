@@ -27,7 +27,10 @@ from mlx_lm.models.cache import (
     EMPTY_ARRAYS_METADATA_KEY,
     GlmMlaKVCache,
     KVCache,
+    PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY,
+    PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY,
     PROMPT_CHECKPOINT_CACHE_DIR_ENV,
+    PROMPT_CHECKPOINT_MAX_AGE_SECONDS_ENV,
     PROMPT_CHECKPOINT_MAX_BYTES_ENV,
     PROMPT_CHECKPOINT_MAX_FILES_ENV,
     PromptCacheCheckpointError,
@@ -36,20 +39,25 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     expected_glm_mla_kv_quantization_metadata,
     expected_glm_mla_kv_settings_metadata,
+    find_prompt_checkpoint_rendered_prefix,
     ensure_glm52_local_cache_dirs,
     glm52_kv_cache_dir,
     glm52_local_cache_root,
     glm52_prompt_checkpoints_dir,
     load_prompt_checkpoint,
     load_prompt_checkpoint_manifest,
+    load_prompt_checkpoint_with_metadata_prefix,
     load_prompt_cache,
     make_prompt_cache,
     prompt_checkpoint_file,
     prompt_checkpoint_manifest_file,
     prompt_prefix_hash,
+    prune_prompt_checkpoints,
     save_prompt_checkpoint,
+    save_prompt_checkpoint_manifest,
     save_prompt_cache,
     trim_prompt_cache,
+    update_prompt_checkpoint_manifest,
 )
 from mlx_lm.utils import load
 
@@ -751,6 +759,57 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertIn("manifest update", output)
         self.assertIn("manifest prune", output)
 
+    def test_rendered_prefix_manifest_lookup_loads_exact_token_prefix(self):
+        self._set_home_to_test_dir()
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = list(range(1, 16))
+
+        def decode_prefix(tokens):
+            return "".join(f"<{token}>" for token in tokens)
+
+        rendered_prompt = decode_prefix(prompt_tokens)
+        list(
+            generate_step(
+                mx.array(prompt_tokens),
+                model,
+                max_tokens=1,
+                prompt_checkpoint_rendered_prompt=rendered_prompt,
+                prompt_checkpoint_decode_prefix=decode_prefix,
+                **self._small_frontier_kwargs(),
+            )
+        )
+
+        manifest = load_prompt_checkpoint_manifest()
+        entries = list(manifest["entries"].values())
+        rendered_entries = [
+            entry
+            for entry in entries
+            if PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY in entry
+        ]
+        self.assertTrue(rendered_entries)
+        self.assertTrue(
+            all(
+                PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY in entry
+                for entry in rendered_entries
+            )
+        )
+
+        rendered_continuation = decode_prefix(prompt_tokens[:12]) + "<extra>"
+        candidates = find_prompt_checkpoint_rendered_prefix(rendered_continuation)
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][1], 12)
+        loaded_cache, prefix_tokens, metadata = (
+            load_prompt_checkpoint_with_metadata_prefix(
+                candidates[0][2],
+                model=model,
+                return_metadata=True,
+            )
+        )
+        self.assertEqual(prefix_tokens, prompt_tokens[:12])
+        self.assertEqual(metadata["checkpoint_label"], "frontier")
+        self.assertEqual([len(c.caches) for c in loaded_cache], [2, 1, 2, 1])
+
     def test_prompt_checkpoint_reuses_deepest_frontier_after_restart(self):
         self._set_home_to_test_dir()
         self._set_prompt_checkpoint_debug()
@@ -1079,6 +1138,53 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertFalse(os.path.exists(prompt_checkpoint_file(prompt_tokens)))
         self.assertIn("manifest prune removed", output)
         self.assertIn("kind=exact", output)
+
+    def test_pruning_evicts_stale_checkpoints_by_age(self):
+        self._set_home_to_test_dir()
+        self._set_env(PROMPT_CHECKPOINT_MAX_AGE_SECONDS_ENV, 50)
+        old_prompt = [1, 2, 3, 4]
+        fresh_prompt = [5, 6, 7, 8]
+        old_file = prompt_checkpoint_file(old_prompt)
+        fresh_file = prompt_checkpoint_file(fresh_prompt)
+        cache = self._filled_kv_cache()
+        ensure_glm52_local_cache_dirs()
+
+        old_metadata = save_prompt_checkpoint(
+            old_file,
+            cache,
+            prefix_tokens=old_prompt,
+        )
+        fresh_metadata = save_prompt_checkpoint(
+            fresh_file,
+            cache,
+            prefix_tokens=fresh_prompt,
+        )
+        update_prompt_checkpoint_manifest(
+            old_file,
+            prefix_length=len(old_prompt),
+            kind="continued",
+            metadata=old_metadata,
+        )
+        update_prompt_checkpoint_manifest(
+            fresh_file,
+            prefix_length=len(fresh_prompt),
+            kind="continued",
+            metadata=fresh_metadata,
+        )
+        manifest = load_prompt_checkpoint_manifest()
+        manifest["entries"][os.path.basename(old_file)]["created_at"] = 100.0
+        manifest["entries"][os.path.basename(old_file)]["last_hit_at"] = None
+        manifest["entries"][os.path.basename(fresh_file)]["created_at"] = 975.0
+        manifest["entries"][os.path.basename(fresh_file)]["last_hit_at"] = None
+        save_prompt_checkpoint_manifest(manifest)
+
+        stats = prune_prompt_checkpoints(now=1000.0)
+
+        self.assertFalse(os.path.exists(old_file))
+        self.assertTrue(os.path.exists(fresh_file))
+        self.assertEqual(len(stats["removed"]), 1)
+        self.assertEqual(stats["removed"][0]["reason"], "age")
+        self.assertEqual(stats["total_files"], 1)
 
     def test_frontier_budget_caps_frontiers_per_run(self):
         self._set_home_to_test_dir()

@@ -453,6 +453,10 @@ def generate_step(
     prompt_checkpoint_frontier_stride_tokens: int = (
         PROMPT_CHECKPOINT_FRONTIER_STRIDE_TOKENS
     ),
+    prompt_checkpoint_rendered_prompt: Optional[Union[str, bytes]] = None,
+    prompt_checkpoint_decode_prefix: Optional[
+        Callable[[Sequence[int]], Optional[str]]
+    ] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -506,6 +510,12 @@ def generate_step(
           frontier to save. Defaults to 8192 tokens.
         prompt_checkpoint_frontier_stride_tokens (int): Token stride for
           automatic frontiers after the first one. Defaults to 16384 tokens.
+        prompt_checkpoint_rendered_prompt (str or bytes, optional): Rendered
+          prompt bytes used to attach ds4-style rendered-prefix lookup metadata
+          to saved prefix/frontier checkpoints.
+        prompt_checkpoint_decode_prefix (Callable, optional): Function used to
+          decode token prefixes for rendered-prefix metadata. The decoded text
+          must be an exact byte prefix of ``prompt_checkpoint_rendered_prompt``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -566,6 +576,9 @@ def generate_step(
         "manifest_missing_entries_removed": 0,
     }
     prompt_checkpoint_lookup_seconds = 0.0
+    prompt_checkpoint_rendered_bytes = cache.rendered_prompt_bytes(
+        prompt_checkpoint_rendered_prompt
+    )
     prompt_checkpoint_initial_cached_tokens = max(
         0, min(int(prompt_checkpoint_initial_cached_tokens), total_prompt_tokens)
     )
@@ -708,7 +721,11 @@ def generate_step(
                             "checkpoint_label",
                             "prefix",
                         )
-                        if prompt_checkpoint_hit_kind not in ("prefix", "frontier"):
+                        if prompt_checkpoint_hit_kind not in (
+                            "prefix",
+                            "frontier",
+                            "continued",
+                        ):
                             prompt_checkpoint_hit_kind = "prefix"
                     prompt_checkpoint_disk_cached_tokens = (
                         prompt_checkpoint_cached_tokens
@@ -920,7 +937,9 @@ def generate_step(
 
     def _prune_prompt_checkpoints(checkpoint_path, label):
         basename = os.path.basename(checkpoint_path)
-        protected_files = [basename] if label in ("frontier", "prefix") else []
+        protected_files = (
+            [basename] if label in ("frontier", "prefix", "continued") else []
+        )
         try:
             prune_report = cache.prune_prompt_checkpoints(
                 protected_files=protected_files
@@ -951,6 +970,55 @@ def generate_step(
                 f"kind={label} "
                 f"error={type(exc).__name__}"
             )
+
+    def _rendered_prefix_for_checkpoint(prefix_tokens):
+        if (
+            prompt_checkpoint_rendered_bytes is None
+            or prompt_checkpoint_decode_prefix is None
+        ):
+            return None
+        try:
+            rendered_prefix = prompt_checkpoint_decode_prefix(prefix_tokens)
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "rendered metadata skipped decode failure "
+                f"prefix_length={len(prefix_tokens)} "
+                f"error={type(exc).__name__}"
+            )
+            return None
+        rendered_prefix_bytes = cache.rendered_prompt_bytes(rendered_prefix)
+        if not rendered_prefix_bytes:
+            _prompt_checkpoint_debug(
+                "rendered metadata skipped empty prefix "
+                f"prefix_length={len(prefix_tokens)}"
+            )
+            return None
+        if not prompt_checkpoint_rendered_bytes.startswith(rendered_prefix_bytes):
+            _prompt_checkpoint_debug(
+                "rendered metadata skipped prefix mismatch "
+                f"prefix_length={len(prefix_tokens)} "
+                f"rendered_prefix_bytes={len(rendered_prefix_bytes)}"
+            )
+            return None
+        return rendered_prefix
+
+    def _checkpoint_save_metadata(prefix_tokens, label):
+        metadata = {"checkpoint_label": label}
+        rendered_prefix = _rendered_prefix_for_checkpoint(prefix_tokens)
+        if rendered_prefix is None:
+            return metadata
+        metadata.update(
+            cache.prompt_checkpoint_rendered_prefix_metadata(rendered_prefix)
+        )
+        metadata[cache.PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY] = (
+            cache.prompt_checkpoint_prefix_tokens_metadata(prefix_tokens)
+        )
+        _prompt_checkpoint_debug(
+            "rendered metadata attached "
+            f"prefix_length={len(prefix_tokens)} "
+            f"rendered_prefix_bytes={len(cache.rendered_prompt_bytes(rendered_prefix))}"
+        )
+        return metadata
 
     def _existing_frontier_checkpoint_is_valid(prefix_tokens, checkpoint_path, label):
         if label != "frontier" or not os.path.exists(checkpoint_path):
@@ -1010,7 +1078,7 @@ def generate_step(
                 kv_bits=kv_bits,
                 kv_group_size=kv_group_size,
                 quantized_kv_start=quantized_kv_start,
-                metadata={"checkpoint_label": label},
+                metadata=_checkpoint_save_metadata(prefix_tokens, label),
             )
             save_seconds = time.perf_counter() - save_t0
             _prompt_checkpoint_debug(
@@ -1413,6 +1481,25 @@ def stream_generate(
     detokenizer = tokenizer.detokenizer
 
     kwargs["max_tokens"] = max_tokens
+    if (
+        kwargs.get("prompt_checkpoint_rendered_prompt") is not None
+        and kwargs.get("prompt_checkpoint_decode_prefix") is None
+    ):
+
+        def decode_checkpoint_prefix(tokens):
+            decode_kwargs = [
+                {"skip_special_tokens": False, "clean_up_tokenization_spaces": False},
+                {"skip_special_tokens": False},
+                {},
+            ]
+            for decode_kwarg in decode_kwargs:
+                try:
+                    return tokenizer.decode(tokens, **decode_kwarg)
+                except TypeError:
+                    continue
+            return tokenizer.decode(tokens)
+
+        kwargs["prompt_checkpoint_decode_prefix"] = decode_checkpoint_prefix
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
@@ -1428,6 +1515,8 @@ def stream_generate(
             _prompt_checkpoint_debug("checkpoint disabled")
         kwargs.pop("prompt_checkpoint", None)
         kwargs.pop("prompt_checkpoint_save_exact", None)
+        kwargs.pop("prompt_checkpoint_rendered_prompt", None)
+        kwargs.pop("prompt_checkpoint_decode_prefix", None)
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(

@@ -18,10 +18,21 @@ import requests
 from mlx_lm.models.cache import KVCache, PROMPT_CHECKPOINT_CACHE_DIR_ENV
 from mlx_lm.server import (
     APIHandler,
+    DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+    DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
     LRUPromptCache,
     Response,
     ResponseGenerator,
     TokenLoopGuard,
+    _prompt_checkpoint_boundary_store_length,
+    _prompt_checkpoint_continued_frontier_args,
+    _prompt_checkpoint_continued_store_length,
+    _prompt_checkpoint_store_prefix_lengths,
     _process_control_tokens,
     configure_checkpoint_cache_dir,
     setup_arg_parser,
@@ -60,6 +71,25 @@ class DummyModelProvider:
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
                 "prefill_max_qk_tokens": 67_108_864,
+                "checkpoint_min_tokens": DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+                "checkpoint_cold_max_tokens": (
+                    DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS
+                ),
+                "checkpoint_boundary_trim_tokens": (
+                    DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS
+                ),
+                "checkpoint_boundary_align_tokens": (
+                    DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS
+                ),
+                "checkpoint_continued_interval_tokens": (
+                    DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
+                ),
+                "checkpoint_max_age_seconds": (
+                    DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS
+                ),
+                "checkpoint_shutdown_save_limit": (
+                    DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT
+                ),
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
@@ -195,6 +225,353 @@ class TestTokenLoopGuard(unittest.TestCase):
         self.assertFalse(any(guard.append(t) for t in [1, 2, 3, 4] * 5))
 
 
+class TestPromptCheckpointPolicy(unittest.TestCase):
+    @staticmethod
+    def _args(**overrides):
+        values = {
+            "checkpoint_min_tokens": DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+            "checkpoint_cold_max_tokens": DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+            "checkpoint_boundary_trim_tokens": (
+                DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS
+            ),
+            "checkpoint_boundary_align_tokens": (
+                DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS
+            ),
+            "checkpoint_continued_interval_tokens": (
+                DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
+            ),
+            "checkpoint_max_age_seconds": DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+            "checkpoint_shutdown_save_limit": (
+                DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT
+            ),
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def test_boundary_store_length_matches_ds4_defaults(self):
+        self.assertEqual(_prompt_checkpoint_boundary_store_length(11_011), 10_240)
+        self.assertEqual(_prompt_checkpoint_boundary_store_length(1_695), 1_695)
+        self.assertEqual(
+            _prompt_checkpoint_boundary_store_length(
+                3_500,
+                min_tokens=512,
+                trim_tokens=0,
+                align_tokens=1_000,
+            ),
+            3_000,
+        )
+        self.assertEqual(
+            _prompt_checkpoint_boundary_store_length(
+                3_500,
+                min_tokens=512,
+                trim_tokens=0,
+                align_tokens=0,
+            ),
+            3_500,
+        )
+
+    def test_store_prefix_lengths_add_system_and_cold_boundary(self):
+        args = self._args()
+        prompt = [0] * 11_011
+        segments = [[0] * 600, [0] * (len(prompt) - 600)]
+
+        lengths = _prompt_checkpoint_store_prefix_lengths(
+            args,
+            prompt,
+            segments,
+            ["system", "user"],
+        )
+
+        self.assertEqual(lengths, [600, 10_240])
+
+    def test_store_prefix_lengths_skip_cached_and_too_long_cold(self):
+        args = self._args()
+        prompt = [0] * 40_000
+        segments = [[0] * 600, [0] * (len(prompt) - 600)]
+
+        lengths = _prompt_checkpoint_store_prefix_lengths(
+            args,
+            prompt,
+            segments,
+            ["system", "user"],
+            initial_cached_tokens=700,
+        )
+
+        self.assertEqual(lengths, [])
+
+    def test_continued_frontier_args_align_interval_up(self):
+        self.assertEqual(
+            _prompt_checkpoint_continued_frontier_args(self._args()),
+            (10_240, 10_240),
+        )
+        self.assertEqual(
+            _prompt_checkpoint_continued_frontier_args(
+                self._args(checkpoint_boundary_align_tokens=0)
+            ),
+            (10_000, 10_000),
+        )
+        self.assertEqual(
+            _prompt_checkpoint_continued_frontier_args(
+                self._args(checkpoint_continued_interval_tokens=0)
+            ),
+            (0, 0),
+        )
+
+    def test_continued_store_length_uses_interval_boundary(self):
+        args = self._args(
+            checkpoint_min_tokens=1,
+            checkpoint_boundary_trim_tokens=0,
+            checkpoint_boundary_align_tokens=4,
+            checkpoint_continued_interval_tokens=5,
+        )
+
+        self.assertEqual(_prompt_checkpoint_continued_store_length(args, 7), 0)
+        self.assertEqual(_prompt_checkpoint_continued_store_length(args, 8), 8)
+        self.assertEqual(_prompt_checkpoint_continued_store_length(args, 15), 8)
+        self.assertEqual(_prompt_checkpoint_continued_store_length(args, 16), 16)
+
+    def test_save_continued_prompt_checkpoint_trims_and_records_metadata(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(
+            checkpoint_min_tokens=1,
+            checkpoint_boundary_trim_tokens=0,
+            checkpoint_boundary_align_tokens=4,
+            checkpoint_continued_interval_tokens=5,
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=cli_args,
+        )
+        tokenizer = types.SimpleNamespace(
+            decode=lambda tokens, **kwargs: "".join(f"<{token}>" for token in tokens)
+        )
+        cache_key = list(range(1, 12))
+        prompt_cache = [MockCache("cache")]
+        rendered_continuation = "".join(f"<{token}>" for token in cache_key)
+        captured = {}
+
+        def fake_save_prompt_checkpoint(file_name, cache, **kwargs):
+            captured["file_name"] = file_name
+            captured["cache"] = cache
+            captured["kwargs"] = kwargs
+            return dict(kwargs["metadata"])
+
+        with mock.patch(
+            "mlx_lm.server.save_prompt_checkpoint",
+            fake_save_prompt_checkpoint,
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest, mock.patch(
+            "mlx_lm.server.prune_prompt_checkpoints"
+        ) as prune:
+            saved = generator._save_continued_prompt_checkpoint(
+                tokenizer,
+                prompt_cache,
+                cache_key,
+                prompt_token_count=5,
+                rendered_continuation=rendered_continuation,
+            )
+
+        self.assertTrue(saved)
+        self.assertEqual(captured["kwargs"]["prefix_tokens"], cache_key[:8])
+        self.assertEqual(
+            captured["kwargs"]["metadata"]["checkpoint_label"],
+            "continued",
+        )
+        self.assertIn("checkpoint_prefix_tokens", captured["kwargs"]["metadata"])
+        self.assertIn(
+            "checkpoint_rendered_prefix_hash",
+            captured["kwargs"]["metadata"],
+        )
+        self.assertIsNot(captured["cache"], prompt_cache)
+        update_manifest.assert_called_once()
+        self.assertEqual(update_manifest.call_args.kwargs["kind"], "continued")
+        prune.assert_called_once()
+
+    def test_shutdown_flush_saves_current_model_continued_checkpoint(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(
+            checkpoint_min_tokens=1,
+            checkpoint_boundary_trim_tokens=0,
+            checkpoint_boundary_align_tokens=4,
+            checkpoint_continued_interval_tokens=5,
+            checkpoint_shutdown_save_limit=1,
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        tokenizer = types.SimpleNamespace(decode=lambda tokens, **kwargs: "")
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            tokenizer=tokenizer,
+            draft_model=None,
+            model_key=("model", None, None),
+            cli_args=cli_args,
+        )
+        generator.prompt_cache = LRUPromptCache(max_size=10)
+        current_cache = [MockCache("current-cache")]
+        other_cache = [MockCache("other-cache")]
+        generator.prompt_cache.insert_cache(
+            ("other", None, None),
+            list(range(20)),
+            other_cache,
+        )
+        generator.prompt_cache.insert_cache(
+            generator.model_provider.model_key,
+            list(range(12)),
+            current_cache,
+        )
+        captured = {}
+
+        def fake_save_prompt_checkpoint(file_name, cache, **kwargs):
+            captured["file_name"] = file_name
+            captured["cache"] = cache
+            captured["kwargs"] = kwargs
+            return dict(kwargs["metadata"])
+
+        with mock.patch(
+            "mlx_lm.server.save_prompt_checkpoint",
+            fake_save_prompt_checkpoint,
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ), mock.patch(
+            "mlx_lm.server.prune_prompt_checkpoints"
+        ):
+            stats = generator.flush_shutdown_prompt_checkpoints()
+
+        self.assertEqual(stats["candidates"], 1)
+        self.assertEqual(stats["attempted"], 1)
+        self.assertEqual(stats["saved"], 1)
+        self.assertEqual(captured["kwargs"]["prefix_tokens"], list(range(8)))
+        self.assertIsNot(captured["cache"], current_cache)
+
+    def test_render_and_tokenize_are_idempotent_for_tool_arguments(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(chat_template_args={})
+        )
+
+        class FakeChatTokenizer:
+            has_chat_template = True
+            has_tool_calling = True
+            has_thinking = False
+            tool_parser = None
+
+            def apply_chat_template(
+                self,
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                **kwargs,
+            ):
+                text = json.dumps(messages, sort_keys=True)
+                if add_generation_prompt:
+                    text += "<gen>"
+                return [ord(ch) for ch in text] if tokenize else text
+
+        request = types.SimpleNamespace(
+            request_type="chat",
+            messages=[
+                {"role": "user", "content": "call a tool"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "call-1",
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query":"prefill"}',
+                            },
+                        }
+                    ],
+                },
+            ],
+            tools=None,
+            role_mapping=None,
+        )
+        args = types.SimpleNamespace(chat_template_kwargs=None)
+        tokenizer = FakeChatTokenizer()
+
+        rendered = generator._render_prompt_text(tokenizer, request, args)
+        prompt, segments, segment_types, initial_state, tokenized_rendered = (
+            generator._tokenize(tokenizer, request, args, return_rendered=True)
+        )
+
+        self.assertEqual(rendered, tokenized_rendered)
+        self.assertEqual(prompt, [ord(ch) for ch in rendered])
+        self.assertEqual(segments, [prompt])
+        self.assertEqual(segment_types, ["assistant"])
+        self.assertEqual(initial_state, "normal")
+        arguments = request.messages[1]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(arguments, {"query": "prefill"})
+
+    def test_rendered_checkpoint_rejects_prefix_decode_mismatch(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0),
+        )
+        tokenizer = types.SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [ord(ch) for ch in text],
+            decode=lambda tokens, **kwargs: "ab" if tokens == [1, 2] else "",
+        )
+
+        with mock.patch(
+            "mlx_lm.server.find_prompt_checkpoint_rendered_prefix",
+            return_value=([(3, 2, "/tmp/frontier.safetensors", "frontier")], {}),
+        ), mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint_with_metadata_prefix",
+            return_value=(["cache"], [1, 2], {"checkpoint_label": "frontier"}),
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest:
+            result = generator._load_rendered_prompt_checkpoint(tokenizer, "abcXYZ")
+
+        self.assertIsNone(result)
+        update_manifest.assert_not_called()
+
+    def test_rendered_checkpoint_rejects_suffix_decode_mismatch(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0),
+        )
+
+        def decode(tokens, **kwargs):
+            if tokens == [1, 2]:
+                return "abc"
+            if tokens == [9]:
+                return "not-XYZ"
+            return ""
+
+        tokenizer = types.SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [9],
+            decode=decode,
+        )
+
+        with mock.patch(
+            "mlx_lm.server.find_prompt_checkpoint_rendered_prefix",
+            return_value=([(3, 2, "/tmp/frontier.safetensors", "frontier")], {}),
+        ), mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint_with_metadata_prefix",
+            return_value=(["cache"], [1, 2], {"checkpoint_label": "frontier"}),
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest:
+            result = generator._load_rendered_prompt_checkpoint(tokenizer, "abcXYZ")
+
+        self.assertIsNone(result)
+        update_manifest.assert_not_called()
+
+
 class TestServerCLI(unittest.TestCase):
     def test_setup_arg_parser_accepts_kv_options(self):
         args = setup_arg_parser().parse_args(
@@ -221,6 +598,33 @@ class TestServerCLI(unittest.TestCase):
         self.assertFalse(args.disable_batching)
         self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
         self.assertIsNone(args.checkpoint_cache_dir)
+        self.assertEqual(
+            args.checkpoint_min_tokens, DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS
+        )
+        self.assertEqual(
+            args.checkpoint_cold_max_tokens,
+            DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+        )
+        self.assertEqual(
+            args.checkpoint_boundary_trim_tokens,
+            DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
+        )
+        self.assertEqual(
+            args.checkpoint_boundary_align_tokens,
+            DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
+        )
+        self.assertEqual(
+            args.checkpoint_continued_interval_tokens,
+            DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
+        )
+        self.assertEqual(
+            args.checkpoint_max_age_seconds,
+            DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+        )
+        self.assertEqual(
+            args.checkpoint_shutdown_save_limit,
+            DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
+        )
         self.assertEqual(args.loop_guard_ngram_size, 64)
         self.assertEqual(args.loop_guard_repeats, 3)
         self.assertEqual(args.loop_guard_min_tokens, 256)
@@ -241,6 +645,34 @@ class TestServerCLI(unittest.TestCase):
         )
 
         self.assertEqual(args.checkpoint_cache_dir, Path("/tmp/glm52-checkpoints"))
+
+    def test_setup_arg_parser_checkpoint_policy_options(self):
+        args = setup_arg_parser().parse_args(
+            [
+                "--checkpoint-min-tokens",
+                "128",
+                "--checkpoint-cold-max-tokens",
+                "4096",
+                "--checkpoint-boundary-trim-tokens",
+                "16",
+                "--checkpoint-boundary-align-tokens",
+                "1024",
+                "--checkpoint-continued-interval-tokens",
+                "8192",
+                "--checkpoint-max-age-seconds",
+                "3600",
+                "--checkpoint-shutdown-save-limit",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.checkpoint_min_tokens, 128)
+        self.assertEqual(args.checkpoint_cold_max_tokens, 4096)
+        self.assertEqual(args.checkpoint_boundary_trim_tokens, 16)
+        self.assertEqual(args.checkpoint_boundary_align_tokens, 1024)
+        self.assertEqual(args.checkpoint_continued_interval_tokens, 8192)
+        self.assertEqual(args.checkpoint_max_age_seconds, 3600)
+        self.assertEqual(args.checkpoint_shutdown_save_limit, 2)
 
     def test_configure_checkpoint_cache_dir_sets_env(self):
         old_value = os.environ.get(PROMPT_CHECKPOINT_CACHE_DIR_ENV)
@@ -319,6 +751,17 @@ class TestServerCLI(unittest.TestCase):
         cli_args = types.SimpleNamespace(
             prefill_step_size=2048,
             prefill_max_qk_tokens=67_108_864,
+            checkpoint_min_tokens=DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+            checkpoint_cold_max_tokens=DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+            checkpoint_boundary_trim_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS
+            ),
+            checkpoint_boundary_align_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS
+            ),
+            checkpoint_continued_interval_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
+            ),
             kv_bits=8,
             kv_group_size=64,
             quantized_kv_start=4096,
@@ -356,12 +799,18 @@ class TestServerCLI(unittest.TestCase):
 
         generator.prompt_cache = FakePromptCache()
         generator._log_cache_stats = lambda: None
-        generator._tokenize = lambda tokenizer, request, args: (
-            prompt,
-            [prompt[:3], prompt[3:]],
-            ["system", "user"],
-            "normal",
-        )
+        def fake_tokenize(tokenizer, request, args, return_rendered=False):
+            result = (
+                prompt,
+                [prompt[:3], prompt[3:]],
+                ["system", "user"],
+                "normal",
+            )
+            if return_rendered:
+                return (*result, None)
+            return result
+
+        generator._tokenize = fake_tokenize
         generator._make_state_machine = lambda *args, **kwargs: (
             FakeStateMachine(),
             {},
@@ -416,6 +865,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 2)
         self.assertEqual(captured["prompt_checkpoint_store_prefix_lengths"], [3])
         self.assertTrue(captured["prompt_checkpoint_allow_existing_cache"])
+        self.assertEqual(captured["prompt_checkpoint_frontier_min_tokens"], 10_240)
+        self.assertEqual(captured["prompt_checkpoint_frontier_stride_tokens"], 10_240)
         self.assertEqual(captured["prefill_max_qk_tokens"], 67_108_864)
         self.assertEqual(captured["kv_bits"], 8)
         self.assertEqual(captured["kv_group_size"], 64)

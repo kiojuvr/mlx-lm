@@ -32,8 +32,19 @@ PROMPT_CHECKPOINT_MANIFEST_VERSION = 1
 PROMPT_CHECKPOINT_CACHE_DIR_ENV = "MLX_LM_PROMPT_CHECKPOINT_CACHE_DIR"
 PROMPT_CHECKPOINT_MAX_FILES_ENV = "MLX_LM_PROMPT_CHECKPOINT_MAX_FILES"
 PROMPT_CHECKPOINT_MAX_BYTES_ENV = "MLX_LM_PROMPT_CHECKPOINT_MAX_BYTES"
+PROMPT_CHECKPOINT_MAX_AGE_SECONDS_ENV = (
+    "MLX_LM_PROMPT_CHECKPOINT_MAX_AGE_SECONDS"
+)
+PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY = "checkpoint_prefix_tokens"
+PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY = (
+    "checkpoint_rendered_prefix_hash"
+)
+PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY = (
+    "checkpoint_rendered_prefix_bytes"
+)
 DEFAULT_PROMPT_CHECKPOINT_MAX_FILES = 256
 DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES = 128 * 1024**3
+DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS = 0
 
 _CHECKPOINT_REQUIRED_METADATA_KEYS = (
     "checkpoint_format",
@@ -245,6 +256,64 @@ def prompt_prefix_hash(prefix_tokens):
     return _json_hash(_token_list(prefix_tokens))
 
 
+def rendered_prompt_bytes(rendered_prompt):
+    if rendered_prompt is None:
+        return None
+    if isinstance(rendered_prompt, bytes):
+        return rendered_prompt
+    if isinstance(rendered_prompt, bytearray):
+        return bytes(rendered_prompt)
+    if not isinstance(rendered_prompt, str):
+        rendered_prompt = str(rendered_prompt)
+    return rendered_prompt.encode("utf-8")
+
+
+def rendered_prompt_hash(rendered_prompt):
+    rendered = rendered_prompt_bytes(rendered_prompt)
+    if rendered is None:
+        raise TypeError("rendered_prompt must not be None")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def prompt_checkpoint_prefix_tokens_metadata(prefix_tokens):
+    return _json_dumps(_token_list(prefix_tokens))
+
+
+def prompt_checkpoint_rendered_prefix_metadata(rendered_prefix):
+    rendered = rendered_prompt_bytes(rendered_prefix)
+    if rendered is None:
+        return {}
+    return {
+        PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY: hashlib.sha256(
+            rendered
+        ).hexdigest(),
+        PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY: str(len(rendered)),
+    }
+
+
+def prompt_checkpoint_metadata_prefix_tokens(metadata):
+    raw = _require_metadata(metadata, PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY)
+    try:
+        prefix = _token_list(json.loads(raw))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise PromptCacheCheckpointError(
+            f"checkpoint has malformed {PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY}"
+        ) from exc
+    if metadata.get("checkpoint_prefix_hash") != prompt_prefix_hash(prefix):
+        raise PromptCacheCheckpointError("checkpoint embedded prefix tokens mismatch")
+    try:
+        prefix_length = int(metadata.get("checkpoint_prefix_length"))
+    except (TypeError, ValueError) as exc:
+        raise PromptCacheCheckpointError(
+            "checkpoint embedded prefix length mismatch"
+        ) from exc
+    if prefix_length != len(prefix):
+        raise PromptCacheCheckpointError(
+            "checkpoint embedded prefix length mismatch"
+        )
+    return prefix
+
+
 def prompt_checkpoint_name(prefix_tokens):
     prefix = _token_list(prefix_tokens)
     return f"{_json_hash(prefix)}-{len(prefix)}.safetensors"
@@ -274,7 +343,13 @@ def _parse_prompt_checkpoint_name(name):
     return hash_part, prefix_length
 
 
-_PROMPT_CHECKPOINT_MANIFEST_KINDS = {"exact", "prefix", "frontier", "unknown"}
+_PROMPT_CHECKPOINT_MANIFEST_KINDS = {
+    "exact",
+    "prefix",
+    "frontier",
+    "continued",
+    "unknown",
+}
 
 
 def _env_int(name, default):
@@ -331,6 +406,22 @@ def _manifest_metadata_identity(metadata):
     return identity
 
 
+def _manifest_metadata_rendered_prefix(metadata):
+    if not metadata:
+        return {}
+    rendered_hash = metadata.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY)
+    rendered_bytes = _safe_manifest_int(
+        metadata.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY),
+        0,
+    )
+    if not rendered_hash or rendered_bytes <= 0:
+        return {}
+    return {
+        PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY: str(rendered_hash),
+        PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY: rendered_bytes,
+    }
+
+
 def _normalize_manifest_entry(filename, entry):
     if not isinstance(entry, dict):
         return None
@@ -362,6 +453,18 @@ def _normalize_manifest_entry(filename, entry):
         "hit_count": _safe_manifest_int(entry.get("hit_count"), 0),
         "size_bytes": _safe_manifest_int(entry.get("size_bytes"), 0),
     }
+    rendered_hash = entry.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY)
+    rendered_bytes = _safe_manifest_int(
+        entry.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY),
+        0,
+    )
+    if rendered_hash and rendered_bytes > 0:
+        normalized[PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY] = str(
+            rendered_hash
+        )
+        normalized[PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY] = (
+            rendered_bytes
+        )
     for key in (
         "checkpoint_namespace",
         "checkpoint_model_hint_hash",
@@ -449,6 +552,7 @@ def _manifest_entry_from_file(filename, *, kind="unknown", metadata=None):
         "size_bytes": int(stat.st_size),
     }
     entry.update(_manifest_metadata_identity(metadata))
+    entry.update(_manifest_metadata_rendered_prefix(metadata))
     return entry
 
 
@@ -567,7 +671,18 @@ def prompt_checkpoint_budget_from_env():
             PROMPT_CHECKPOINT_MAX_BYTES_ENV,
             DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES,
         ),
+        "max_age_seconds": _env_int(
+            PROMPT_CHECKPOINT_MAX_AGE_SECONDS_ENV,
+            DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+        ),
     }
+
+
+def _prompt_checkpoint_entry_used_at(entry):
+    used_at = _safe_manifest_float(entry.get("last_hit_at"), None)
+    if used_at is None:
+        used_at = _safe_manifest_float(entry.get("created_at"), 0)
+    return used_at
 
 
 def _prompt_checkpoint_prune_key(entry):
@@ -576,11 +691,10 @@ def _prompt_checkpoint_prune_key(entry):
         "unknown": 1,
         "prefix": 2,
         "frontier": 3,
+        "continued": 4,
     }.get(entry.get("kind"), 1)
     hit_count = _safe_manifest_int(entry.get("hit_count"), 0)
-    used_at = _safe_manifest_float(entry.get("last_hit_at"), None)
-    if used_at is None:
-        used_at = _safe_manifest_float(entry.get("created_at"), 0)
+    used_at = _prompt_checkpoint_entry_used_at(entry)
     prefix_length = _safe_manifest_int(entry.get("prefix_length"), 0)
     return (kind_rank, hit_count, used_at, prefix_length)
 
@@ -589,16 +703,23 @@ def prune_prompt_checkpoints(
     *,
     max_files=None,
     max_bytes=None,
+    max_age_seconds=None,
     protected_files=None,
+    now=None,
 ):
-    if max_files is None or max_bytes is None:
+    if max_files is None or max_bytes is None or max_age_seconds is None:
         budget = prompt_checkpoint_budget_from_env()
         if max_files is None:
             max_files = budget["max_files"]
         if max_bytes is None:
             max_bytes = budget["max_bytes"]
+        if max_age_seconds is None:
+            max_age_seconds = budget["max_age_seconds"]
     max_files = _safe_manifest_int(max_files, 0)
     max_bytes = _safe_manifest_int(max_bytes, 0)
+    max_age_seconds = _safe_manifest_int(max_age_seconds, 0)
+    if now is None:
+        now = time.time()
     protected = {os.path.basename(f) for f in (protected_files or [])}
 
     manifest, sync_stats = sync_prompt_checkpoint_manifest(bootstrap=True)
@@ -613,6 +734,48 @@ def prune_prompt_checkpoints(
             or (max_bytes > 0 and total_bytes > max_bytes)
         )
 
+    def remove_entry(victim, reason):
+        nonlocal changed, total_bytes
+        filename = victim["filename"]
+        file_path = os.path.join(glm52_prompt_checkpoints_dir(), filename)
+        try:
+            os.remove(file_path)
+            removed_status = "removed"
+        except FileNotFoundError:
+            removed_status = "missing"
+        except OSError:
+            return False
+        removed.append(
+            {
+                "filename": filename,
+                "kind": victim.get("kind", "unknown"),
+                "prefix_length": victim.get("prefix_length", 0),
+                "size_bytes": victim.get("size_bytes", 0),
+                "status": removed_status,
+                "reason": reason,
+            }
+        )
+        total_bytes -= _safe_manifest_int(victim.get("size_bytes"), 0)
+        del entries[filename]
+        changed = True
+        return True
+
+    if max_age_seconds > 0:
+        stale_cutoff = now - max_age_seconds
+        for victim in sorted(
+            list(entries.values()),
+            key=lambda entry: (
+                _prompt_checkpoint_entry_used_at(entry),
+                entry["filename"],
+            ),
+        ):
+            if victim["filename"] in protected:
+                continue
+            if _prompt_checkpoint_entry_used_at(victim) >= stale_cutoff:
+                continue
+            if not remove_entry(victim, "age"):
+                break
+
     while over_budget():
         victims = [
             entry
@@ -622,27 +785,8 @@ def prune_prompt_checkpoints(
         if not victims:
             break
         victim = min(victims, key=_prompt_checkpoint_prune_key)
-        filename = victim["filename"]
-        file_path = os.path.join(glm52_prompt_checkpoints_dir(), filename)
-        try:
-            os.remove(file_path)
-            removed_status = "removed"
-        except FileNotFoundError:
-            removed_status = "missing"
-        except OSError:
+        if not remove_entry(victim, "budget"):
             break
-        removed.append(
-            {
-                "filename": filename,
-                "kind": victim.get("kind", "unknown"),
-                "prefix_length": victim.get("prefix_length", 0),
-                "size_bytes": victim.get("size_bytes", 0),
-                "status": removed_status,
-            }
-        )
-        total_bytes -= _safe_manifest_int(victim.get("size_bytes"), 0)
-        del entries[filename]
-        changed = True
 
     if changed or sync_stats.get("saved"):
         save_prompt_checkpoint_manifest(manifest)
@@ -650,6 +794,7 @@ def prune_prompt_checkpoints(
     return {
         "max_files": max_files,
         "max_bytes": max_bytes,
+        "max_age_seconds": max_age_seconds,
         "total_files": len(entries),
         "total_bytes": total_bytes,
         "removed": removed,
@@ -726,6 +871,87 @@ def find_prompt_checkpoint_prefix(
                 prefix_length,
                 prefix,
                 os.path.join(glm52_prompt_checkpoints_dir(), name),
+            )
+        )
+    stats["matched_candidates"] = len(candidates)
+    return (candidates, stats) if return_stats else candidates
+
+
+def find_prompt_checkpoint_rendered_prefix(
+    rendered_prompt,
+    *,
+    min_prefix_bytes=1,
+    allowed_kinds=("prefix", "frontier", "continued"),
+    return_stats=False,
+):
+    """
+    Find checkpoints whose rendered byte prefix matches ``rendered_prompt``.
+
+    Newer checkpoints can carry a rendered-prefix hash plus their exact token
+    prefix in metadata. This lets server code load the stored token prefix and
+    tokenize only the rendered suffix, avoiding tokenizer-boundary merge drift.
+    """
+    rendered = rendered_prompt_bytes(rendered_prompt)
+    if rendered is None:
+        rendered = b""
+    allowed_kinds = set(allowed_kinds or ())
+    stats = {
+        "files_scanned": 0,
+        "candidate_files_scanned": 0,
+        "candidate_lengths_scanned": 0,
+        "rendered_prefix_hashes_computed": 0,
+        "matched_candidates": 0,
+        "manifest_entries": 0,
+        "manifest_loaded": False,
+        "manifest_missing": False,
+        "manifest_malformed": False,
+        "manifest_bootstrap": False,
+        "manifest_missing_entries_removed": 0,
+    }
+    manifest, manifest_stats = sync_prompt_checkpoint_manifest(bootstrap=True)
+    stats["manifest_entries"] = len(manifest["entries"])
+    stats["manifest_loaded"] = manifest_stats.get("loaded", False)
+    stats["manifest_missing"] = manifest_stats.get("missing", False)
+    stats["manifest_malformed"] = manifest_stats.get("malformed", False)
+    stats["manifest_bootstrap"] = manifest_stats.get("bootstrap", False)
+    stats["manifest_missing_entries_removed"] = manifest_stats.get(
+        "missing_entries_removed",
+        0,
+    )
+
+    by_length = {}
+    for name, entry in manifest["entries"].items():
+        stats["files_scanned"] += 1
+        if allowed_kinds and entry.get("kind") not in allowed_kinds:
+            continue
+        rendered_hash = entry.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY)
+        rendered_bytes = _safe_manifest_int(
+            entry.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY),
+            0,
+        )
+        if (
+            not rendered_hash
+            or rendered_bytes < min_prefix_bytes
+            or rendered_bytes > len(rendered)
+        ):
+            continue
+        stats["candidate_files_scanned"] += 1
+        by_length.setdefault(rendered_bytes, {})[rendered_hash] = entry
+
+    candidates = []
+    for rendered_bytes in sorted(by_length, reverse=True):
+        stats["candidate_lengths_scanned"] += 1
+        rendered_hash = hashlib.sha256(rendered[:rendered_bytes]).hexdigest()
+        stats["rendered_prefix_hashes_computed"] += 1
+        entry = by_length[rendered_bytes].get(rendered_hash)
+        if entry is None:
+            continue
+        candidates.append(
+            (
+                rendered_bytes,
+                entry["prefix_length"],
+                os.path.join(glm52_prompt_checkpoints_dir(), entry["filename"]),
+                entry.get("kind", "unknown"),
             )
         )
     stats["matched_candidates"] = len(candidates)
@@ -1207,7 +1433,9 @@ def load_prompt_checkpoint(
     try:
         cache, metadata = load_prompt_cache(file_name, return_metadata=True)
     except Exception as exc:
-        raise PromptCacheCheckpointError(f"failed to load prompt checkpoint: {exc}") from exc
+        raise PromptCacheCheckpointError(
+            f"failed to load prompt checkpoint: {exc}"
+        ) from exc
     _validate_checkpoint_metadata(
         cache,
         metadata,
@@ -1224,6 +1452,44 @@ def load_prompt_checkpoint(
     if return_metadata:
         return cache, metadata
     return cache
+
+
+def load_prompt_checkpoint_with_metadata_prefix(
+    file_name: str,
+    *,
+    checkpoint_namespace: str = DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+    model_id: str = DEFAULT_PROMPT_CHECKPOINT_MODEL_ID,
+    tokenizer_id: str = DEFAULT_PROMPT_CHECKPOINT_TOKENIZER_ID,
+    model: Optional[nn.Module] = None,
+    tokenizer: Optional[Any] = None,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    expected_glm_mla_kv_quantization: Optional[Dict[str, Any]] = None,
+    expected_glm_mla_kv_settings: Optional[Dict[str, Any]] = None,
+    return_metadata: bool = False,
+):
+    try:
+        cache, metadata = load_prompt_cache(file_name, return_metadata=True)
+    except Exception as exc:
+        raise PromptCacheCheckpointError(
+            f"failed to load prompt checkpoint: {exc}"
+        ) from exc
+    prefix_tokens = prompt_checkpoint_metadata_prefix_tokens(metadata)
+    _validate_checkpoint_metadata(
+        cache,
+        metadata,
+        prefix_tokens=prefix_tokens,
+        checkpoint_namespace=checkpoint_namespace,
+        model_id=model_id,
+        tokenizer_id=tokenizer_id,
+        model=model,
+        tokenizer=tokenizer,
+        tokenizer_config=tokenizer_config,
+        expected_glm_mla_kv_quantization=expected_glm_mla_kv_quantization,
+        expected_glm_mla_kv_settings=expected_glm_mla_kv_settings,
+    )
+    if return_metadata:
+        return cache, prefix_tokens, metadata
+    return cache, prefix_tokens
 
 
 def invalidate_prompt_checkpoint(file_name: str):
@@ -3353,6 +3619,8 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+        created_at: float
+        last_hit_at: Optional[float] = None
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -3398,15 +3666,21 @@ class LRUPromptCache:
     def nbytes(self):
         return self._n_bytes
 
+    def _record_cache_hit(self, model: Any, tokens: List[int]):
+        cache_entry = self._trie.get(model, tokens)
+        if cache_entry is not None:
+            cache_entry.last_hit_at = time.time()
+        return cache_entry
+
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
         if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
+            cache_entry = self._record_cache_hit(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
-            cache_entry = self._trie.get(result.model, result.longer)
+            cache_entry = self._record_cache_hit(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
@@ -3415,7 +3689,7 @@ class LRUPromptCache:
                 return cache, tokens[prefix:]
 
         if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
+            cache_entry = self._record_cache_hit(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
@@ -3430,7 +3704,10 @@ class LRUPromptCache:
     ):
         # Make the cache entry
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
+            prompt_cache,
+            sum(c.nbytes for c in prompt_cache),
+            cache_type,
+            time.time(),
         )
 
         # Insert into the trie and update the byte counter and lru position
@@ -3487,4 +3764,27 @@ class LRUPromptCache:
                 "n_sequences": len(self._lru._lrus[cache_type]),
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
+        return result
+
+    def snapshot(self, *, newest_first: bool = True):
+        result = []
+        for cache_type in self._lru._ordering:
+            ordered = list(self._lru._lrus[cache_type])
+            if newest_first:
+                ordered.reverse()
+            for model, tokens in ordered:
+                entry = self._trie.get(model, tokens)
+                if entry is None:
+                    continue
+                result.append(
+                    {
+                        "model": model,
+                        "tokens": tokens[:],
+                        "prompt_cache": entry.prompt_cache,
+                        "nbytes": entry.nbytes,
+                        "cache_type": entry.cache_type,
+                        "created_at": entry.created_at,
+                        "last_hit_at": entry.last_hit_at,
+                    }
+                )
         return result

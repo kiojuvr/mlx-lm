@@ -57,6 +57,31 @@ def parse_lengths(value):
     return [int(v.strip()) for v in value.split(",") if v.strip()]
 
 
+def parse_policy_candidates(value):
+    candidates = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if ":" in raw:
+            name, length = raw.split(":", 1)
+            name = name.strip()
+            length = length.strip()
+        else:
+            name = ""
+            length = raw
+        length = int(length)
+        if length < 0:
+            raise ValueError("policy candidate lengths must be non-negative")
+        candidates.append((name or f"prefix-{length}", length))
+    return candidates
+
+
+def safe_case_name(value):
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")
+    return value or "case"
+
+
 def percentile(values, pct):
     if not values:
         return None
@@ -93,6 +118,56 @@ def build_prompt_text(tokenizer, target_tokens, prefix_text=""):
         i += 1
         text = header + body
     return text
+
+
+def ds4_boundary_store_length(token_count, *, min_tokens=512, trim_tokens=32, align_tokens=2048):
+    token_count = max(0, int(token_count))
+    min_tokens = max(0, int(min_tokens))
+    trim_tokens = max(0, int(trim_tokens))
+    align_tokens = max(0, int(align_tokens))
+    if token_count == 0:
+        return 0
+    if token_count > min_tokens + trim_tokens:
+        stable_length = token_count - trim_tokens
+        if align_tokens > 0:
+            stable_length -= stable_length % align_tokens
+        if stable_length >= min_tokens:
+            return stable_length
+    return token_count
+
+
+def policy_sweep_candidates(args, prefix_tokens, requested_total_tokens):
+    if args.policy_candidates:
+        raw_candidates = args.policy_candidates
+    else:
+        ds4_length = min(
+            prefix_tokens,
+            ds4_boundary_store_length(
+                requested_total_tokens,
+                min_tokens=args.policy_min_tokens,
+                trim_tokens=args.policy_boundary_trim_tokens,
+                align_tokens=args.policy_boundary_align_tokens,
+            ),
+        )
+        raw_candidates = [("disabled", 0), ("ds4-boundary", ds4_length)]
+        if ds4_length != prefix_tokens:
+            raw_candidates.append(("full-prefix", prefix_tokens))
+
+    candidates = []
+    seen = set()
+    for name, store_length in raw_candidates:
+        store_length = int(store_length)
+        if store_length > prefix_tokens:
+            raise ValueError(
+                f"policy candidate {name} stores {store_length} tokens, "
+                f"but shared prefix is only {prefix_tokens}"
+            )
+        key = (name, store_length)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append((name, store_length))
+    return candidates
 
 
 def build_prompt_tokens(tokenizer, target_tokens, prefix_text=""):
@@ -585,6 +660,11 @@ def print_table(rows, output_format):
     headers = [
         "case",
         "mode",
+        "policy_name",
+        "policy_candidate_index",
+        "policy_store_prefix_tokens",
+        "policy_reused_ratio",
+        "policy_fresh_prefill_ratio",
         "batch_size",
         "prefill_batch_size",
         "completion_batch_size",
@@ -646,9 +726,9 @@ def print_table(rows, output_format):
 
 
 def configure_checkpoint_cache_dir(args):
-    if args.mode == "controlled-lcp" and args.checkpoint_cache_dir is None:
+    if args.mode in ("controlled-lcp", "policy-sweep") and args.checkpoint_cache_dir is None:
         args.checkpoint_cache_dir = Path(
-            tempfile.mkdtemp(prefix="glm52-lcp-checkpoints-")
+            tempfile.mkdtemp(prefix=f"glm52-{args.mode}-checkpoints-")
         )
 
     old_cache_dir = os.environ.get(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV)
@@ -798,12 +878,139 @@ def run_controlled_lcp(model, tokenizer, args):
         args.checkpoint_frontier_min_tokens = old_frontier_min
 
 
+def run_policy_sweep(model, tokenizer, args):
+    prefix_tokens = (
+        args.lcp_prefix_tokens
+        if args.lcp_prefix_tokens is not None
+        else args.repeat_prefix_tokens
+    )
+    suffix_tokens = (
+        args.lcp_suffix_tokens
+        if args.lcp_suffix_tokens is not None
+        else args.repeat_suffix_tokens
+    )
+    if prefix_tokens <= 0:
+        raise ValueError("--lcp-prefix-tokens or --repeat-prefix-tokens must be positive")
+    if suffix_tokens <= 0:
+        raise ValueError("--lcp-suffix-tokens or --repeat-suffix-tokens must be positive")
+
+    requested_total_tokens = prefix_tokens + suffix_tokens
+    seed_prompt, hit_prompt = build_controlled_lcp_prompts(
+        tokenizer,
+        prefix_tokens,
+        suffix_tokens,
+    )
+    candidates = policy_sweep_candidates(args, prefix_tokens, requested_total_tokens)
+    base_cache_dir = Path(args.resolved_checkpoint_cache_dir)
+
+    rows = []
+    old_target_tokens = getattr(args, "target_tokens", None)
+    old_store_lengths = args.checkpoint_store_prefix_lengths
+    old_frontier_min = args.checkpoint_frontier_min_tokens
+    old_no_prompt_checkpoint = args.no_prompt_checkpoint
+    old_cache_dir = os.environ.get(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV)
+    old_resolved_cache_dir = args.resolved_checkpoint_cache_dir
+    args.target_tokens = requested_total_tokens
+    args.checkpoint_frontier_min_tokens = max(
+        args.checkpoint_frontier_min_tokens,
+        requested_total_tokens + 1,
+    )
+    try:
+        for policy_index, (policy_name, store_length) in enumerate(candidates):
+            candidate_dir = base_cache_dir / f"{policy_index:02d}-{safe_case_name(policy_name)}"
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            os.environ[prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV] = str(candidate_dir)
+            args.resolved_checkpoint_cache_dir = str(candidate_dir)
+            args.no_prompt_checkpoint = store_length == 0
+            args.checkpoint_store_prefix_lengths = (
+                None if store_length == 0 else [store_length]
+            )
+            expected_reused_prefix_tokens = 0 if store_length == 0 else store_length
+
+            seed_row = run_once(
+                model,
+                tokenizer,
+                seed_prompt,
+                args,
+                f"policy-{policy_name}-store",
+            )
+            seed_row.update(
+                {
+                    "mode": "policy-sweep",
+                    "policy_name": policy_name,
+                    "policy_store_prefix_tokens": store_length,
+                    "policy_candidate_index": policy_index,
+                    "requested_total_tokens": requested_total_tokens,
+                    "stored_prefix_tokens": expected_reused_prefix_tokens,
+                    "expected_reused_prefix_tokens": 0,
+                    "checkpoint_expected_match": (
+                        seed_row.get("disk_cached_tokens") == 0
+                    ),
+                    "lcp_prefix_tokens": prefix_tokens,
+                    "lcp_suffix_tokens": suffix_tokens,
+                }
+            )
+            rows.append(seed_row)
+
+            hit_row = run_once(
+                model,
+                tokenizer,
+                hit_prompt,
+                args,
+                f"policy-{policy_name}-hit",
+            )
+            hit_row.update(
+                {
+                    "mode": "policy-sweep",
+                    "policy_name": policy_name,
+                    "policy_store_prefix_tokens": store_length,
+                    "policy_candidate_index": policy_index,
+                    "requested_total_tokens": requested_total_tokens,
+                    "stored_prefix_tokens": expected_reused_prefix_tokens,
+                    "expected_reused_prefix_tokens": expected_reused_prefix_tokens,
+                    "checkpoint_expected_match": (
+                        hit_row.get("disk_cached_tokens")
+                        == expected_reused_prefix_tokens
+                    ),
+                    "policy_reused_ratio": (
+                        expected_reused_prefix_tokens / requested_total_tokens
+                    ),
+                    "policy_fresh_prefill_ratio": (
+                        (hit_row.get("fresh_prefill_tokens") or 0)
+                        / max(1, requested_total_tokens - 1)
+                    ),
+                    "lcp_prefix_tokens": prefix_tokens,
+                    "lcp_suffix_tokens": suffix_tokens,
+                }
+            )
+            if not hit_row["checkpoint_expected_match"]:
+                raise RuntimeError(
+                    "policy sweep checkpoint mismatch: "
+                    f"policy={policy_name} "
+                    f"expected disk_cached_tokens={expected_reused_prefix_tokens}, "
+                    f"got {hit_row.get('disk_cached_tokens')} "
+                    f"(resolution={hit_row.get('checkpoint_resolution')})"
+                )
+            rows.append(hit_row)
+        return rows
+    finally:
+        args.target_tokens = old_target_tokens
+        args.checkpoint_store_prefix_lengths = old_store_lengths
+        args.checkpoint_frontier_min_tokens = old_frontier_min
+        args.no_prompt_checkpoint = old_no_prompt_checkpoint
+        args.resolved_checkpoint_cache_dir = old_resolved_cache_dir
+        if old_cache_dir is None:
+            os.environ.pop(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV, None)
+        else:
+            os.environ[prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV] = old_cache_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local path or HF repo.")
     parser.add_argument(
         "--mode",
-        choices=("single", "batch", "queued", "controlled-lcp"),
+        choices=("single", "batch", "queued", "controlled-lcp", "policy-sweep"),
         default="single",
     )
     parser.add_argument("--batch-size", type=int, default=1)
@@ -832,6 +1039,34 @@ def main():
             "Changed suffix tokens for --mode controlled-lcp. Defaults to "
             "--repeat-suffix-tokens."
         ),
+    )
+    parser.add_argument(
+        "--policy-candidates",
+        type=parse_policy_candidates,
+        help=(
+            "Comma-separated policy candidates for --mode policy-sweep. "
+            "Use name:length entries; length 0 is the disabled baseline. "
+            "When omitted, the sweep compares disabled, ds4-boundary, and "
+            "full-prefix when distinct."
+        ),
+    )
+    parser.add_argument(
+        "--policy-min-tokens",
+        type=int,
+        default=512,
+        help="Minimum prefix length used when deriving the default ds4-boundary candidate.",
+    )
+    parser.add_argument(
+        "--policy-boundary-trim-tokens",
+        type=int,
+        default=32,
+        help="Tail trim used when deriving the default ds4-boundary candidate.",
+    )
+    parser.add_argument(
+        "--policy-boundary-align-tokens",
+        type=int,
+        default=2048,
+        help="Alignment used when deriving the default ds4-boundary candidate.",
     )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
@@ -931,7 +1166,9 @@ def main():
     args = parser.parse_args()
     if args.checkpoint_save_exact is None:
         args.checkpoint_save_exact = (
-            "disabled" if args.mode == "controlled-lcp" else "enabled"
+            "disabled"
+            if args.mode in ("controlled-lcp", "policy-sweep")
+            else "enabled"
         )
     args.target_tokens = None
     configure_glm_dsa_fast_prefill(args)
@@ -948,6 +1185,8 @@ def main():
         rows = []
         if args.mode == "controlled-lcp":
             rows.extend(run_controlled_lcp(model, tokenizer, args))
+        elif args.mode == "policy-sweep":
+            rows.extend(run_policy_sweep(model, tokenizer, args))
         else:
             if args.mode == "queued":
                 runner = run_queued_once
