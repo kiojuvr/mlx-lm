@@ -171,6 +171,55 @@ def policy_sweep_candidates(args, prefix_tokens, requested_total_tokens):
     return candidates
 
 
+def prefill_sweep_candidates(args):
+    step_values = args.prefill_step_candidates or [512, 1024, 2048]
+    qk_values = args.prefill_max_qk_token_candidates or [args.prefill_max_qk_tokens]
+    adaptive_values = args.glm_dsa_adaptive_prefill_step_candidates
+    if not step_values:
+        raise ValueError("prefill step candidates must not be empty")
+    if not qk_values:
+        raise ValueError("prefill max-qk candidates must not be empty")
+    if adaptive_values is None:
+        adaptive_values = [0]
+        if max(step_values) < 8192:
+            adaptive_values.append(8192)
+    if not adaptive_values:
+        raise ValueError("GLM DSA adaptive prefill step candidates must not be empty")
+
+    candidates = []
+    seen = set()
+    for step_size in step_values:
+        if step_size <= 0:
+            raise ValueError("prefill step candidates must be positive")
+        for max_qk_tokens in qk_values:
+            if max_qk_tokens < 0:
+                raise ValueError("prefill max-qk candidates must be non-negative")
+            for adaptive_step_size in adaptive_values:
+                if adaptive_step_size < 0:
+                    raise ValueError(
+                        "GLM DSA adaptive prefill step candidates must be non-negative"
+                    )
+                key = (step_size, max_qk_tokens, adaptive_step_size)
+                if key in seen:
+                    continue
+                seen.add(key)
+                qk_label = "qk-off" if max_qk_tokens == 0 else f"qk-{max_qk_tokens}"
+                adaptive_label = (
+                    "adaptive-off"
+                    if adaptive_step_size == 0
+                    else f"adaptive-{adaptive_step_size}"
+                )
+                candidates.append(
+                    {
+                        "name": f"step-{step_size}-{qk_label}-{adaptive_label}",
+                        "prefill_step_size": step_size,
+                        "prefill_max_qk_tokens": max_qk_tokens,
+                        "glm_dsa_adaptive_prefill_step_size": adaptive_step_size,
+                    }
+                )
+    return candidates
+
+
 def build_prompt_tokens(tokenizer, target_tokens, prefix_text=""):
     return encode(tokenizer, build_prompt_text(tokenizer, target_tokens, prefix_text))[
         :target_tokens
@@ -739,6 +788,9 @@ def print_table(rows, output_format):
         "policy_store_prefix_tokens",
         "policy_reused_ratio",
         "policy_fresh_prefill_ratio",
+        "prefill_sweep_name",
+        "prefill_sweep_candidate_index",
+        "prefill_sweep_use_checkpoints",
         "batch_size",
         "prefill_batch_size",
         "completion_batch_size",
@@ -815,6 +867,14 @@ def configure_checkpoint_cache_dir(args):
     if args.mode in ("controlled-lcp", "policy-sweep") and args.checkpoint_cache_dir is None:
         args.checkpoint_cache_dir = Path(
             tempfile.mkdtemp(prefix=f"glm52-{args.mode}-checkpoints-")
+        )
+    if (
+        args.mode == "prefill-sweep"
+        and args.prefill_sweep_use_checkpoints
+        and args.checkpoint_cache_dir is None
+    ):
+        args.checkpoint_cache_dir = Path(
+            tempfile.mkdtemp(prefix="glm52-prefill-sweep-checkpoints-")
         )
 
     old_cache_dir = os.environ.get(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV)
@@ -1091,12 +1151,73 @@ def run_policy_sweep(model, tokenizer, args):
             os.environ[prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV] = old_cache_dir
 
 
+def run_prefill_sweep(model, tokenizer, args):
+    candidates = prefill_sweep_candidates(args)
+    if args.prompt_file:
+        prompt_cases = [("file", args.prompt_file.read_text(), None)]
+    else:
+        prompt_cases = [
+            (str(length), build_prompt_text(tokenizer, length), length)
+            for length in parse_lengths(args.lengths)
+        ]
+
+    rows = []
+    old_target_tokens = getattr(args, "target_tokens", None)
+    old_prefill_step_size = args.prefill_step_size
+    old_prefill_max_qk_tokens = args.prefill_max_qk_tokens
+    old_adaptive_step_size = args.glm_dsa_adaptive_prefill_step_size
+    old_no_prompt_checkpoint = args.no_prompt_checkpoint
+    old_checkpoint_save_exact = args.checkpoint_save_exact
+    args.no_prompt_checkpoint = not args.prefill_sweep_use_checkpoints
+    if not args.prefill_sweep_use_checkpoints:
+        args.checkpoint_save_exact = "disabled"
+
+    try:
+        for prompt_label, prompt_text, target_tokens in prompt_cases:
+            args.target_tokens = target_tokens
+            for candidate_index, candidate in enumerate(candidates):
+                args.prefill_step_size = candidate["prefill_step_size"]
+                args.prefill_max_qk_tokens = candidate["prefill_max_qk_tokens"]
+                args.glm_dsa_adaptive_prefill_step_size = candidate[
+                    "glm_dsa_adaptive_prefill_step_size"
+                ]
+                case_name = f"prefill-sweep-{prompt_label}-{candidate['name']}"
+                for _run in range(args.repeat_runs):
+                    row = run_once(model, tokenizer, prompt_text, args, case_name)
+                    row.update(
+                        {
+                            "mode": "prefill-sweep",
+                            "prefill_sweep_name": candidate["name"],
+                            "prefill_sweep_candidate_index": candidate_index,
+                            "prefill_sweep_use_checkpoints": (
+                                args.prefill_sweep_use_checkpoints
+                            ),
+                        }
+                    )
+                    rows.append(row)
+        return rows
+    finally:
+        args.target_tokens = old_target_tokens
+        args.prefill_step_size = old_prefill_step_size
+        args.prefill_max_qk_tokens = old_prefill_max_qk_tokens
+        args.glm_dsa_adaptive_prefill_step_size = old_adaptive_step_size
+        args.no_prompt_checkpoint = old_no_prompt_checkpoint
+        args.checkpoint_save_exact = old_checkpoint_save_exact
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local path or HF repo.")
     parser.add_argument(
         "--mode",
-        choices=("single", "batch", "queued", "controlled-lcp", "policy-sweep"),
+        choices=(
+            "single",
+            "batch",
+            "queued",
+            "controlled-lcp",
+            "policy-sweep",
+            "prefill-sweep",
+        ),
         default="single",
     )
     parser.add_argument("--batch-size", type=int, default=1)
@@ -1153,6 +1274,40 @@ def main():
         type=int,
         default=2048,
         help="Alignment used when deriving the default ds4-boundary candidate.",
+    )
+    parser.add_argument(
+        "--prefill-step-candidates",
+        type=parse_lengths,
+        help=(
+            "Comma-separated base prefill step candidates for --mode prefill-sweep. "
+            "Defaults to 512,1024,2048."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-max-qk-token-candidates",
+        type=parse_lengths,
+        help=(
+            "Comma-separated QK budget candidates for --mode prefill-sweep. "
+            "Use 0 to disable context-aware shrinking. Defaults to "
+            "--prefill-max-qk-tokens."
+        ),
+    )
+    parser.add_argument(
+        "--glm-dsa-adaptive-prefill-step-candidates",
+        type=parse_lengths,
+        help=(
+            "Comma-separated adaptive GLM DSA step candidates for "
+            "--mode prefill-sweep. Use 0 to disable. Defaults to 0,8192."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-sweep-use-checkpoints",
+        action="store_true",
+        help=(
+            "Allow prompt checkpoint load/save during --mode prefill-sweep. "
+            "By default prefill-sweep disables checkpoints to measure cold "
+            "prefill step behavior."
+        ),
     )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
@@ -1283,7 +1438,7 @@ def main():
     if args.checkpoint_save_exact is None:
         args.checkpoint_save_exact = (
             "disabled"
-            if args.mode in ("controlled-lcp", "policy-sweep")
+            if args.mode in ("controlled-lcp", "policy-sweep", "prefill-sweep")
             else "enabled"
         )
     args.target_tokens = None
@@ -1303,6 +1458,8 @@ def main():
             rows.extend(run_controlled_lcp(model, tokenizer, args))
         elif args.mode == "policy-sweep":
             rows.extend(run_policy_sweep(model, tokenizer, args))
+        elif args.mode == "prefill-sweep":
+            rows.extend(run_prefill_sweep(model, tokenizer, args))
         else:
             if args.mode == "queued":
                 runner = run_queued_once

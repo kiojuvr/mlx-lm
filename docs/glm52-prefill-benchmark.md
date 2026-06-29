@@ -296,6 +296,18 @@ python benchmarks/glm52_prefill_benchmark.py \
   --checkpoint-cache-dir "$POLICY_CUSTOM_DIR" \
   --json-output glm52-policy-custom-8192-2048.json
 
+# Cold prefill step sweep for GLM DSA tuning. Checkpoints are disabled by
+# default so each candidate measures prefill chunking instead of reuse.
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode prefill-sweep \
+  --lengths 8192,32768,131072 \
+  --max-tokens 1 \
+  --prefill-step-candidates 512,1024,2048 \
+  --prefill-max-qk-token-candidates 67108864 \
+  --glm-dsa-adaptive-prefill-step-candidates 0,8192 \
+  --fast-prefill enabled \
+  --json-output glm52-prefill-step-sweep.json
+
 # Queued serving workload with repeated coding-agent prefixes:
 # exercises admission waiting and the conservative fp/int8 guard. Use
 # --max-tokens > 1 so active quantized decode batches stay alive long enough for

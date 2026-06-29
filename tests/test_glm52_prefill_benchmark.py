@@ -228,6 +228,74 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             [("disabled", 0), ("ds4-boundary", 2048), ("full-prefix", 3000)],
         )
 
+    def test_prefill_sweep_default_candidates_compare_adaptive(self):
+        args = Namespace(
+            prefill_step_candidates=None,
+            prefill_max_qk_token_candidates=None,
+            prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_candidates=None,
+        )
+
+        candidates = benchmark.prefill_sweep_candidates(args)
+
+        self.assertEqual(len(candidates), 6)
+        self.assertEqual(candidates[0]["prefill_step_size"], 512)
+        self.assertEqual(candidates[0]["prefill_max_qk_tokens"], 67_108_864)
+        self.assertEqual(candidates[0]["glm_dsa_adaptive_prefill_step_size"], 0)
+        self.assertEqual(candidates[1]["glm_dsa_adaptive_prefill_step_size"], 8192)
+
+    def test_prefill_sweep_disables_checkpoints_by_default(self):
+        args = Namespace(
+            prompt_file=None,
+            lengths="8",
+            repeat_runs=1,
+            prefill_step_candidates=[512, 1024],
+            prefill_max_qk_token_candidates=[0],
+            prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_candidates=[0, 8192],
+            glm_dsa_adaptive_prefill_step_size=0,
+            prefill_step_size=2048,
+            no_prompt_checkpoint=False,
+            checkpoint_save_exact="enabled",
+            prefill_sweep_use_checkpoints=False,
+            target_tokens=None,
+        )
+        old_build_prompt_text = benchmark.build_prompt_text
+        old_run_once = benchmark.run_once
+        calls = []
+
+        def fake_build_prompt_text(_tokenizer, target_tokens, prefix_text=""):
+            return f"prompt-{target_tokens}-{prefix_text}"
+
+        def fake_run_once(_model, _tokenizer, _prompt, call_args, case_name):
+            calls.append(
+                {
+                    "case": case_name,
+                    "step": call_args.prefill_step_size,
+                    "qk": call_args.prefill_max_qk_tokens,
+                    "adaptive": call_args.glm_dsa_adaptive_prefill_step_size,
+                    "no_checkpoint": call_args.no_prompt_checkpoint,
+                    "save_exact": call_args.checkpoint_save_exact,
+                }
+            )
+            return {"case": case_name, "mode": "single"}
+
+        try:
+            benchmark.build_prompt_text = fake_build_prompt_text
+            benchmark.run_once = fake_run_once
+            rows = benchmark.run_prefill_sweep(None, None, args)
+        finally:
+            benchmark.build_prompt_text = old_build_prompt_text
+            benchmark.run_once = old_run_once
+
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(call["no_checkpoint"] for call in calls))
+        self.assertTrue(all(call["save_exact"] == "disabled" for call in calls))
+        self.assertEqual(calls[0]["step"], 512)
+        self.assertEqual(calls[1]["adaptive"], 8192)
+        self.assertEqual(rows[0]["mode"], "prefill-sweep")
+        self.assertEqual(rows[0]["prefill_sweep_candidate_index"], 0)
+
     def test_policy_sweep_runs_isolated_candidates(self):
         args = Namespace(
             lcp_prefix_tokens=4,
