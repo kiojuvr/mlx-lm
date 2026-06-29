@@ -18,6 +18,7 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mlx_lm.generate import PROMPT_CHECKPOINT_DEBUG_ENV, BatchGenerator, BatchStats
+from mlx_lm.generate import DEFAULT_PREFILL_MAX_QK_TOKENS
 from mlx_lm.generate import stream_generate
 from mlx_lm.models import cache as prompt_cache
 from mlx_lm.models import glm_moe_dsa
@@ -204,6 +205,13 @@ def extract_checkpoint_summary(messages):
         "fresh_prompt_tokens": None,
         "fresh_prefill_tokens": None,
         "checkpoint_prefill_step_size": None,
+        "checkpoint_prefill_max_qk_tokens": None,
+        "checkpoint_glm_dsa_adaptive_prefill_step_size": None,
+        "checkpoint_glm_dsa_adaptive_prefill_after_tokens": None,
+        "checkpoint_glm_dsa_adaptive_prefill_min_remaining_tokens": None,
+        "checkpoint_prefill_chunks": 0,
+        "checkpoint_max_adaptive_prefill_step_size": None,
+        "checkpoint_max_effective_prefill_step_size": None,
         "checkpoint_resolution": None,
         "checkpoint_lookup_seconds": None,
         "checkpoint_files_scanned": None,
@@ -214,28 +222,60 @@ def extract_checkpoint_summary(messages):
         "checkpoint_events": len(messages),
     }
     for message in messages:
-        if "prefill summary " not in message:
+        if "prefill summary " in message:
+            for key, value in re.findall(r"([a-z_]+)=([^ ]+)", message):
+                output_key = {
+                    "total_prompt_tokens": "checkpoint_total_prompt_tokens",
+                    "prefill_step_size": "checkpoint_prefill_step_size",
+                    "prefill_max_qk_tokens": "checkpoint_prefill_max_qk_tokens",
+                    "glm_dsa_adaptive_prefill_step_size": (
+                        "checkpoint_glm_dsa_adaptive_prefill_step_size"
+                    ),
+                    "glm_dsa_adaptive_prefill_after_tokens": (
+                        "checkpoint_glm_dsa_adaptive_prefill_after_tokens"
+                    ),
+                    "glm_dsa_adaptive_prefill_min_remaining_tokens": (
+                        "checkpoint_glm_dsa_adaptive_prefill_min_remaining_tokens"
+                    ),
+                    "files_scanned": "checkpoint_files_scanned",
+                    "candidates_scanned": "checkpoint_candidates_scanned",
+                    "matched_candidates": "checkpoint_matched_candidates",
+                    "manifest_entries": "checkpoint_manifest_entries",
+                    "manifest_bootstrap": "checkpoint_manifest_bootstrap",
+                    "lookup_seconds": "checkpoint_lookup_seconds",
+                    "resolution": "checkpoint_resolution",
+                }.get(key, key)
+                if output_key not in summary:
+                    continue
+                if output_key == "checkpoint_resolution":
+                    summary[output_key] = value
+                elif output_key == "checkpoint_lookup_seconds":
+                    summary[output_key] = float(value)
+                elif value == "None":
+                    summary[output_key] = None
+                else:
+                    summary[output_key] = int(value)
             continue
-        for key, value in re.findall(r"([a-z_]+)=([^ ]+)", message):
-            output_key = {
-                "total_prompt_tokens": "checkpoint_total_prompt_tokens",
-                "prefill_step_size": "checkpoint_prefill_step_size",
-                "files_scanned": "checkpoint_files_scanned",
-                "candidates_scanned": "checkpoint_candidates_scanned",
-                "matched_candidates": "checkpoint_matched_candidates",
-                "manifest_entries": "checkpoint_manifest_entries",
-                "manifest_bootstrap": "checkpoint_manifest_bootstrap",
-                "lookup_seconds": "checkpoint_lookup_seconds",
-                "resolution": "checkpoint_resolution",
-            }.get(key, key)
-            if output_key not in summary:
+
+        if "prefill chunk " not in message:
+            continue
+        values = dict(re.findall(r"([a-z_]+)=([^ ]+)", message))
+        summary["checkpoint_prefill_chunks"] += 1
+        for key, output_key in (
+            (
+                "adaptive_prefill_step_size",
+                "checkpoint_max_adaptive_prefill_step_size",
+            ),
+            (
+                "effective_prefill_step_size",
+                "checkpoint_max_effective_prefill_step_size",
+            ),
+        ):
+            if key not in values:
                 continue
-            if output_key == "checkpoint_resolution":
-                summary[output_key] = value
-            elif output_key == "checkpoint_lookup_seconds":
-                summary[output_key] = float(value)
-            else:
-                summary[output_key] = int(value)
+            value = int(values[key])
+            current = summary[output_key]
+            summary[output_key] = value if current is None else max(current, value)
     return summary
 
 
@@ -295,6 +335,26 @@ def collect_glm_dsa_profile(args):
     }
 
 
+def prefill_config_summary(args):
+    return {
+        "prefill_step_size": args.prefill_step_size,
+        "prefill_max_qk_tokens": getattr(
+            args,
+            "prefill_max_qk_tokens",
+            DEFAULT_PREFILL_MAX_QK_TOKENS,
+        ),
+        "glm_dsa_adaptive_prefill_step_size": (
+            getattr(args, "glm_dsa_adaptive_prefill_step_size", 0)
+        ),
+        "glm_dsa_adaptive_prefill_after_tokens": (
+            getattr(args, "glm_dsa_adaptive_prefill_after_tokens", 0)
+        ),
+        "glm_dsa_adaptive_prefill_min_remaining_tokens": (
+            getattr(args, "glm_dsa_adaptive_prefill_min_remaining_tokens", 0)
+        ),
+    }
+
+
 def run_once(model, tokenizer, prompt, args, case_name):
     tokenize_t0 = time.perf_counter()
     tokens = prompt_to_tokens(tokenizer, prompt)
@@ -316,6 +376,7 @@ def run_once(model, tokenizer, prompt, args, case_name):
     mx.clear_cache()
     mx.synchronize()
     reset_glm_dsa_profile()
+    prefill_config = prefill_config_summary(args)
 
     ttft_t0 = time.perf_counter()
     response = None
@@ -326,6 +387,16 @@ def run_once(model, tokenizer, prompt, args, case_name):
             prompt=tokens,
             max_tokens=args.max_tokens,
             prefill_step_size=args.prefill_step_size,
+            prefill_max_qk_tokens=prefill_config["prefill_max_qk_tokens"],
+            glm_dsa_adaptive_prefill_step_size=(
+                prefill_config["glm_dsa_adaptive_prefill_step_size"]
+            ),
+            glm_dsa_adaptive_prefill_after_tokens=(
+                prefill_config["glm_dsa_adaptive_prefill_after_tokens"]
+            ),
+            glm_dsa_adaptive_prefill_min_remaining_tokens=(
+                prefill_config["glm_dsa_adaptive_prefill_min_remaining_tokens"]
+            ),
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
             quantized_kv_start=args.quantized_kv_start,
@@ -377,6 +448,7 @@ def run_once(model, tokenizer, prompt, args, case_name):
         "peak_memory_gb": response.peak_memory,
         "progress_events": len(progress_events),
         "finish_reason": response.finish_reason,
+        **prefill_config,
         **checkpoint,
         **glm_profile,
     }
@@ -464,6 +536,7 @@ def run_batch_once(model, tokenizer, text, args, case_name):
         "finish_reason": ",".join(
             sorted({str(r.finish_reason) for r in responses.values()})
         ),
+        **prefill_config_summary(args),
         "checkpoint_resolution": "batch-n/a",
         "checkpoint_total_prompt_tokens": None,
         "server_cached_tokens": None,
@@ -603,6 +676,7 @@ def run_queued_once(model, tokenizer, _text, args, case_name):
         "finish_reason": ",".join(
             sorted({str(r.finish_reason) for r in responses.values()})
         ),
+        **prefill_config_summary(args),
         "checkpoint_resolution": "batch-n/a",
         "checkpoint_total_prompt_tokens": None,
         "server_cached_tokens": None,
@@ -678,6 +752,13 @@ def print_table(rows, output_format):
         "checkpoint_total_prompt_tokens",
         "server_cached_tokens",
         "checkpoint_prefill_step_size",
+        "checkpoint_prefill_max_qk_tokens",
+        "checkpoint_glm_dsa_adaptive_prefill_step_size",
+        "checkpoint_glm_dsa_adaptive_prefill_after_tokens",
+        "checkpoint_glm_dsa_adaptive_prefill_min_remaining_tokens",
+        "checkpoint_prefill_chunks",
+        "checkpoint_max_adaptive_prefill_step_size",
+        "checkpoint_max_effective_prefill_step_size",
         "checkpoint_cache_dir",
         "checkpoint_save_exact",
         "checkpoint_lookup_seconds",
@@ -692,6 +773,11 @@ def print_table(rows, output_format):
         "ttft_p50_seconds",
         "ttft_p95_seconds",
         "prompt_tps",
+        "prefill_step_size",
+        "prefill_max_qk_tokens",
+        "glm_dsa_adaptive_prefill_step_size",
+        "glm_dsa_adaptive_prefill_after_tokens",
+        "glm_dsa_adaptive_prefill_min_remaining_tokens",
         "peak_memory_gb",
         "admission_wait_p50_seconds",
         "admission_wait_p95_seconds",
@@ -1070,6 +1156,36 @@ def main():
     )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
+    parser.add_argument(
+        "--prefill-max-qk-tokens",
+        type=int,
+        default=DEFAULT_PREFILL_MAX_QK_TOKENS,
+        help=(
+            "Maximum chunk_tokens * effective_context_tokens for single-request "
+            "prefill. Use 0 to disable context-aware step shrinking."
+        ),
+    )
+    parser.add_argument(
+        "--glm-dsa-adaptive-prefill-step-size",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in larger base prefill step for GLM DSA single-request runs "
+            "before the context-aware QK cap is applied."
+        ),
+    )
+    parser.add_argument(
+        "--glm-dsa-adaptive-prefill-after-tokens",
+        type=int,
+        default=0,
+        help="Minimum processed prompt tokens before adaptive GLM DSA prefill activates.",
+    )
+    parser.add_argument(
+        "--glm-dsa-adaptive-prefill-min-remaining-tokens",
+        type=int,
+        default=0,
+        help="Minimum remaining prompt tokens required for adaptive GLM DSA prefill.",
+    )
     parser.add_argument("--kv-bits", type=int)
     parser.add_argument("--kv-group-size", type=int, default=64)
     parser.add_argument("--quantized-kv-start", type=int, default=0)

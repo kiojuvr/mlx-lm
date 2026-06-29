@@ -19,10 +19,22 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "total_prompt_tokens=8192 server_cached_tokens=0 "
                     "disk_cached_tokens=6144 fresh_prompt_tokens=2048 "
                     "fresh_prefill_tokens=2047 prefill_step_size=2048 "
+                    "prefill_max_qk_tokens=67108864 "
+                    "glm_dsa_adaptive_prefill_step_size=8192 "
+                    "glm_dsa_adaptive_prefill_after_tokens=4096 "
+                    "glm_dsa_adaptive_prefill_min_remaining_tokens=2048 "
                     "resolution=prefix files_scanned=1 candidates_scanned=1 "
                     "matched_candidates=1 manifest_entries=1 "
                     "manifest_bootstrap=0 lookup_seconds=0.001234"
-                )
+                ),
+                (
+                    "prompt checkpoint: prefill chunk start_tokens=6144 "
+                    "chunk_tokens=2048 processed_tokens=8192 "
+                    "total_prompt_tokens=8192 prefill_step_size=2048 "
+                    "adaptive_prefill_step_size=8192 "
+                    "effective_prefill_step_size=2048 "
+                    "prefill_max_qk_tokens=67108864 chunk_seconds=1.000000"
+                ),
             ]
         )
 
@@ -32,6 +44,20 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(summary["fresh_prefill_tokens"], 2047)
         self.assertEqual(summary["checkpoint_resolution"], "prefix")
         self.assertEqual(summary["checkpoint_lookup_seconds"], 0.001234)
+        self.assertEqual(summary["checkpoint_prefill_max_qk_tokens"], 67108864)
+        self.assertEqual(
+            summary["checkpoint_glm_dsa_adaptive_prefill_step_size"], 8192
+        )
+        self.assertEqual(
+            summary["checkpoint_glm_dsa_adaptive_prefill_after_tokens"], 4096
+        )
+        self.assertEqual(
+            summary["checkpoint_glm_dsa_adaptive_prefill_min_remaining_tokens"],
+            2048,
+        )
+        self.assertEqual(summary["checkpoint_prefill_chunks"], 1)
+        self.assertEqual(summary["checkpoint_max_adaptive_prefill_step_size"], 8192)
+        self.assertEqual(summary["checkpoint_max_effective_prefill_step_size"], 2048)
 
     def test_format_output_cell_serializes_compound_values(self):
         self.assertEqual(benchmark.format_output_cell({"decode": 156}), '{"decode":156}')

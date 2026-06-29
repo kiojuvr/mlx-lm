@@ -34,6 +34,8 @@ The benchmark reports:
 - peak MLX memory
 - prompt progress callback count
 - prompt checkpoint resolution, lookup time, and cache accounting from debug logs
+- configured `prefill_max_qk_tokens` and GLM DSA adaptive prefill knobs, plus
+  observed maximum adaptive/effective prefill chunk sizes from debug logs
 - controlled LCP fields: requested total tokens, stored prefix tokens, expected
   reused prefix tokens, actual `disk_cached_tokens`, `fresh_prompt_tokens`, and
   `fresh_prefill_tokens`
@@ -277,6 +279,8 @@ python benchmarks/glm52_prefill_benchmark.py \
   --model "$MODEL" --mode policy-sweep \
   --lcp-prefix-tokens 8192 --lcp-suffix-tokens 2048 \
   --max-tokens 1 --prefill-step-size 2048 \
+  --prefill-max-qk-tokens 67108864 \
+  --glm-dsa-adaptive-prefill-step-size 8192 \
   --fast-prefill disabled \
   --checkpoint-cache-dir "$POLICY_DIR" \
   --json-output glm52-policy-sweep-8192-2048.json
