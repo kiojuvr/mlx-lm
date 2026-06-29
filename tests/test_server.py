@@ -71,6 +71,9 @@ class DummyModelProvider:
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
                 "prefill_max_qk_tokens": 67_108_864,
+                "glm_dsa_adaptive_prefill_step_size": 0,
+                "glm_dsa_adaptive_prefill_after_tokens": 0,
+                "glm_dsa_adaptive_prefill_min_remaining_tokens": 0,
                 "checkpoint_min_tokens": DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
                 "checkpoint_cold_max_tokens": (
                     DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS
@@ -600,6 +603,9 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.quantized_kv_start, 0)
         self.assertFalse(args.disable_batching)
         self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
+        self.assertEqual(args.glm_dsa_adaptive_prefill_step_size, 0)
+        self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 0)
+        self.assertEqual(args.glm_dsa_adaptive_prefill_min_remaining_tokens, 0)
         self.assertIsNone(args.checkpoint_cache_dir)
         self.assertEqual(
             args.checkpoint_min_tokens, DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS
@@ -644,6 +650,22 @@ class TestServerCLI(unittest.TestCase):
         args = setup_arg_parser().parse_args(["--prefill-max-qk-tokens", "0"])
 
         self.assertEqual(args.prefill_max_qk_tokens, 0)
+
+    def test_setup_arg_parser_glm_dsa_adaptive_prefill_options(self):
+        args = setup_arg_parser().parse_args(
+            [
+                "--glm-dsa-adaptive-prefill-step-size",
+                "8192",
+                "--glm-dsa-adaptive-prefill-after-tokens",
+                "4096",
+                "--glm-dsa-adaptive-prefill-min-remaining-tokens",
+                "2048",
+            ]
+        )
+
+        self.assertEqual(args.glm_dsa_adaptive_prefill_step_size, 8192)
+        self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 4096)
+        self.assertEqual(args.glm_dsa_adaptive_prefill_min_remaining_tokens, 2048)
 
     def test_setup_arg_parser_checkpoint_cache_dir(self):
         args = setup_arg_parser().parse_args(
@@ -771,6 +793,9 @@ class TestServerCLI(unittest.TestCase):
         cli_args = types.SimpleNamespace(
             prefill_step_size=2048,
             prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_size=8192,
+            glm_dsa_adaptive_prefill_after_tokens=4096,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=2048,
             checkpoint_min_tokens=DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
             checkpoint_cold_max_tokens=DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
             checkpoint_boundary_trim_tokens=(
@@ -890,6 +915,11 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["prompt_checkpoint_frontier_min_tokens"], 10_240)
         self.assertEqual(captured["prompt_checkpoint_frontier_stride_tokens"], 10_240)
         self.assertEqual(captured["prefill_max_qk_tokens"], 67_108_864)
+        self.assertEqual(captured["glm_dsa_adaptive_prefill_step_size"], 8192)
+        self.assertEqual(captured["glm_dsa_adaptive_prefill_after_tokens"], 4096)
+        self.assertEqual(
+            captured["glm_dsa_adaptive_prefill_min_remaining_tokens"], 2048
+        )
         self.assertEqual(captured["kv_bits"], 8)
         self.assertEqual(captured["kv_group_size"], 64)
         self.assertEqual(captured["quantized_kv_start"], 4096)

@@ -144,7 +144,10 @@ def _effective_prefill_step_size(
     remaining_tokens: int,
     processed_tokens: int,
     prefill_max_qk_tokens: Optional[int],
+    adaptive_step_size: Optional[int] = None,
 ) -> int:
+    if adaptive_step_size is not None and adaptive_step_size > 0:
+        requested_step_size = max(requested_step_size, int(adaptive_step_size))
     step_size = min(requested_step_size, remaining_tokens)
     if prefill_max_qk_tokens is None or prefill_max_qk_tokens <= 0:
         return step_size
@@ -158,6 +161,51 @@ def _effective_prefill_step_size(
     ):
         step_size = max(1, max_qk_tokens // max(processed_tokens + step_size, 1))
     return max(1, step_size)
+
+
+def _model_config_value(model, key):
+    configs = [
+        getattr(model, "config", None),
+        getattr(model, "args", None),
+    ]
+    nested_model = getattr(model, "model", None)
+    if nested_model is not None:
+        configs.extend(
+            [
+                getattr(nested_model, "config", None),
+                getattr(nested_model, "args", None),
+            ]
+        )
+    for config in configs:
+        if isinstance(config, dict):
+            value = config.get(key)
+        else:
+            value = getattr(config, key, None)
+        if value is not None:
+            return value
+    return getattr(model, key, None)
+
+
+def _glm_dsa_adaptive_prefill_step_size(
+    model,
+    *,
+    requested_step_size: int,
+    processed_tokens: int,
+    remaining_tokens: int,
+    adaptive_step_size: int = 0,
+    adaptive_after_tokens: int = 0,
+    adaptive_min_remaining_tokens: int = 0,
+) -> Optional[int]:
+    """Return an opt-in larger prefill step for GLM DSA models."""
+    if adaptive_step_size <= 0:
+        return None
+    if _model_config_value(model, "model_type") != "glm_moe_dsa":
+        return None
+    if processed_tokens < max(0, adaptive_after_tokens):
+        return None
+    if remaining_tokens < max(0, adaptive_min_remaining_tokens):
+        return None
+    return max(int(requested_step_size), int(adaptive_step_size))
 
 
 def _checkpoint_limit_frontier_lengths(lengths, max_frontiers):
@@ -436,6 +484,9 @@ def generate_step(
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
     prefill_max_qk_tokens: Optional[int] = None,
+    glm_dsa_adaptive_prefill_step_size: int = 0,
+    glm_dsa_adaptive_prefill_after_tokens: int = 0,
+    glm_dsa_adaptive_prefill_min_remaining_tokens: int = 0,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
@@ -479,6 +530,13 @@ def generate_step(
         prefill_max_qk_tokens (int, optional): If set, cap each prompt prefill
           chunk so ``chunk_tokens * effective_context_tokens`` stays below this
           value. This lets long-context dense fallback shrink before it OOMs.
+        glm_dsa_adaptive_prefill_step_size (int): Optional larger base prefill
+          step for ``glm_moe_dsa`` models. The context-aware QK cap still
+          applies after this step is selected. Use ``0`` to disable.
+        glm_dsa_adaptive_prefill_after_tokens (int): Minimum processed prompt
+          tokens before the GLM DSA adaptive step can activate.
+        glm_dsa_adaptive_prefill_min_remaining_tokens (int): Minimum remaining
+          prompt tokens required for the GLM DSA adaptive step.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
@@ -812,6 +870,9 @@ def generate_step(
         f"fresh_prefill_tokens={fresh_prefill_tokens} "
         f"prefill_step_size={prefill_step_size} "
         f"prefill_max_qk_tokens={prefill_max_qk_tokens} "
+        f"glm_dsa_adaptive_prefill_step_size={glm_dsa_adaptive_prefill_step_size} "
+        f"glm_dsa_adaptive_prefill_after_tokens={glm_dsa_adaptive_prefill_after_tokens} "
+        f"glm_dsa_adaptive_prefill_min_remaining_tokens={glm_dsa_adaptive_prefill_min_remaining_tokens} "
         f"resolution={prompt_checkpoint_resolution} "
         f"files_scanned={prompt_checkpoint_lookup_stats['files_scanned']} "
         f"candidates_scanned={prompt_checkpoint_lookup_stats['candidate_files_scanned']} "
@@ -1147,11 +1208,23 @@ def generate_step(
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+            adaptive_prefill_step_size = _glm_dsa_adaptive_prefill_step_size(
+                model,
+                requested_step_size=prefill_step_size,
+                processed_tokens=prompt_processed_tokens,
+                remaining_tokens=remaining,
+                adaptive_step_size=glm_dsa_adaptive_prefill_step_size,
+                adaptive_after_tokens=glm_dsa_adaptive_prefill_after_tokens,
+                adaptive_min_remaining_tokens=(
+                    glm_dsa_adaptive_prefill_min_remaining_tokens
+                ),
+            )
             n_to_process = _effective_prefill_step_size(
                 prefill_step_size,
                 remaining,
                 prompt_processed_tokens,
                 prefill_max_qk_tokens,
+                adaptive_step_size=adaptive_prefill_step_size,
             )
             for store_length in prompt_checkpoint_pending_store_lengths:
                 if prompt_processed_tokens < store_length <= (
@@ -1180,6 +1253,7 @@ def generate_step(
                 f"processed_tokens={prompt_processed_tokens} "
                 f"total_prompt_tokens={total_prompt_tokens} "
                 f"prefill_step_size={prefill_step_size} "
+                f"adaptive_prefill_step_size={adaptive_prefill_step_size or 0} "
                 f"effective_prefill_step_size={n_to_process} "
                 f"prefill_max_qk_tokens={prefill_max_qk_tokens} "
                 f"chunk_seconds={chunk_seconds:.6f}"
@@ -1517,6 +1591,9 @@ def stream_generate(
         kwargs.pop("prompt_checkpoint_save_exact", None)
         kwargs.pop("prompt_checkpoint_rendered_prompt", None)
         kwargs.pop("prompt_checkpoint_decode_prefix", None)
+        kwargs.pop("glm_dsa_adaptive_prefill_step_size", None)
+        kwargs.pop("glm_dsa_adaptive_prefill_after_tokens", None)
+        kwargs.pop("glm_dsa_adaptive_prefill_min_remaining_tokens", None)
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(

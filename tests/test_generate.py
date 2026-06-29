@@ -11,6 +11,7 @@ from mlx_lm.generate import (
     GenerationResponse,
     SequenceStateMachine,
     _effective_prefill_step_size,
+    _glm_dsa_adaptive_prefill_step_size,
     batch_generate,
     generate,
     generate_step,
@@ -42,6 +43,53 @@ class TestGenerateUtilities(unittest.TestCase):
         )
 
         self.assertEqual(step, 1024)
+
+    def test_glm_dsa_adaptive_prefill_step_is_opt_in(self):
+        model = type("Model", (), {"config": {"model_type": "glm_moe_dsa"}})()
+
+        step = _glm_dsa_adaptive_prefill_step_size(
+            model,
+            requested_step_size=1024,
+            processed_tokens=0,
+            remaining_tokens=20_000,
+            adaptive_step_size=8192,
+        )
+
+        self.assertEqual(step, 8192)
+
+    def test_glm_dsa_adaptive_prefill_step_respects_qk_cap(self):
+        model = type("Model", (), {"config": {"model_type": "glm_moe_dsa"}})()
+        adaptive_step = _glm_dsa_adaptive_prefill_step_size(
+            model,
+            requested_step_size=1024,
+            processed_tokens=200_000,
+            remaining_tokens=20_000,
+            adaptive_step_size=8192,
+        )
+
+        step = _effective_prefill_step_size(
+            requested_step_size=1024,
+            remaining_tokens=20_000,
+            processed_tokens=200_000,
+            prefill_max_qk_tokens=67_108_864,
+            adaptive_step_size=adaptive_step,
+        )
+
+        self.assertLess(step, 8192)
+        self.assertLessEqual(step * (200_000 + step), 67_108_864)
+
+    def test_glm_dsa_adaptive_prefill_step_skips_non_glm(self):
+        model = type("Model", (), {"config": {"model_type": "llama"}})()
+
+        step = _glm_dsa_adaptive_prefill_step_size(
+            model,
+            requested_step_size=1024,
+            processed_tokens=0,
+            remaining_tokens=20_000,
+            adaptive_step_size=8192,
+        )
+
+        self.assertIsNone(step)
 
 
 class TestGenerate(unittest.TestCase):

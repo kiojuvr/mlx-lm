@@ -1755,6 +1755,15 @@ class ResponseGenerator:
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 prefill_max_qk_tokens=self.cli_args.prefill_max_qk_tokens,
+                glm_dsa_adaptive_prefill_step_size=(
+                    self.cli_args.glm_dsa_adaptive_prefill_step_size
+                ),
+                glm_dsa_adaptive_prefill_after_tokens=(
+                    self.cli_args.glm_dsa_adaptive_prefill_after_tokens
+                ),
+                glm_dsa_adaptive_prefill_min_remaining_tokens=(
+                    self.cli_args.glm_dsa_adaptive_prefill_min_remaining_tokens
+                ),
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
@@ -3281,6 +3290,33 @@ def setup_arg_parser():
             "Maximum chunk_tokens * effective_context_tokens for sequential "
             "prefill. Use 0 to disable context-aware step shrinking "
             f"(default: {DEFAULT_PREFILL_MAX_QK_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--glm-dsa-adaptive-prefill-step-size",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in larger base prefill step for GLM DSA models before the "
+            "context-aware QK cap is applied. Use 0 to disable (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--glm-dsa-adaptive-prefill-after-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Minimum processed prompt tokens before the GLM DSA adaptive "
+            "prefill step can activate (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--glm-dsa-adaptive-prefill-min-remaining-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Minimum remaining prompt tokens required for the GLM DSA "
+            "adaptive prefill step (default: 0)."
         ),
     )
     parser.add_argument(

@@ -423,6 +423,12 @@ on your real prompt distribution. `--prefill-max-qk-tokens` keeps dense fallback
 chunks below the configured query-by-context budget and can be set to `0` to
 disable context-aware step shrinking.
 
+For GLM DSA step-size tuning, keep the conservative base step above and try
+`--glm-dsa-adaptive-prefill-step-size 8192` as a benchmark-only knob. The
+adaptive step is GLM-only and still passes through the `--prefill-max-qk-tokens`
+cap, so it mainly helps earlier/mid-context prefill where the QK budget allows a
+larger chunk.
+
 The checkpoint defaults above are the current ds4-style policy: save stable
 boundaries rather than unstable tails, round continued checkpoints to a roughly
 10K-token interval, and preserve a few live RAM frontiers on shutdown. For
