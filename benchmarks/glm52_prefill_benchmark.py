@@ -863,6 +863,36 @@ def print_table(rows, output_format):
         writer.writerow([format_output_cell(row.get(h)) for h in headers])
 
 
+def write_json_output(path, rows, *, partial=False):
+    path = Path(path)
+    payload = {"runs": rows, "summary": summarize_repeats(rows)}
+    if partial:
+        payload["partial"] = True
+        payload["completed_runs"] = len(rows)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def partial_json_output_path(path):
+    path = Path(path)
+    return path.with_name(f"{path.name}.partial")
+
+
+def remove_partial_json_output(path):
+    partial_path = partial_json_output_path(path)
+    try:
+        partial_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_partial_prefill_sweep_output(args, rows):
+    json_output = getattr(args, "json_output", None)
+    if json_output:
+        write_json_output(partial_json_output_path(json_output), rows, partial=True)
+
+
 def configure_checkpoint_cache_dir(args):
     if args.mode in ("controlled-lcp", "policy-sweep") and args.checkpoint_cache_dir is None:
         args.checkpoint_cache_dir = Path(
@@ -1195,6 +1225,7 @@ def run_prefill_sweep(model, tokenizer, args):
                         }
                     )
                     rows.append(row)
+                    write_partial_prefill_sweep_output(args, rows)
         return rows
     finally:
         args.target_tokens = old_target_tokens
@@ -1529,9 +1560,9 @@ def main():
         summaries = summarize_repeats(rows)
         print_table(summaries, args.output_format)
         if args.json_output:
-            args.json_output.write_text(
-                json.dumps({"runs": rows, "summary": summaries}, indent=2)
-            )
+            write_json_output(args.json_output, rows)
+            if args.mode == "prefill-sweep":
+                remove_partial_json_output(args.json_output)
     finally:
         restore_checkpoint_cache_dir(old_checkpoint_cache_dir)
 

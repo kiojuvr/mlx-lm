@@ -300,16 +300,30 @@ python benchmarks/glm52_prefill_benchmark.py \
   --json-output glm52-policy-custom-8192-2048.json
 
 # Cold prefill step sweep for GLM DSA tuning. Checkpoints are disabled by
-# default so each candidate measures prefill chunking instead of reuse.
+# default so each candidate measures prefill chunking instead of reuse. The
+# benchmark writes glm52-prefill-step-sweep.json.partial after each completed
+# candidate, so interrupted long-context runs still keep completed rows.
 python benchmarks/glm52_prefill_benchmark.py \
   --model "$MODEL" --mode prefill-sweep \
-  --lengths 8192,32768,131072 \
+  --lengths 8192,32768 \
   --max-tokens 1 \
   --prefill-step-candidates 512,1024,2048 \
   --prefill-max-qk-token-candidates 67108864 \
   --glm-dsa-adaptive-prefill-step-candidates 0,8192 \
   --fast-prefill enabled \
   --json-output glm52-prefill-step-sweep.json
+
+# Confirm only the short/medium finalists at 131072 tokens. Replace the
+# candidate lists with the winners from the previous run.
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$MODEL" --mode prefill-sweep \
+  --lengths 131072 \
+  --max-tokens 1 \
+  --prefill-step-candidates 2048 \
+  --prefill-max-qk-token-candidates 67108864 \
+  --glm-dsa-adaptive-prefill-step-candidates 0 \
+  --fast-prefill enabled \
+  --json-output glm52-prefill-step-sweep-131k-finalists.json
 
 # Queued serving workload with repeated coding-agent prefixes:
 # exercises admission waiting and the conservative fp/int8 guard. Use

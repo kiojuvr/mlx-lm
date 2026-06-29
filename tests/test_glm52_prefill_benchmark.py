@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from argparse import Namespace
+from pathlib import Path
 
 from benchmarks import glm52_prefill_benchmark as benchmark
 
@@ -276,6 +277,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             checkpoint_save_exact="enabled",
             prefill_sweep_use_checkpoints=False,
             target_tokens=None,
+            json_output=None,
         )
         old_build_prompt_text = benchmark.build_prompt_text
         old_run_once = benchmark.run_once
@@ -312,6 +314,57 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(calls[1]["adaptive"], 8192)
         self.assertEqual(rows[0]["mode"], "prefill-sweep")
         self.assertEqual(rows[0]["prefill_sweep_candidate_index"], 0)
+
+    def test_prefill_sweep_writes_partial_json_output(self):
+        old_build_prompt_text = benchmark.build_prompt_text
+        old_run_once = benchmark.run_once
+
+        def fake_build_prompt_text(_tokenizer, target_tokens, prefix_text=""):
+            return f"prompt-{target_tokens}-{prefix_text}"
+
+        def fake_run_once(_model, _tokenizer, _prompt, _args, case_name):
+            return {
+                "case": case_name,
+                "mode": "single",
+                "ttft_seconds": 1.0,
+                "prompt_tps": 2.0,
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_output = Path(tmpdir) / "prefill-sweep.json"
+            args = Namespace(
+                prompt_file=None,
+                lengths="8",
+                repeat_runs=1,
+                prefill_step_candidates=[512],
+                prefill_max_qk_token_candidates=[0],
+                prefill_max_qk_tokens=0,
+                glm_dsa_adaptive_prefill_step_candidates=[0],
+                glm_dsa_adaptive_prefill_step_size=0,
+                prefill_step_size=2048,
+                no_prompt_checkpoint=False,
+                checkpoint_save_exact="enabled",
+                prefill_sweep_use_checkpoints=False,
+                target_tokens=None,
+                json_output=json_output,
+            )
+            benchmark.build_prompt_text = fake_build_prompt_text
+            benchmark.run_once = fake_run_once
+            try:
+                rows = benchmark.run_prefill_sweep(None, None, args)
+            finally:
+                benchmark.build_prompt_text = old_build_prompt_text
+                benchmark.run_once = old_run_once
+
+            partial_output = benchmark.partial_json_output_path(json_output)
+            with open(partial_output, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["completed_runs"], 1)
+        self.assertEqual(payload["runs"][0]["mode"], "prefill-sweep")
+        self.assertEqual(payload["summary"][0]["case"], rows[0]["case"])
 
     def test_policy_sweep_runs_isolated_candidates(self):
         args = Namespace(
