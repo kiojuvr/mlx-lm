@@ -63,6 +63,23 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(benchmark.format_output_cell({"decode": 156}), '{"decode":156}')
         self.assertEqual(benchmark.format_output_cell(None), "")
 
+    def test_main_rejects_empty_model_argument(self):
+        old_argv = sys.argv
+        sys.argv = [
+            "glm52_prefill_benchmark.py",
+            "--model",
+            "",
+        ]
+        try:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as cm:
+                    benchmark.main()
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--model is empty", stderr.getvalue())
+        finally:
+            sys.argv = old_argv
+
     def test_controlled_lcp_rejects_unexpected_checkpoint_length(self):
         args = Namespace(
             lcp_prefix_tokens=4,

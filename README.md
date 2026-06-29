@@ -125,6 +125,9 @@ Set `MODEL` once:
 MODEL="$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"
 ```
 
+Confirm `echo "$MODEL"` prints the model directory before using examples that
+pass `--model "$MODEL"`.
+
 Disabled baseline with the same controlled-LCP row schema:
 
 ```sh

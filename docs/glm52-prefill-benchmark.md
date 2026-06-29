@@ -171,7 +171,10 @@ There is no fuzzy matching: a checkpoint is reused only when the candidate token
 sequence is an identical prefix of the request and all cache/model settings
 validate.
 
-Run separate commands to keep the main effects distinct:
+Run separate commands to keep the main effects distinct.
+
+The examples below use `--model "$MODEL"`; confirm `echo "$MODEL"` prints the
+model directory before running them.
 
 ```sh
 MODEL="$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"

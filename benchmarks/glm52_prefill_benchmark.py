@@ -1435,6 +1435,12 @@ def main():
     )
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
+    args.model = args.model.strip()
+    if not args.model:
+        parser.error(
+            "--model is empty; set MODEL to your model directory or pass an "
+            "explicit --model /path/to/model value."
+        )
     if args.checkpoint_save_exact is None:
         args.checkpoint_save_exact = (
             "disabled"
