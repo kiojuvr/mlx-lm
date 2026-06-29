@@ -291,6 +291,13 @@ def _prompt_checkpoint_max_age_seconds(args):
     )
 
 
+def _prompt_checkpoint_save_exact_enabled(args):
+    value = getattr(args, "checkpoint_save_exact", "enabled")
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() not in {"0", "false", "no", "off", "disabled"}
+
+
 def _prompt_checkpoint_boundary_store_length(
     token_count,
     *,
@@ -1728,6 +1735,9 @@ class ResponseGenerator:
             checkpoint_frontier_min_tokens, checkpoint_frontier_stride_tokens = (
                 _prompt_checkpoint_continued_frontier_args(self.cli_args)
             )
+            prompt_checkpoint_save_exact = _prompt_checkpoint_save_exact_enabled(
+                self.cli_args
+            )
             prompt_token_count = len(prompt)
             generated_text_parts = []
 
@@ -1752,6 +1762,7 @@ class ResponseGenerator:
                 prompt_checkpoint_initial_cached_tokens=ctx.prompt_cache_count,
                 prompt_checkpoint_store_prefix_lengths=checkpoint_prefix_lengths,
                 prompt_checkpoint_allow_existing_cache=True,
+                prompt_checkpoint_save_exact=prompt_checkpoint_save_exact,
                 prompt_checkpoint_frontier_min_tokens=checkpoint_frontier_min_tokens,
                 prompt_checkpoint_frontier_stride_tokens=(
                     checkpoint_frontier_stride_tokens
@@ -2229,10 +2240,49 @@ class APIHandler(BaseHTTPRequestHandler):
                 ctx.stop()
             return False
 
-        # Keep connection allive during long prompt processing (and also log
-        # the progress)
+        prefill_progress_interval = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "prefill_progress_interval_tokens",
+            0,
+        )
+        prefill_started_at = time.perf_counter()
+        prefill_initial_processed = None
+        prefill_last_logged = None
+
+        # Keep connection alive during long prompt processing (and also log
+        # the progress).
         def keepalive_callback(processed, total):
-            logging.info(f"Prompt processing progress: {processed}/{total}")
+            nonlocal prefill_initial_processed, prefill_last_logged
+            if prefill_initial_processed is None:
+                prefill_initial_processed = processed
+            should_log = (
+                prefill_progress_interval <= 0
+                or prefill_last_logged is None
+                or processed >= total
+                or processed - prefill_last_logged >= prefill_progress_interval
+            )
+            if should_log:
+                elapsed = max(time.perf_counter() - prefill_started_at, 1e-9)
+                cached_tokens = prefill_initial_processed
+                fresh_processed = max(processed - cached_tokens, 0)
+                fresh_total = max(total - cached_tokens, 0)
+                progress_pct = (processed / total * 100.0) if total > 0 else 100.0
+                prefill_tps = fresh_processed / elapsed if fresh_processed else 0.0
+                logging.info(
+                    "Prompt processing progress: processed_tokens=%s "
+                    "total_tokens=%s cached_tokens=%s fresh_processed_tokens=%s "
+                    "fresh_total_tokens=%s progress_pct=%.2f "
+                    "elapsed_seconds=%.3f prefill_tps=%.3f",
+                    processed,
+                    total,
+                    cached_tokens,
+                    fresh_processed,
+                    fresh_total,
+                    progress_pct,
+                    elapsed,
+                    prefill_tps,
+                )
+                prefill_last_logged = processed
             if self.stream:
                 msg = f": keepalive {processed}/{total}\n\n".encode()
                 stream_write(msg)
@@ -2278,6 +2328,12 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        decode_progress_interval = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "decode_progress_interval_tokens",
+            0,
+        )
+        decode_started_at = time.perf_counter()
         loop_guard = TokenLoopGuard(
             self.response_generator.cli_args.loop_guard_ngram_size,
             self.response_generator.cli_args.loop_guard_repeats,
@@ -2303,6 +2359,19 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
+                if (
+                    decode_progress_interval > 0
+                    and len(tokens) % decode_progress_interval == 0
+                ):
+                    elapsed = max(time.perf_counter() - decode_started_at, 1e-9)
+                    logging.info(
+                        "Decode progress: generated_tokens=%s "
+                        "elapsed_seconds=%.3f generation_tps=%.3f state=%s",
+                        len(tokens),
+                        elapsed,
+                        len(tokens) / elapsed,
+                        gen.state,
+                    )
                 if args.logprobs:
                     token_logprobs.append(gen.logprob)
                 if args.top_logprobs > 0:
@@ -3142,6 +3211,24 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--decode-progress-interval-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Log decode progress every N generated tokens. Use 0 to disable "
+            "(default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-progress-interval-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Log prompt prefill progress every N newly processed tokens. "
+            "Use 0 to log every prompt progress callback (default: 0)."
+        ),
+    )
+    parser.add_argument(
         "--loop-guard-repeats",
         type=int,
         default=3,
@@ -3265,6 +3352,23 @@ def setup_arg_parser():
             "within this many seconds. Use 0 to disable age eviction "
             f"(default: {DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS})."
         ),
+    )
+    parser.add_argument(
+        "--checkpoint-save-exact",
+        choices=["enabled", "disabled"],
+        default="enabled",
+        help=(
+            "Save final exact full-prompt checkpoints after prefill. Disable for "
+            "long-running server workloads that only need stable prefix/frontier "
+            "and continued checkpoints (default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--no-save-exact-checkpoint",
+        dest="checkpoint_save_exact",
+        action="store_const",
+        const="disabled",
+        help="Alias for --checkpoint-save-exact disabled.",
     )
     parser.add_argument(
         "--checkpoint-shutdown-save-limit",

@@ -403,11 +403,14 @@ python -m mlx_lm server \
   --checkpoint-boundary-trim-tokens 32 \
   --checkpoint-boundary-align-tokens 2048 \
   --checkpoint-continued-interval-tokens 10000 \
+  --checkpoint-save-exact disabled \
   --checkpoint-shutdown-save-limit 4 \
   --checkpoint-max-age-seconds 0 \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
+  --prefill-progress-interval-tokens 2048 \
+  --decode-progress-interval-tokens 512 \
   --loop-guard-ngram-size 64 \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256
@@ -422,7 +425,11 @@ disable context-aware step shrinking.
 
 The checkpoint defaults above are the current ds4-style policy: save stable
 boundaries rather than unstable tails, round continued checkpoints to a roughly
-10K-token interval, and preserve a few live RAM frontiers on shutdown. Set
+10K-token interval, and preserve a few live RAM frontiers on shutdown. For
+long-running coding-agent sessions, `--checkpoint-save-exact disabled` avoids
+writing large exact full-prompt checkpoints that are often immediately superseded
+by RAM/server cache or pruned by the byte budget. The progress intervals keep
+long prefill/decode phases visible without requiring checkpoint debug logging. Set
 `--checkpoint-max-age-seconds` only after measuring real cache hit windows; the
 default keeps age eviction off and lets file/byte budgets control pruning.
 

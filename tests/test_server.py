@@ -101,6 +101,9 @@ class DummyModelProvider:
                 "loop_guard_ngram_size": 64,
                 "loop_guard_repeats": 3,
                 "loop_guard_min_tokens": 256,
+                "decode_progress_interval_tokens": 0,
+                "prefill_progress_interval_tokens": 0,
+                "checkpoint_save_exact": "enabled",
             },
         )
 
@@ -628,6 +631,9 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.loop_guard_ngram_size, 64)
         self.assertEqual(args.loop_guard_repeats, 3)
         self.assertEqual(args.loop_guard_min_tokens, 256)
+        self.assertEqual(args.decode_progress_interval_tokens, 0)
+        self.assertEqual(args.prefill_progress_interval_tokens, 0)
+        self.assertEqual(args.checkpoint_save_exact, "enabled")
 
     def test_setup_arg_parser_disable_batching(self):
         args = setup_arg_parser().parse_args(["--disable-batching"])
@@ -661,6 +667,8 @@ class TestServerCLI(unittest.TestCase):
                 "8192",
                 "--checkpoint-max-age-seconds",
                 "3600",
+                "--checkpoint-save-exact",
+                "disabled",
                 "--checkpoint-shutdown-save-limit",
                 "2",
             ]
@@ -672,7 +680,13 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.checkpoint_boundary_align_tokens, 1024)
         self.assertEqual(args.checkpoint_continued_interval_tokens, 8192)
         self.assertEqual(args.checkpoint_max_age_seconds, 3600)
+        self.assertEqual(args.checkpoint_save_exact, "disabled")
         self.assertEqual(args.checkpoint_shutdown_save_limit, 2)
+
+    def test_setup_arg_parser_no_save_exact_checkpoint_alias(self):
+        args = setup_arg_parser().parse_args(["--no-save-exact-checkpoint"])
+
+        self.assertEqual(args.checkpoint_save_exact, "disabled")
 
     def test_configure_checkpoint_cache_dir_sets_env(self):
         old_value = os.environ.get(PROMPT_CHECKPOINT_CACHE_DIR_ENV)
@@ -699,6 +713,10 @@ class TestServerCLI(unittest.TestCase):
             [
                 "--loop-guard-ngram-size",
                 "32",
+                "--decode-progress-interval-tokens",
+                "256",
+                "--prefill-progress-interval-tokens",
+                "2048",
                 "--loop-guard-repeats",
                 "4",
                 "--loop-guard-min-tokens",
@@ -707,6 +725,8 @@ class TestServerCLI(unittest.TestCase):
         )
 
         self.assertEqual(args.loop_guard_ngram_size, 32)
+        self.assertEqual(args.decode_progress_interval_tokens, 256)
+        self.assertEqual(args.prefill_progress_interval_tokens, 2048)
         self.assertEqual(args.loop_guard_repeats, 4)
         self.assertEqual(args.loop_guard_min_tokens, 128)
 
@@ -762,6 +782,7 @@ class TestServerCLI(unittest.TestCase):
             checkpoint_continued_interval_tokens=(
                 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
             ),
+            checkpoint_save_exact="disabled",
             kv_bits=8,
             kv_group_size=64,
             quantized_kv_start=4096,
@@ -865,6 +886,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 2)
         self.assertEqual(captured["prompt_checkpoint_store_prefix_lengths"], [3])
         self.assertTrue(captured["prompt_checkpoint_allow_existing_cache"])
+        self.assertFalse(captured["prompt_checkpoint_save_exact"])
         self.assertEqual(captured["prompt_checkpoint_frontier_min_tokens"], 10_240)
         self.assertEqual(captured["prompt_checkpoint_frontier_stride_tokens"], 10_240)
         self.assertEqual(captured["prefill_max_qk_tokens"], 67_108_864)
