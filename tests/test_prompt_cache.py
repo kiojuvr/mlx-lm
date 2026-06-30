@@ -250,7 +250,7 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         budget = prompt_checkpoint_budget_from_env()
 
         self.assertEqual(budget["max_bytes"], DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES)
-        self.assertEqual(DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES, 1024**4)
+        self.assertEqual(DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES, 256 * 1024**3)
 
     def test_prompt_checkpoint_budget_parses_size_suffixes(self):
         self._set_env(PROMPT_CHECKPOINT_MAX_BYTES_ENV, "2GiB")
