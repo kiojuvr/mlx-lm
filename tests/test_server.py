@@ -32,6 +32,7 @@ from mlx_lm.server import (
     _prompt_checkpoint_boundary_store_length,
     _prompt_checkpoint_continued_frontier_args,
     _prompt_checkpoint_continued_store_length,
+    _prompt_checkpoint_save_exact_for_prompt,
     _prompt_checkpoint_store_prefix_lengths,
     _process_control_tokens,
     configure_checkpoint_cache_dir,
@@ -335,6 +336,26 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(_prompt_checkpoint_continued_store_length(args, 8), 8)
         self.assertEqual(_prompt_checkpoint_continued_store_length(args, 15), 8)
         self.assertEqual(_prompt_checkpoint_continued_store_length(args, 16), 16)
+
+    def test_save_exact_prompt_policy_respects_cold_max(self):
+        args = self._args(checkpoint_cold_max_tokens=30_000)
+
+        self.assertTrue(_prompt_checkpoint_save_exact_for_prompt(args, 30_000))
+        self.assertFalse(_prompt_checkpoint_save_exact_for_prompt(args, 30_001))
+
+    def test_save_exact_prompt_policy_can_be_disabled_or_unbounded(self):
+        self.assertFalse(
+            _prompt_checkpoint_save_exact_for_prompt(
+                self._args(checkpoint_save_exact="disabled"),
+                1_000,
+            )
+        )
+        self.assertTrue(
+            _prompt_checkpoint_save_exact_for_prompt(
+                self._args(checkpoint_cold_max_tokens=0),
+                200_000,
+            )
+        )
 
     def test_save_continued_prompt_checkpoint_trims_and_records_metadata(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)

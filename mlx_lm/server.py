@@ -298,6 +298,21 @@ def _prompt_checkpoint_save_exact_enabled(args):
     return str(value).lower() not in {"0", "false", "no", "off", "disabled"}
 
 
+def _prompt_checkpoint_save_exact_for_prompt(args, token_count):
+    if not _prompt_checkpoint_save_exact_enabled(args):
+        return False
+    cold_max_tokens = _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_cold_max_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+    )
+    try:
+        token_count = max(0, int(token_count))
+    except (TypeError, ValueError):
+        return False
+    return cold_max_tokens <= 0 or token_count <= cold_max_tokens
+
+
 def _prompt_checkpoint_boundary_store_length(
     token_count,
     *,
@@ -1786,10 +1801,11 @@ class ResponseGenerator:
             checkpoint_frontier_min_tokens, checkpoint_frontier_stride_tokens = (
                 _prompt_checkpoint_continued_frontier_args(self.cli_args)
             )
-            prompt_checkpoint_save_exact = _prompt_checkpoint_save_exact_enabled(
-                self.cli_args
-            )
             prompt_token_count = len(prompt)
+            prompt_checkpoint_save_exact = _prompt_checkpoint_save_exact_for_prompt(
+                self.cli_args,
+                prompt_token_count,
+            )
             generated_text_parts = []
 
             # Process the prompt and generate tokens
