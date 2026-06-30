@@ -57,8 +57,9 @@ python -m mlx_lm server \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
-  --prefill-step-size 1024 \
+  --prefill-step-size 2048 \
   --prefill-max-qk-tokens 67108864 \
+  --glm-dsa-adaptive-prefill-step-size 0 \
   --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
@@ -76,7 +77,7 @@ Do not pass `--model-name` for this OpenCode setup unless you have explicitly ve
 
 `--kv-bits 8` is not a prefill-compute speedup by itself. Its value is that GLM MLA int8 KV cache reduces long-context KV memory and keeps 200K+ prompts inside the intended memory envelope.
 
-Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that writes and reuses disk prompt checkpoints, including frontier checkpoints. `--prefill-step-size 1024` is the safer long-context default, while `--prefill-max-qk-tokens 67108864` shrinks only the chunks whose query-by-context product would get too large. Try `--prefill-step-size 2048` only after checking peak memory and Metal stability on your real prompt distribution. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery still appears, retry with `--prefill-step-size 512`.
+Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that writes and reuses disk prompt checkpoints, including frontier checkpoints. The measured cold-prefill sweep favored `--prefill-step-size 2048`, `--prefill-max-qk-tokens 67108864`, and adaptive GLM DSA prefill disabled (`--glm-dsa-adaptive-prefill-step-size 0`). The QK cap shrinks only the chunks whose query-by-context product would get too large. Keep `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` at its default/effective 131072 handoff for now; lowering the sparse handoff threshold increased runtime and memory in the tested 128K runs. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery or memory pressure appears on your real prompt distribution, retry with `--prefill-step-size 1024` first, then 512.
 
 For shorter mixed workloads where throughput matters more than per-request TTFT
 and disk frontier checkpoints are less important, continuous batching can still
