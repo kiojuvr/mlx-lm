@@ -970,6 +970,7 @@ class ResponseGenerator:
 
         candidates, _ = find_prompt_checkpoint_rendered_prefix(
             rendered,
+            allowed_kinds=("prefix", "frontier", "continued", "exact"),
             return_stats=True,
         )
         _prompt_checkpoint_debug(
@@ -980,16 +981,17 @@ class ResponseGenerator:
         for rendered_prefix_length, token_prefix_length, checkpoint_path, kind in (
             candidates
         ):
-            if kind not in ("prefix", "frontier", "continued"):
-                continue
-            try:
-                rendered_suffix = rendered[rendered_prefix_length:].decode("utf-8")
-            except UnicodeDecodeError:
+            if kind not in ("prefix", "frontier", "continued", "exact"):
                 continue
 
+            checkpoint_cache_token_length = (
+                max(token_prefix_length - 1, 0)
+                if kind == "exact"
+                else token_prefix_length
+            )
             expected_quantization = expected_glm_mla_kv_quantization_metadata(
                 self.model_provider.model,
-                cache_token_length=token_prefix_length,
+                cache_token_length=checkpoint_cache_token_length,
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
@@ -1019,21 +1021,69 @@ class ResponseGenerator:
                 )
                 continue
             checkpoint_label = metadata.get("checkpoint_label", kind)
-            if checkpoint_label not in ("prefix", "frontier", "continued"):
+            if checkpoint_label not in ("prefix", "frontier", "continued", "exact"):
                 continue
-            try:
-                decoded_prefix = self._decode_checkpoint_tokens_bytes(
-                    tokenizer,
-                    prefix_tokens,
-                )
-            except Exception:
-                decoded_prefix = None
-            if decoded_prefix != rendered[:rendered_prefix_length]:
+            if kind == "exact" and checkpoint_label != "exact":
                 _prompt_checkpoint_debug(
-                    "rendered candidate rejected prefix decode mismatch "
+                    "rendered candidate rejected label mismatch "
+                    f"file={os.path.basename(checkpoint_path)} "
+                    f"manifest_kind={kind} "
+                    f"checkpoint_label={checkpoint_label}"
+                )
+                continue
+
+            stored_prefix_tokens = prefix_tokens
+            if checkpoint_label == "exact":
+                if len(stored_prefix_tokens) <= 1:
+                    _prompt_checkpoint_debug(
+                        "rendered candidate rejected exact too short "
+                        f"file={os.path.basename(checkpoint_path)} "
+                        f"prefix_tokens={len(stored_prefix_tokens)}"
+                    )
+                    continue
+                prefix_tokens = stored_prefix_tokens[:-1]
+                try:
+                    decoded_prefix = self._decode_checkpoint_tokens_bytes(
+                        tokenizer,
+                        prefix_tokens,
+                    )
+                except Exception:
+                    decoded_prefix = None
+                if not decoded_prefix or not rendered.startswith(decoded_prefix):
+                    _prompt_checkpoint_debug(
+                        "rendered candidate rejected exact prefix decode mismatch "
+                        f"file={os.path.basename(checkpoint_path)} "
+                        f"stored_prefix_tokens={len(stored_prefix_tokens)} "
+                        f"cached_tokens={len(prefix_tokens)}"
+                    )
+                    continue
+                rendered_prefix_length = len(decoded_prefix)
+            else:
+                try:
+                    decoded_prefix = self._decode_checkpoint_tokens_bytes(
+                        tokenizer,
+                        prefix_tokens,
+                    )
+                except Exception:
+                    decoded_prefix = None
+                if decoded_prefix != rendered[:rendered_prefix_length]:
+                    _prompt_checkpoint_debug(
+                        "rendered candidate rejected prefix decode mismatch "
+                        f"file={os.path.basename(checkpoint_path)} "
+                        f"kind={checkpoint_label} "
+                        f"prefix_tokens={len(prefix_tokens)} "
+                        f"rendered_prefix_bytes={rendered_prefix_length}"
+                    )
+                    continue
+
+            rendered_suffix_bytes = rendered[rendered_prefix_length:]
+            try:
+                rendered_suffix = rendered_suffix_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                _prompt_checkpoint_debug(
+                    "rendered candidate rejected suffix utf8 mismatch "
                     f"file={os.path.basename(checkpoint_path)} "
                     f"kind={checkpoint_label} "
-                    f"prefix_tokens={len(prefix_tokens)} "
                     f"rendered_prefix_bytes={rendered_prefix_length}"
                 )
                 continue
@@ -1057,7 +1107,7 @@ class ResponseGenerator:
             try:
                 update_prompt_checkpoint_manifest(
                     checkpoint_path,
-                    prefix_length=len(prefix_tokens),
+                    prefix_length=len(stored_prefix_tokens),
                     kind=checkpoint_label,
                     metadata=metadata,
                     hit=True,
@@ -1068,7 +1118,8 @@ class ResponseGenerator:
                 "rendered hit "
                 f"file={os.path.basename(checkpoint_path)} "
                 f"kind={checkpoint_label} "
-                f"prefix_tokens={len(prefix_tokens)} "
+                f"stored_prefix_tokens={len(stored_prefix_tokens)} "
+                f"cached_tokens={len(prefix_tokens)} "
                 f"suffix_tokens={len(suffix_tokens)} "
                 f"rendered_prefix_bytes={rendered_prefix_length}"
             )

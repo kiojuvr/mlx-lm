@@ -517,6 +517,44 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         arguments = request.messages[1]["tool_calls"][0]["function"]["arguments"]
         self.assertEqual(arguments, {"query": "prefill"})
 
+    def test_rendered_checkpoint_uses_exact_as_cached_prefix(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0),
+        )
+        tokenizer = types.SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [ord(ch) for ch in text],
+            decode=lambda tokens, **kwargs: "".join(chr(token) for token in tokens),
+        )
+
+        with mock.patch(
+            "mlx_lm.server.find_prompt_checkpoint_rendered_prefix",
+            return_value=([(3, 3, "/tmp/exact.safetensors", "exact")], {}),
+        ) as find_rendered, mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint_with_metadata_prefix",
+            return_value=(
+                ["cache"],
+                [ord("a"), ord("b"), ord("c")],
+                {"checkpoint_label": "exact"},
+            ),
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest:
+            result = generator._load_rendered_prompt_checkpoint(tokenizer, "abcXYZ")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "exact")
+        self.assertEqual(result.prefix_tokens, [ord("a"), ord("b")])
+        self.assertEqual(result.suffix_tokens, [ord(ch) for ch in "cXYZ"])
+        self.assertEqual(result.cached_tokens, 2)
+        self.assertEqual(result.prompt, [ord(ch) for ch in "abcXYZ"])
+        self.assertIn("exact", find_rendered.call_args.kwargs["allowed_kinds"])
+        update_manifest.assert_called_once()
+        self.assertEqual(update_manifest.call_args.kwargs["prefix_length"], 3)
+        self.assertEqual(update_manifest.call_args.kwargs["kind"], "exact")
+
     def test_rendered_checkpoint_rejects_prefix_decode_mismatch(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
