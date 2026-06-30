@@ -62,6 +62,7 @@ python -m mlx_lm server \
   --glm-dsa-adaptive-prefill-step-size 0 \
   --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
   --checkpoint-save-exact disabled \
+  --request-max-tokens-floor 384000 \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
@@ -71,6 +72,11 @@ python -m mlx_lm server \
 ```
 
 Do not pass `--model-name` for this OpenCode setup unless you have explicitly verified that you need request-facing model-name aliasing. The normal single-model local server workflow loads the model from `--model` and serves OpenCode requests through `/v1/chat/completions`.
+
+OpenCode may still send a conservative `max_tokens` value such as 32000 even
+when `limit.output` is set higher. `--request-max-tokens-floor 384000` raises
+that request cap on the server side so long coding-agent turns are not cut off
+early with `finish_reason=length`.
 
 `--temp 0.4` and `--top-p 0.95` are recommended as conservative default sampling settings for coding-agent and long-context workflows. In local use, lower-temperature sampling helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
 

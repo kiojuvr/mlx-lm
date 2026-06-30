@@ -46,6 +46,7 @@ from mlx_lm.server import (
     _prompt_checkpoint_save_exact_for_prompt,
     _prompt_checkpoint_store_prefix_lengths,
     _process_control_tokens,
+    _resolve_request_max_tokens,
     configure_checkpoint_cache_dir,
     setup_arg_parser,
 )
@@ -77,6 +78,7 @@ class DummyModelProvider:
                 "top_k": 0,
                 "min_p": 0.0,
                 "max_tokens": 512,
+                "request_max_tokens_floor": 0,
                 "chat_template_args": {},
                 "model": None,
                 "decode_concurrency": 32,
@@ -828,6 +830,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.loop_guard_min_tokens, 256)
         self.assertEqual(args.decode_progress_interval_tokens, 0)
         self.assertEqual(args.prefill_progress_interval_tokens, 0)
+        self.assertEqual(args.request_max_tokens_floor, 0)
         self.assertEqual(args.checkpoint_save_exact, "enabled")
 
     def test_setup_arg_parser_disable_batching(self):
@@ -839,6 +842,45 @@ class TestServerCLI(unittest.TestCase):
         args = setup_arg_parser().parse_args(["--prefill-max-qk-tokens", "0"])
 
         self.assertEqual(args.prefill_max_qk_tokens, 0)
+
+    def test_setup_arg_parser_request_max_tokens_floor(self):
+        args = setup_arg_parser().parse_args(
+            ["--request-max-tokens-floor", "384000"]
+        )
+
+        self.assertEqual(args.request_max_tokens_floor, 384000)
+
+    def test_resolve_request_max_tokens_honors_client_by_default(self):
+        cli_args = types.SimpleNamespace(
+            max_tokens=512,
+            request_max_tokens_floor=0,
+        )
+
+        max_tokens, source, requested, floor_applied = _resolve_request_max_tokens(
+            {"max_tokens": 32000},
+            cli_args,
+        )
+
+        self.assertEqual(max_tokens, 32000)
+        self.assertEqual(source, "max_tokens")
+        self.assertEqual(requested, 32000)
+        self.assertFalse(floor_applied)
+
+    def test_resolve_request_max_tokens_applies_floor(self):
+        cli_args = types.SimpleNamespace(
+            max_tokens=512,
+            request_max_tokens_floor=384000,
+        )
+
+        max_tokens, source, requested, floor_applied = _resolve_request_max_tokens(
+            {"max_tokens": 32000},
+            cli_args,
+        )
+
+        self.assertEqual(max_tokens, 384000)
+        self.assertEqual(source, "max_tokens")
+        self.assertEqual(requested, 32000)
+        self.assertTrue(floor_applied)
 
     def test_setup_arg_parser_glm_dsa_adaptive_prefill_options(self):
         args = setup_arg_parser().parse_args(

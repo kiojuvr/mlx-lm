@@ -265,6 +265,25 @@ class GenerationContext:
         self._should_stop = True
 
 
+def _resolve_request_max_tokens(body, cli_args):
+    if body.get("max_completion_tokens", None) is not None:
+        max_tokens = body["max_completion_tokens"]
+        max_tokens_source = "max_completion_tokens"
+    elif "max_tokens" in body:
+        max_tokens = body["max_tokens"]
+        max_tokens_source = "max_tokens"
+    else:
+        max_tokens = cli_args.max_tokens
+        max_tokens_source = "cli_default"
+
+    requested_max_tokens = max_tokens
+    floor = getattr(cli_args, "request_max_tokens_floor", 0) or 0
+    floor_applied = isinstance(max_tokens, int) and floor > 0 and max_tokens < floor
+    if floor_applied:
+        max_tokens = floor
+    return max_tokens, max_tokens_source, requested_max_tokens, floor_applied
+
+
 @dataclass
 class RenderedPromptCheckpoint:
     prompt_cache: List[Any]
@@ -2353,15 +2372,15 @@ class APIHandler(BaseHTTPRequestHandler):
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
         )
         self.adapter = self.body.get("adapters", None)
-        self.max_tokens = self.body.get("max_completion_tokens", None)
-        self.max_tokens_source = "max_completion_tokens"
-        if self.max_tokens is None:
-            if "max_tokens" in self.body:
-                self.max_tokens = self.body["max_tokens"]
-                self.max_tokens_source = "max_tokens"
-            else:
-                self.max_tokens = self.response_generator.cli_args.max_tokens
-                self.max_tokens_source = "cli_default"
+        (
+            self.max_tokens,
+            self.max_tokens_source,
+            self.requested_max_tokens,
+            self.max_tokens_floor_applied,
+        ) = _resolve_request_max_tokens(
+            self.body,
+            self.response_generator.cli_args,
+        )
         self.temperature = self.body.get(
             "temperature", self.response_generator.cli_args.temp
         )
@@ -2384,12 +2403,15 @@ class APIHandler(BaseHTTPRequestHandler):
         self.validate_model_parameters()
         logging.info(
             "request parameters: path=%s stream=%s model=%s "
-            "max_tokens=%s max_tokens_source=%s temperature=%s top_p=%s",
+            "max_tokens=%s requested_max_tokens=%s max_tokens_source=%s "
+            "max_tokens_floor_applied=%s temperature=%s top_p=%s",
             self.path,
             self.stream,
             self.requested_model,
             self.max_tokens,
+            self.requested_max_tokens,
             self.max_tokens_source,
+            self.max_tokens_floor_applied,
             self.temperature,
             self.top_p,
         )
@@ -2805,6 +2827,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "completion finished: request_id=%s prompt_tokens=%s "
                 "generated_tokens=%s finish_reason=%s stream=%s "
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
+                "requested_max_tokens=%s max_tokens_floor_applied=%s "
                 "made_tool_call=%s",
                 self.request_id,
                 len(ctx.prompt),
@@ -2814,6 +2837,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 client_connected,
                 self.max_tokens,
                 self.max_tokens_source,
+                self.requested_max_tokens,
+                self.max_tokens_floor_applied,
                 made_tool_call,
             )
 
@@ -3178,6 +3203,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "responses completion finished: request_id=%s prompt_tokens=%s "
                 "generated_tokens=%s finish_reason=%s stream=%s "
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
+                "requested_max_tokens=%s max_tokens_floor_applied=%s "
                 "made_tool_call=%s",
                 self.request_id,
                 len(ctx.prompt),
@@ -3187,6 +3213,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 client_connected,
                 self.max_tokens,
                 self.max_tokens_source,
+                self.requested_max_tokens,
+                self.max_tokens_floor_applied,
                 made_tool_call,
             )
         finally:
@@ -3615,6 +3643,15 @@ def setup_arg_parser():
         type=int,
         default=512,
         help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--request-max-tokens-floor",
+        type=int,
+        default=0,
+        help=(
+            "Raise request max_tokens/max_completion_tokens below this value "
+            "to the floor. Use 0 to honor client limits (default: 0)."
+        ),
     )
     parser.add_argument(
         "--loop-guard-ngram-size",
