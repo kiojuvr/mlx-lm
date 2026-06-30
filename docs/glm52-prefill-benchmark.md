@@ -75,8 +75,10 @@ The implementation order is intentionally conservative:
   output back to value-head space.
 
 The fast path is on by default, but it waits until the effective context reaches
-`MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072) before using exact
-sparse attention. This keeps short and early prefill chunks on the faster
+one token below `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072)
+before using exact sparse attention. Generation prefill leaves the final prompt
+token for logits, so a 131072-token prompt can expose at most 131071 tokens to
+the attention call. This keeps short and early prefill chunks on the faster
 dense fallback while retaining the memory-bounded sparse path for longer
 contexts. Disable it only for short-context comparison runs with:
 

@@ -587,6 +587,19 @@ class TestModels(unittest.TestCase):
         finally:
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_sparse_prefill_min_context_allows_prompt_tail(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_key = glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "8"
+            self.assertFalse(glm_moe_dsa._sparse_prefill_context_ready(6))
+            self.assertTrue(glm_moe_dsa._sparse_prefill_context_ready(7))
+            self.assertTrue(glm_moe_dsa._sparse_prefill_context_ready(8))
+        finally:
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_sparse_prefill_needs_full_topk_causal_prefix(self):
         from mlx_lm.models import glm_moe_dsa
 

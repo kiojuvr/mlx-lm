@@ -104,6 +104,16 @@ def _sparse_prefill_min_context_length() -> int:
     return _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT
 
 
+def _sparse_prefill_min_effective_context_length() -> int:
+    # Generation prefill leaves the final prompt token for logits, so a nominal
+    # N-token prompt can expose at most N-1 tokens to the attention call.
+    return max(0, _sparse_prefill_min_context_length() - 1)
+
+
+def _sparse_prefill_context_ready(context_length: int) -> bool:
+    return context_length >= _sparse_prefill_min_effective_context_length()
+
+
 def _new_profile():
     return {
         "stages": {
@@ -389,7 +399,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             _fast_prefill_enabled()
             and b == 1
             and s > 1
-            and k.shape[2] >= _sparse_prefill_min_context_length()
+            and _sparse_prefill_context_ready(k.shape[2])
         ):
             return self._block_indexer_topk(q, x, k, mask)
         return self._dense_indexer_topk(q, x, k, mask)
@@ -534,7 +544,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "empty_topk"
         if K > k_pe.shape[2]:
             return False, "topk_exceeds_context"
-        if k_pe.shape[2] < _sparse_prefill_min_context_length():
+        if not _sparse_prefill_context_ready(k_pe.shape[2]):
             return False, "below_sparse_min_context"
         if not _has_full_topk_causal_prefix(k_pe.shape[2], L, K):
             return False, "causal_prefix_shorter_than_topk"
