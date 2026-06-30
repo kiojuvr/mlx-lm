@@ -175,10 +175,15 @@ def prefill_sweep_candidates(args):
     step_values = args.prefill_step_candidates or [512, 1024, 2048]
     qk_values = args.prefill_max_qk_token_candidates or [args.prefill_max_qk_tokens]
     adaptive_values = args.glm_dsa_adaptive_prefill_step_candidates
+    min_context_values = getattr(args, "fast_prefill_min_context_candidates", None)
+    if min_context_values is None:
+        min_context_values = [getattr(args, "fast_prefill_min_context", None)]
     if not step_values:
         raise ValueError("prefill step candidates must not be empty")
     if not qk_values:
         raise ValueError("prefill max-qk candidates must not be empty")
+    if not min_context_values:
+        raise ValueError("fast prefill min-context candidates must not be empty")
     if adaptive_values is None:
         adaptive_values = [0]
         if max(step_values) < 8192:
@@ -199,24 +204,40 @@ def prefill_sweep_candidates(args):
                     raise ValueError(
                         "GLM DSA adaptive prefill step candidates must be non-negative"
                     )
-                key = (step_size, max_qk_tokens, adaptive_step_size)
-                if key in seen:
-                    continue
-                seen.add(key)
-                qk_label = "qk-off" if max_qk_tokens == 0 else f"qk-{max_qk_tokens}"
-                adaptive_label = (
-                    "adaptive-off"
-                    if adaptive_step_size == 0
-                    else f"adaptive-{adaptive_step_size}"
-                )
-                candidates.append(
-                    {
-                        "name": f"step-{step_size}-{qk_label}-{adaptive_label}",
-                        "prefill_step_size": step_size,
-                        "prefill_max_qk_tokens": max_qk_tokens,
-                        "glm_dsa_adaptive_prefill_step_size": adaptive_step_size,
-                    }
-                )
+                for min_context in min_context_values:
+                    if min_context is not None and min_context < 0:
+                        raise ValueError(
+                            "fast prefill min-context candidates must be non-negative"
+                        )
+                    key = (step_size, max_qk_tokens, adaptive_step_size, min_context)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    qk_label = (
+                        "qk-off" if max_qk_tokens == 0 else f"qk-{max_qk_tokens}"
+                    )
+                    adaptive_label = (
+                        "adaptive-off"
+                        if adaptive_step_size == 0
+                        else f"adaptive-{adaptive_step_size}"
+                    )
+                    min_context_label = (
+                        "minctx-default"
+                        if min_context is None
+                        else f"minctx-{min_context}"
+                    )
+                    candidates.append(
+                        {
+                            "name": (
+                                f"step-{step_size}-{qk_label}-{adaptive_label}-"
+                                f"{min_context_label}"
+                            ),
+                            "prefill_step_size": step_size,
+                            "prefill_max_qk_tokens": max_qk_tokens,
+                            "glm_dsa_adaptive_prefill_step_size": adaptive_step_size,
+                            "fast_prefill_min_context": min_context,
+                        }
+                    )
     return candidates
 
 
@@ -791,6 +812,7 @@ def print_table(rows, output_format):
         "prefill_sweep_name",
         "prefill_sweep_candidate_index",
         "prefill_sweep_use_checkpoints",
+        "prefill_sweep_fast_prefill_min_context",
         "batch_size",
         "prefill_batch_size",
         "completion_batch_size",
@@ -891,6 +913,16 @@ def write_partial_prefill_sweep_output(args, rows):
     json_output = getattr(args, "json_output", None)
     if json_output:
         write_json_output(partial_json_output_path(json_output), rows, partial=True)
+
+
+def set_sparse_prefill_min_context_env(value, fallback_env_value=None):
+    env_key = glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+    if value is not None:
+        os.environ[env_key] = str(value)
+    elif fallback_env_value is None:
+        os.environ.pop(env_key, None)
+    else:
+        os.environ[env_key] = fallback_env_value
 
 
 def configure_checkpoint_cache_dir(args):
@@ -1196,6 +1228,10 @@ def run_prefill_sweep(model, tokenizer, args):
     old_prefill_step_size = args.prefill_step_size
     old_prefill_max_qk_tokens = args.prefill_max_qk_tokens
     old_adaptive_step_size = args.glm_dsa_adaptive_prefill_step_size
+    old_fast_prefill_min_context = getattr(args, "fast_prefill_min_context", None)
+    old_sparse_prefill_min_context_env = os.environ.get(
+        glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+    )
     old_no_prompt_checkpoint = args.no_prompt_checkpoint
     old_checkpoint_save_exact = args.checkpoint_save_exact
     args.no_prompt_checkpoint = not args.prefill_sweep_use_checkpoints
@@ -1211,6 +1247,11 @@ def run_prefill_sweep(model, tokenizer, args):
                 args.glm_dsa_adaptive_prefill_step_size = candidate[
                     "glm_dsa_adaptive_prefill_step_size"
                 ]
+                args.fast_prefill_min_context = candidate["fast_prefill_min_context"]
+                set_sparse_prefill_min_context_env(
+                    args.fast_prefill_min_context,
+                    old_sparse_prefill_min_context_env,
+                )
                 case_name = f"prefill-sweep-{prompt_label}-{candidate['name']}"
                 for _run in range(args.repeat_runs):
                     row = run_once(model, tokenizer, prompt_text, args, case_name)
@@ -1222,6 +1263,9 @@ def run_prefill_sweep(model, tokenizer, args):
                             "prefill_sweep_use_checkpoints": (
                                 args.prefill_sweep_use_checkpoints
                             ),
+                            "prefill_sweep_fast_prefill_min_context": (
+                                args.fast_prefill_min_context
+                            ),
                         }
                     )
                     rows.append(row)
@@ -1232,6 +1276,11 @@ def run_prefill_sweep(model, tokenizer, args):
         args.prefill_step_size = old_prefill_step_size
         args.prefill_max_qk_tokens = old_prefill_max_qk_tokens
         args.glm_dsa_adaptive_prefill_step_size = old_adaptive_step_size
+        args.fast_prefill_min_context = old_fast_prefill_min_context
+        set_sparse_prefill_min_context_env(
+            old_fast_prefill_min_context,
+            old_sparse_prefill_min_context_env,
+        )
         args.no_prompt_checkpoint = old_no_prompt_checkpoint
         args.checkpoint_save_exact = old_checkpoint_save_exact
 
@@ -1329,6 +1378,15 @@ def main():
         help=(
             "Comma-separated adaptive GLM DSA step candidates for "
             "--mode prefill-sweep. Use 0 to disable. Defaults to 0,8192."
+        ),
+    )
+    parser.add_argument(
+        "--fast-prefill-min-context-candidates",
+        type=parse_lengths,
+        help=(
+            "Comma-separated GLM DSA sparse prefill handoff thresholds for "
+            "--mode prefill-sweep. When omitted, --fast-prefill-min-context "
+            "or the current environment/default is used."
         ),
     )
     parser.add_argument(

@@ -252,6 +252,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             prefill_max_qk_token_candidates=None,
             prefill_max_qk_tokens=67_108_864,
             glm_dsa_adaptive_prefill_step_candidates=None,
+            fast_prefill_min_context=None,
+            fast_prefill_min_context_candidates=None,
         )
 
         candidates = benchmark.prefill_sweep_candidates(args)
@@ -260,6 +262,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(candidates[0]["prefill_step_size"], 512)
         self.assertEqual(candidates[0]["prefill_max_qk_tokens"], 67_108_864)
         self.assertEqual(candidates[0]["glm_dsa_adaptive_prefill_step_size"], 0)
+        self.assertIsNone(candidates[0]["fast_prefill_min_context"])
         self.assertEqual(candidates[1]["glm_dsa_adaptive_prefill_step_size"], 8192)
 
     def test_prefill_sweep_disables_checkpoints_by_default(self):
@@ -278,6 +281,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             prefill_sweep_use_checkpoints=False,
             target_tokens=None,
             json_output=None,
+            fast_prefill_min_context=None,
+            fast_prefill_min_context_candidates=None,
         )
         old_build_prompt_text = benchmark.build_prompt_text
         old_run_once = benchmark.run_once
@@ -293,6 +298,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "step": call_args.prefill_step_size,
                     "qk": call_args.prefill_max_qk_tokens,
                     "adaptive": call_args.glm_dsa_adaptive_prefill_step_size,
+                    "min_context": call_args.fast_prefill_min_context,
                     "no_checkpoint": call_args.no_prompt_checkpoint,
                     "save_exact": call_args.checkpoint_save_exact,
                 }
@@ -312,8 +318,67 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertTrue(all(call["save_exact"] == "disabled" for call in calls))
         self.assertEqual(calls[0]["step"], 512)
         self.assertEqual(calls[1]["adaptive"], 8192)
+        self.assertIsNone(calls[0]["min_context"])
         self.assertEqual(rows[0]["mode"], "prefill-sweep")
         self.assertEqual(rows[0]["prefill_sweep_candidate_index"], 0)
+
+    def test_prefill_sweep_sweeps_fast_prefill_min_context(self):
+        args = Namespace(
+            prompt_file=None,
+            lengths="8",
+            repeat_runs=1,
+            prefill_step_candidates=[2048],
+            prefill_max_qk_token_candidates=[67_108_864],
+            prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_candidates=[0],
+            glm_dsa_adaptive_prefill_step_size=0,
+            prefill_step_size=2048,
+            no_prompt_checkpoint=False,
+            checkpoint_save_exact="enabled",
+            prefill_sweep_use_checkpoints=False,
+            target_tokens=None,
+            json_output=None,
+            fast_prefill_min_context=None,
+            fast_prefill_min_context_candidates=[98_304, 131_072],
+        )
+        env_key = benchmark.glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+        saved_env = os.environ.get(env_key)
+        old_build_prompt_text = benchmark.build_prompt_text
+        old_run_once = benchmark.run_once
+        calls = []
+
+        def fake_build_prompt_text(_tokenizer, target_tokens, prefix_text=""):
+            return f"prompt-{target_tokens}-{prefix_text}"
+
+        def fake_run_once(_model, _tokenizer, _prompt, call_args, case_name):
+            calls.append(
+                {
+                    "case": case_name,
+                    "min_context": call_args.fast_prefill_min_context,
+                    "env": os.environ.get(env_key),
+                }
+            )
+            return {"case": case_name, "mode": "single"}
+
+        try:
+            os.environ[env_key] = "999"
+            benchmark.build_prompt_text = fake_build_prompt_text
+            benchmark.run_once = fake_run_once
+            rows = benchmark.run_prefill_sweep(None, None, args)
+            restored_env = os.environ.get(env_key)
+        finally:
+            benchmark.build_prompt_text = old_build_prompt_text
+            benchmark.run_once = old_run_once
+            if saved_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = saved_env
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([call["min_context"] for call in calls], [98_304, 131_072])
+        self.assertEqual([call["env"] for call in calls], ["98304", "131072"])
+        self.assertEqual(restored_env, "999")
+        self.assertEqual(rows[0]["prefill_sweep_fast_prefill_min_context"], 98_304)
 
     def test_prefill_sweep_writes_partial_json_output(self):
         old_build_prompt_text = benchmark.build_prompt_text
@@ -347,6 +412,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 prefill_sweep_use_checkpoints=False,
                 target_tokens=None,
                 json_output=json_output,
+                fast_prefill_min_context=None,
+                fast_prefill_min_context_candidates=None,
             )
             benchmark.build_prompt_text = fake_build_prompt_text
             benchmark.run_once = fake_run_once
