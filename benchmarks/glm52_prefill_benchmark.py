@@ -54,6 +54,15 @@ class CheckpointLogCapture(logging.Handler):
             self.messages.append(message)
 
 
+class PrefillBenchmarkStop(Exception):
+    def __init__(self, processed_tokens, total_tokens):
+        super().__init__(
+            f"prefill stopped after {processed_tokens}/{total_tokens} tokens"
+        )
+        self.processed_tokens = processed_tokens
+        self.total_tokens = total_tokens
+
+
 def parse_lengths(value):
     return [int(v.strip()) for v in value.split(",") if v.strip()]
 
@@ -433,6 +442,7 @@ def run_once(model, tokenizer, prompt, args, case_name):
     tokenize_seconds = time.perf_counter() - tokenize_t0
 
     progress_events = []
+    prefill_stop_after_tokens = getattr(args, "prefill_stop_after_tokens", None)
     capture = CheckpointLogCapture()
     logger = logging.getLogger("mlx_lm.generate")
     old_level = logger.level
@@ -448,45 +458,61 @@ def run_once(model, tokenizer, prompt, args, case_name):
     reset_glm_dsa_profile()
     prefill_config = prefill_config_summary(args)
 
+    def on_prompt_progress(done, total):
+        progress_events.append((done, total, time.perf_counter()))
+        if (
+            prefill_stop_after_tokens is not None
+            and done >= prefill_stop_after_tokens
+            and done < total
+        ):
+            raise PrefillBenchmarkStop(done, total)
+
     ttft_t0 = time.perf_counter()
     response = None
+    prefill_stop = None
     try:
-        for response in stream_generate(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=tokens,
-            max_tokens=args.max_tokens,
-            prefill_step_size=args.prefill_step_size,
-            prefill_max_qk_tokens=prefill_config["prefill_max_qk_tokens"],
-            glm_dsa_adaptive_prefill_step_size=(
-                prefill_config["glm_dsa_adaptive_prefill_step_size"]
-            ),
-            glm_dsa_adaptive_prefill_after_tokens=(
-                prefill_config["glm_dsa_adaptive_prefill_after_tokens"]
-            ),
-            glm_dsa_adaptive_prefill_min_remaining_tokens=(
-                prefill_config["glm_dsa_adaptive_prefill_min_remaining_tokens"]
-            ),
-            kv_bits=args.kv_bits,
-            kv_group_size=args.kv_group_size,
-            quantized_kv_start=args.quantized_kv_start,
-            prompt_checkpoint=not args.no_prompt_checkpoint,
-            prompt_checkpoint_store_prefix_lengths=args.checkpoint_store_prefix_lengths,
-            prompt_checkpoint_save_exact=(
-                args.checkpoint_save_exact == "enabled"
-            ),
-            prompt_checkpoint_frontier_min_tokens=(
-                args.checkpoint_frontier_min_tokens
-            ),
-            prompt_checkpoint_frontier_stride_tokens=(
-                args.checkpoint_frontier_stride_tokens
-            ),
-            prompt_progress_callback=lambda done, total: progress_events.append(
-                (done, total, time.perf_counter())
-            ),
-        ):
-            break
-        mx.synchronize()
+        try:
+            for response in stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=tokens,
+                max_tokens=args.max_tokens,
+                prefill_step_size=args.prefill_step_size,
+                prefill_max_qk_tokens=prefill_config["prefill_max_qk_tokens"],
+                glm_dsa_adaptive_prefill_step_size=(
+                    prefill_config["glm_dsa_adaptive_prefill_step_size"]
+                ),
+                glm_dsa_adaptive_prefill_after_tokens=(
+                    prefill_config["glm_dsa_adaptive_prefill_after_tokens"]
+                ),
+                glm_dsa_adaptive_prefill_min_remaining_tokens=(
+                    prefill_config[
+                        "glm_dsa_adaptive_prefill_min_remaining_tokens"
+                    ]
+                ),
+                kv_bits=args.kv_bits,
+                kv_group_size=args.kv_group_size,
+                quantized_kv_start=args.quantized_kv_start,
+                prompt_checkpoint=not args.no_prompt_checkpoint,
+                prompt_checkpoint_store_prefix_lengths=(
+                    args.checkpoint_store_prefix_lengths
+                ),
+                prompt_checkpoint_save_exact=(
+                    args.checkpoint_save_exact == "enabled"
+                ),
+                prompt_checkpoint_frontier_min_tokens=(
+                    args.checkpoint_frontier_min_tokens
+                ),
+                prompt_checkpoint_frontier_stride_tokens=(
+                    args.checkpoint_frontier_stride_tokens
+                ),
+                prompt_progress_callback=on_prompt_progress,
+            ):
+                break
+            mx.synchronize()
+        except PrefillBenchmarkStop as exc:
+            prefill_stop = exc
+            mx.synchronize()
     finally:
         logger.removeHandler(capture)
         logger.setLevel(old_level)
@@ -496,11 +522,26 @@ def run_once(model, tokenizer, prompt, args, case_name):
             os.environ[PROMPT_CHECKPOINT_DEBUG_ENV] = old_debug
 
     ttft_seconds = time.perf_counter() - ttft_t0
-    if response is None:
+    if response is None and prefill_stop is None:
         raise RuntimeError(f"{case_name}: generation produced no response")
 
     checkpoint = extract_checkpoint_summary(capture.messages)
     glm_profile = collect_glm_dsa_profile(args)
+    prompt_tps = (
+        response.prompt_tps
+        if response is not None
+        else prefill_stop.processed_tokens / ttft_seconds
+    )
+    peak_memory_gb = (
+        response.peak_memory
+        if response is not None
+        else mx.get_peak_memory() / 1e9
+    )
+    finish_reason = (
+        response.finish_reason
+        if response is not None
+        else "prefill-stop-after-tokens"
+    )
     return {
         "case": case_name,
         "mode": "single",
@@ -514,10 +555,18 @@ def run_once(model, tokenizer, prompt, args, case_name):
         "prompt_tokens": len(tokens),
         "tokenize_seconds": tokenize_seconds,
         "ttft_seconds": ttft_seconds,
-        "prompt_tps": response.prompt_tps,
-        "peak_memory_gb": response.peak_memory,
+        "prompt_tps": prompt_tps,
+        "peak_memory_gb": peak_memory_gb,
         "progress_events": len(progress_events),
-        "finish_reason": response.finish_reason,
+        "finish_reason": finish_reason,
+        "prefill_stopped_early": prefill_stop is not None,
+        "prefill_stop_after_tokens": prefill_stop_after_tokens,
+        "partial_prefill_tokens": (
+            prefill_stop.processed_tokens if prefill_stop is not None else None
+        ),
+        "partial_prefill_total_tokens": (
+            prefill_stop.total_tokens if prefill_stop is not None else None
+        ),
         **prefill_config,
         **checkpoint,
         **glm_profile,
@@ -841,6 +890,10 @@ def print_table(rows, output_format):
         "checkpoint_matched_candidates",
         "checkpoint_manifest_entries",
         "checkpoint_manifest_bootstrap",
+        "prefill_stopped_early",
+        "prefill_stop_after_tokens",
+        "partial_prefill_tokens",
+        "partial_prefill_total_tokens",
         "prompt_tokens",
         "tokenize_seconds",
         "ttft_seconds",
@@ -1390,6 +1443,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--prefill-stop-after-tokens",
+        type=int,
+        help=(
+            "Benchmark-only early stop: abort a single-request run after "
+            "prefill reaches this many processed prompt tokens and record a "
+            "partial row. Useful for long-context prefill-sweep probes."
+        ),
+    )
+    parser.add_argument(
         "--prefill-sweep-use-checkpoints",
         action="store_true",
         help=(
@@ -1530,6 +1592,11 @@ def main():
             "--model is empty; set MODEL to your model directory or pass an "
             "explicit --model /path/to/model value."
         )
+    if (
+        args.prefill_stop_after_tokens is not None
+        and args.prefill_stop_after_tokens <= 0
+    ):
+        parser.error("--prefill-stop-after-tokens must be positive when set.")
     if args.checkpoint_save_exact is None:
         args.checkpoint_save_exact = (
             "disabled"

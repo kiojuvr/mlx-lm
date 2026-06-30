@@ -433,6 +433,56 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(payload["runs"][0]["mode"], "prefill-sweep")
         self.assertEqual(payload["summary"][0]["case"], rows[0]["case"])
 
+    def test_run_once_can_stop_after_prefill_tokens(self):
+        old_stream_generate = benchmark.stream_generate
+
+        def fake_stream_generate(**kwargs):
+            progress = kwargs["prompt_progress_callback"]
+            progress(0, 10)
+            progress(6, 10)
+            yield None
+
+        args = Namespace(
+            target_tokens=10,
+            max_tokens=1,
+            prefill_step_size=4,
+            prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_size=0,
+            glm_dsa_adaptive_prefill_after_tokens=0,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=0,
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+            no_prompt_checkpoint=True,
+            checkpoint_store_prefix_lengths=None,
+            checkpoint_save_exact="disabled",
+            checkpoint_frontier_min_tokens=8192,
+            checkpoint_frontier_stride_tokens=16384,
+            resolved_checkpoint_cache_dir=None,
+            prefill_stop_after_tokens=6,
+            prefill_profile=False,
+            fast_prefill="enabled",
+        )
+
+        benchmark.stream_generate = fake_stream_generate
+        try:
+            row = benchmark.run_once(
+                object(),
+                object(),
+                list(range(10)),
+                args,
+                "early-stop",
+            )
+        finally:
+            benchmark.stream_generate = old_stream_generate
+
+        self.assertTrue(row["prefill_stopped_early"])
+        self.assertEqual(row["finish_reason"], "prefill-stop-after-tokens")
+        self.assertEqual(row["partial_prefill_tokens"], 6)
+        self.assertEqual(row["partial_prefill_total_tokens"], 10)
+        self.assertEqual(row["prefill_stop_after_tokens"], 6)
+        self.assertGreater(row["prompt_tps"], 0)
+
     def test_policy_sweep_runs_isolated_candidates(self):
         args = Namespace(
             lcp_prefix_tokens=4,

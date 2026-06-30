@@ -315,10 +315,10 @@ python benchmarks/glm52_prefill_benchmark.py \
   --fast-prefill enabled \
   --json-output glm52-prefill-step-sweep.json
 
-# Confirm only the short/medium finalists at 131072 tokens. Replace the
-# candidate lists with the winners from the previous run. The min-context
-# candidates tune where the sparse path starts; use only a few candidates
-# because each 131072-token run is expensive.
+# Probe only the short/medium finalists at 131072 tokens. Replace the candidate
+# lists with the winners from the previous run. The min-context candidates tune
+# where the sparse path starts; use --prefill-stop-after-tokens first so the
+# sweep writes partial rows without waiting for every full 131072-token run.
 python benchmarks/glm52_prefill_benchmark.py \
   --model "$MODEL" --mode prefill-sweep \
   --lengths 131072 \
@@ -327,6 +327,7 @@ python benchmarks/glm52_prefill_benchmark.py \
   --prefill-max-qk-token-candidates 67108864 \
   --glm-dsa-adaptive-prefill-step-candidates 0 \
   --fast-prefill-min-context-candidates 98304,114688,131072 \
+  --prefill-stop-after-tokens 98304 \
   --fast-prefill enabled \
   --json-output glm52-prefill-step-sweep-131k-finalists.json
 
