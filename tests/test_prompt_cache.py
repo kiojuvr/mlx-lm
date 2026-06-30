@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_lm.generate import (
     PROMPT_CHECKPOINT_DEBUG_ENV,
@@ -27,6 +28,7 @@ from mlx_lm.models.cache import (
     EMPTY_ARRAYS_METADATA_KEY,
     GlmMlaKVCache,
     KVCache,
+    PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
     PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY,
     PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY,
     PROMPT_CHECKPOINT_CACHE_DIR_ENV,
@@ -51,17 +53,94 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
     prompt_checkpoint_file,
     prompt_checkpoint_manifest_file,
+    prompt_cache_token_length,
     prompt_prefix_hash,
     prune_prompt_checkpoints,
     save_prompt_checkpoint,
     save_prompt_checkpoint_manifest,
     save_prompt_cache,
+    slice_prompt_cache,
+    concat_prompt_caches,
     trim_prompt_cache,
     update_prompt_checkpoint_manifest,
 )
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+
+
+class TestPromptCacheDeltaUtilities(unittest.TestCase):
+    @staticmethod
+    def _kv_cache(length, head_dim=2):
+        cache = KVCache()
+        keys = mx.array(
+            list(range(length * head_dim)),
+            dtype=mx.float32,
+        ).reshape(1, 1, length, head_dim)
+        values = keys + 100
+        cache.update_and_fetch(keys, values)
+        return cache
+
+    @staticmethod
+    def _glm_mla_cache(length, head_dim=32):
+        cache = GlmMlaKVCache()
+        keys = mx.array(
+            list(range(length * head_dim)),
+            dtype=mx.float32,
+        ).reshape(1, 1, length, head_dim)
+        values = keys + 100
+        cache.update_and_fetch(keys, values)
+        return cache
+
+    def _assert_state_equal(self, actual, expected):
+        for (_, actual_value), (_, expected_value) in zip(
+            tree_flatten(actual),
+            tree_flatten(expected),
+        ):
+            self.assertTrue(mx.array_equal(actual_value, expected_value).item())
+
+    def test_slice_and_concat_prompt_cache_round_trips_kv_cache(self):
+        full = [self._kv_cache(8)]
+        base = slice_prompt_cache(full, 0, 5)
+        delta = slice_prompt_cache(full, 5, 8)
+        merged = concat_prompt_caches(base, delta)
+
+        self.assertEqual(prompt_cache_token_length(delta), 3)
+        self.assertEqual(prompt_cache_token_length(merged), 8)
+        self.assertTrue(mx.array_equal(merged[0].state[0], full[0].state[0]).item())
+        self.assertTrue(mx.array_equal(merged[0].state[1], full[0].state[1]).item())
+
+    def test_slice_and_concat_prompt_cache_round_trips_quantized_kv_cache(self):
+        full = [self._kv_cache(8, head_dim=32).to_quantized(group_size=32, bits=8)]
+        base = slice_prompt_cache(full, 0, 5)
+        delta = slice_prompt_cache(full, 5, 8)
+        merged = concat_prompt_caches(base, delta)
+
+        self.assertEqual(prompt_cache_token_length(delta), 3)
+        self.assertEqual(prompt_cache_token_length(merged), 8)
+        self._assert_state_equal(merged[0].state, full[0].state)
+
+    def test_slice_and_concat_prompt_cache_round_trips_quantized_glm_mla_cache(self):
+        full = [self._glm_mla_cache(8, head_dim=32).to_quantized(group_size=32, bits=8)]
+        base = slice_prompt_cache(full, 0, 5)
+        delta = slice_prompt_cache(full, 5, 8)
+        merged = concat_prompt_caches(base, delta)
+
+        self.assertEqual(prompt_cache_token_length(delta), 3)
+        self.assertEqual(prompt_cache_token_length(merged), 8)
+        self._assert_state_equal(merged[0].state, full[0].state)
+
+    def test_slice_and_concat_prompt_cache_round_trips_cache_list(self):
+        full = [CacheList(self._kv_cache(6), self._kv_cache(6))]
+        base = slice_prompt_cache(full, 0, 4)
+        delta = slice_prompt_cache(full, 4, 6)
+        merged = concat_prompt_caches(base, delta)
+
+        self.assertEqual(prompt_cache_token_length(delta), 2)
+        self.assertEqual(prompt_cache_token_length(merged), 6)
+        for original, actual in zip(full[0].caches, merged[0].caches):
+            self.assertTrue(mx.array_equal(actual.state[0], original.state[0]).item())
+            self.assertTrue(mx.array_equal(actual.state[1], original.state[1]).item())
 
 
 class TestPromptCacheCheckpoint(unittest.TestCase):
@@ -108,6 +187,50 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 os.environ[name] = old_value
 
         self.addCleanup(restore_env)
+
+    def test_prune_removes_delta_before_referenced_base(self):
+        self._set_home_to_test_dir()
+        ensure_glm52_local_cache_dirs()
+        base_path = prompt_checkpoint_file([1, 2, 3])
+        delta_path = prompt_checkpoint_file([1, 2, 3, 4, 5])
+        with open(base_path, "wb") as f:
+            f.write(b"base")
+        with open(delta_path, "wb") as f:
+            f.write(b"delta")
+
+        base_name = os.path.basename(base_path)
+        delta_name = os.path.basename(delta_path)
+        save_prompt_checkpoint_manifest(
+            {
+                "version": 1,
+                "entries": {
+                    base_name: {
+                        "filename": base_name,
+                        "prefix_length": 3,
+                        "kind": "frontier",
+                        "created_at": 1,
+                        "size_bytes": 4,
+                    },
+                    delta_name: {
+                        "filename": delta_name,
+                        "prefix_length": 5,
+                        "kind": "delta",
+                        "created_at": 2,
+                        "size_bytes": 5,
+                        PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY: base_name,
+                    },
+                },
+            }
+        )
+
+        report = prune_prompt_checkpoints(max_files=1, max_bytes=0)
+
+        self.assertEqual(
+            [entry["filename"] for entry in report["removed"]],
+            [delta_name],
+        )
+        self.assertTrue(os.path.exists(base_path))
+        self.assertFalse(os.path.exists(delta_path))
 
     def _clear_env(self, name):
         old_value = os.environ.get(name)

@@ -112,6 +112,7 @@ This fork automatically stores trusted local GLM-5.2 prompt checkpoints and reus
 
 - exact full-prompt hits replay the last prompt token and skip almost all prefill;
 - prefix/frontier hits restore cached KV/DSA state for the shared prefix and prefill only the changed suffix;
+- delta hits restore a base prefix/frontier checkpoint plus a suffix-only cache file, avoiding multi-GB exact checkpoint writes for 190K+ token conversations;
 - disabled checkpointing reports `checkpoint_resolution=disabled`, `disk_cached_tokens=0`, and a full fresh prefill;
 - mismatched tokens, incompatible GLM DSA metadata, incompatible GLM MLA KV settings, malformed checkpoints, or missing files fall back to a normal miss.
 

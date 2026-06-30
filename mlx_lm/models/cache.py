@@ -42,6 +42,19 @@ PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY = (
 PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY = (
     "checkpoint_rendered_prefix_bytes"
 )
+PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY = "checkpoint_delta_base_filename"
+PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY = (
+    "checkpoint_delta_base_prefix_hash"
+)
+PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY = (
+    "checkpoint_delta_base_prefix_length"
+)
+PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY = (
+    "checkpoint_delta_cache_start_tokens"
+)
+PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY = (
+    "checkpoint_delta_cache_tokens"
+)
 DEFAULT_PROMPT_CHECKPOINT_MAX_FILES = 256
 DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES = 128 * 1024**3
 DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS = 0
@@ -348,6 +361,7 @@ _PROMPT_CHECKPOINT_MANIFEST_KINDS = {
     "prefix",
     "frontier",
     "continued",
+    "delta",
     "unknown",
 }
 
@@ -473,9 +487,18 @@ def _normalize_manifest_entry(filename, entry):
         "checkpoint_glm_mla_kv_quantization_hash",
         "checkpoint_glm_mla_kv_settings",
         "checkpoint_glm_mla_kv_settings_hash",
+        PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
+        PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY,
     ):
         if key in entry and entry[key] is not None:
             normalized[key] = str(entry[key])
+    for key in (
+        PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY,
+        PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY,
+        PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY,
+    ):
+        if key in entry and entry[key] is not None:
+            normalized[key] = _safe_manifest_int(entry[key], 0)
     return normalized
 
 
@@ -553,6 +576,22 @@ def _manifest_entry_from_file(filename, *, kind="unknown", metadata=None):
     }
     entry.update(_manifest_metadata_identity(metadata))
     entry.update(_manifest_metadata_rendered_prefix(metadata))
+    if metadata:
+        for key in (
+            PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY,
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                entry[key] = str(value)
+        for key in (
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY,
+            PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY,
+            PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY,
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                entry[key] = _safe_manifest_int(value, 0)
     return entry
 
 
@@ -692,6 +731,7 @@ def _prompt_checkpoint_prune_key(entry):
         "prefix": 2,
         "frontier": 3,
         "continued": 4,
+        "delta": 5,
     }.get(entry.get("kind"), 1)
     hit_count = _safe_manifest_int(entry.get("hit_count"), 0)
     used_at = _prompt_checkpoint_entry_used_at(entry)
@@ -760,6 +800,14 @@ def prune_prompt_checkpoints(
         changed = True
         return True
 
+    def delta_base_files():
+        return {
+            str(entry.get(PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY))
+            for entry in entries.values()
+            if entry.get("kind") == "delta"
+            and entry.get(PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY)
+        }
+
     if max_age_seconds > 0:
         stale_cutoff = now - max_age_seconds
         for victim in sorted(
@@ -771,17 +819,27 @@ def prune_prompt_checkpoints(
         ):
             if victim["filename"] in protected:
                 continue
+            if victim["filename"] in delta_base_files():
+                continue
             if _prompt_checkpoint_entry_used_at(victim) >= stale_cutoff:
                 continue
             if not remove_entry(victim, "age"):
                 break
 
     while over_budget():
+        protected_by_delta = delta_base_files()
         victims = [
             entry
             for entry in entries.values()
             if entry["filename"] not in protected
+            and entry["filename"] not in protected_by_delta
         ]
+        if not victims:
+            victims = [
+                entry
+                for entry in entries.values()
+                if entry["filename"] not in protected
+            ]
         if not victims:
             break
         victim = min(victims, key=_prompt_checkpoint_prune_key)
@@ -807,6 +865,7 @@ def find_prompt_checkpoint_prefix(
     prefix_tokens,
     *,
     min_prefix_length=2,
+    allowed_kinds=("exact", "prefix", "frontier", "continued", "unknown"),
     return_stats=False,
 ):
     """
@@ -818,6 +877,7 @@ def find_prompt_checkpoint_prefix(
     checkpoints when a longer file is malformed or rejected.
     """
     tokens = _token_list(prefix_tokens)
+    allowed_kinds = set(allowed_kinds or ())
     stats = {
         "files_scanned": 0,
         "candidate_files_scanned": 0,
@@ -843,8 +903,10 @@ def find_prompt_checkpoint_prefix(
     )
 
     by_length = {}
-    for name in manifest["entries"]:
+    for name, entry in manifest["entries"].items():
         stats["files_scanned"] += 1
+        if allowed_kinds and entry.get("kind") not in allowed_kinds:
+            continue
         parsed = _parse_prompt_checkpoint_name(name)
         if parsed is None:
             continue
@@ -2510,6 +2572,117 @@ class CacheList(_BaseCache):
             globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
         ]
         return obj
+
+
+def _cache_sequence_length(cache):
+    try:
+        size = cache.size()
+    except Exception:
+        size = 0
+    if size:
+        return int(size)
+    offset = getattr(cache, "offset", 0)
+    if hasattr(offset, "shape") and offset.shape != ():
+        return 0
+    try:
+        return int(offset)
+    except (TypeError, ValueError):
+        return 0
+
+
+def prompt_cache_token_length(cache: List[Any]):
+    if not cache:
+        return 0
+    lengths = [_cache_sequence_length(c) for c in cache]
+    lengths = [length for length in lengths if length > 0]
+    return min(lengths) if lengths else 0
+
+
+def _slice_sequence_state(state, start_tokens, end_tokens):
+    return tree_map(lambda x: x[..., start_tokens:end_tokens, :], state)
+
+
+def _concat_sequence_state(left_state, right_state):
+    return tree_map(
+        lambda left, right: mx.concatenate([left, right], axis=-2),
+        left_state,
+        right_state,
+    )
+
+
+def _state_sequence_length(state):
+    leaves = tree_flatten(state)
+    for _, value in leaves:
+        if hasattr(value, "shape") and len(value.shape) >= 3:
+            return int(value.shape[-2])
+    return 0
+
+
+def _new_cache_like(cache, state):
+    if isinstance(cache, CacheList):
+        raise TypeError("CacheList must be handled recursively")
+    if isinstance(cache, (QuantizedKVCache, QuantizedGlmMlaKVCache)):
+        new_cache = type(cache)(group_size=cache.group_size, bits=cache.bits)
+    elif isinstance(cache, RotatingKVCache):
+        new_cache = type(cache)(max_size=cache.max_size, keep=cache.keep)
+    elif isinstance(cache, ChunkedKVCache):
+        new_cache = type(cache)(chunk_size=cache.chunk_size)
+        new_cache.start_position = 0
+    else:
+        new_cache = type(cache)()
+    new_cache.state = state
+    if hasattr(new_cache, "offset"):
+        offset = _state_sequence_length(state)
+        if offset:
+            new_cache.offset = offset
+    if isinstance(new_cache, RotatingKVCache):
+        new_cache._idx = min(new_cache.offset, new_cache.max_size)
+    return new_cache
+
+
+def slice_prompt_cache(cache: List[Any], start_tokens: int, end_tokens: Optional[int] = None):
+    start_tokens = max(0, int(start_tokens))
+    token_length = prompt_cache_token_length(cache)
+    if end_tokens is None:
+        end_tokens = token_length
+    end_tokens = max(start_tokens, min(int(end_tokens), token_length))
+
+    def slice_one(c):
+        if isinstance(c, CacheList):
+            return CacheList(*(slice_one(subcache) for subcache in c.caches))
+        return _new_cache_like(
+            c,
+            _slice_sequence_state(c.state, start_tokens, end_tokens),
+        )
+
+    return [slice_one(c) for c in cache]
+
+
+def concat_prompt_caches(left_cache: List[Any], right_cache: List[Any]):
+    if len(left_cache) != len(right_cache):
+        raise ValueError("prompt cache structures differ")
+
+    def concat_one(left, right):
+        if type(left) is not type(right):
+            raise ValueError("prompt cache entry types differ")
+        if isinstance(left, CacheList):
+            if len(left.caches) != len(right.caches):
+                raise ValueError("prompt cache list structures differ")
+            return CacheList(
+                *(
+                    concat_one(left_subcache, right_subcache)
+                    for left_subcache, right_subcache in zip(
+                        left.caches,
+                        right.caches,
+                    )
+                )
+            )
+        return _new_cache_like(
+            left,
+            _concat_sequence_state(left.state, right.state),
+        )
+
+    return [concat_one(left, right) for left, right in zip(left_cache, right_cache)]
 
 
 def dynamic_roll(x, shifts, axis):

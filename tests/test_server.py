@@ -15,7 +15,17 @@ from queue import Queue
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache, PROMPT_CHECKPOINT_CACHE_DIR_ENV
+from mlx_lm.models.cache import (
+    KVCache,
+    PROMPT_CHECKPOINT_CACHE_DIR_ENV,
+    PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
+    PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY,
+    PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY,
+    PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY,
+    PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY,
+    prompt_cache_token_length,
+    prompt_prefix_hash,
+)
 from mlx_lm.server import (
     APIHandler,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
@@ -26,6 +36,7 @@ from mlx_lm.server import (
     DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
     LRUPromptCache,
+    RenderedPromptCheckpoint,
     Response,
     ResponseGenerator,
     TokenLoopGuard,
@@ -418,6 +429,125 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         update_manifest.assert_called_once()
         self.assertEqual(update_manifest.call_args.kwargs["kind"], "continued")
         prune.assert_called_once()
+
+    def test_save_delta_prompt_checkpoint_saves_suffix_cache(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=cli_args,
+        )
+        tokenizer = types.SimpleNamespace(
+            decode=lambda tokens, **kwargs: "".join(f"<{token}>" for token in tokens)
+        )
+        prompt_cache = [KVCache()]
+        keys = mx.array(list(range(10)), dtype=mx.float32).reshape(1, 1, 5, 2)
+        prompt_cache[0].update_and_fetch(keys, keys + 100)
+        cache_key = [1, 2, 3, 4, 5]
+        rendered_continuation = "".join(f"<{token}>" for token in cache_key)
+        base_checkpoint = RenderedPromptCheckpoint(
+            prompt_cache=[],
+            prefix_tokens=[1, 2, 3],
+            suffix_tokens=[],
+            kind="frontier",
+            rendered_prefix_bytes=9,
+            checkpoint_path="/tmp/base-3.safetensors",
+        )
+        captured = {}
+
+        def fake_save_prompt_checkpoint(file_name, cache, **kwargs):
+            captured["file_name"] = file_name
+            captured["cache"] = cache
+            captured["kwargs"] = kwargs
+            return dict(kwargs["metadata"])
+
+        with mock.patch(
+            "mlx_lm.server.prompt_checkpoint_file",
+            return_value="/tmp/delta-5.safetensors",
+        ), mock.patch(
+            "mlx_lm.server.save_prompt_checkpoint",
+            fake_save_prompt_checkpoint,
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest, mock.patch(
+            "mlx_lm.server.prune_prompt_checkpoints"
+        ) as prune:
+            saved = generator._save_delta_prompt_checkpoint(
+                tokenizer,
+                prompt_cache,
+                cache_key,
+                base_checkpoint=base_checkpoint,
+                rendered_continuation=rendered_continuation,
+            )
+
+        self.assertTrue(saved)
+        self.assertEqual(prompt_cache_token_length(captured["cache"]), 2)
+        self.assertEqual(captured["kwargs"]["prefix_tokens"], cache_key)
+        metadata = captured["kwargs"]["metadata"]
+        self.assertEqual(metadata["checkpoint_label"], "delta")
+        self.assertEqual(
+            metadata[PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY],
+            "base-3.safetensors",
+        )
+        self.assertEqual(
+            metadata[PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY],
+            "5",
+        )
+        update_manifest.assert_called_once()
+        self.assertEqual(update_manifest.call_args.kwargs["kind"], "delta")
+        prune.assert_called_once()
+
+    def test_load_delta_prompt_checkpoint_concatenates_base_and_delta(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            cli_args=self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0),
+        )
+
+        def kv_cache(start, length):
+            cache = KVCache()
+            values = mx.array(
+                list(range(start, start + length * 2)),
+                dtype=mx.float32,
+            ).reshape(1, 1, length, 2)
+            cache.update_and_fetch(values, values + 100)
+            return [cache]
+
+        base_tokens = [1, 2, 3]
+        target_tokens = [1, 2, 3, 4, 5]
+        metadata = {
+            "checkpoint_label": "delta",
+            PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY: "base-3.safetensors",
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY: prompt_prefix_hash(
+                base_tokens
+            ),
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY: "3",
+            PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY: "3",
+            PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY: "5",
+        }
+
+        def fake_load(path, **kwargs):
+            if path.endswith("delta-5.safetensors"):
+                return kv_cache(6, 2), target_tokens, metadata
+            if path.endswith("base-3.safetensors"):
+                return kv_cache(0, 3), base_tokens, {}
+            raise AssertionError(path)
+
+        with mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint_with_metadata_prefix",
+            fake_load,
+        ):
+            merged, cached_tokens, stored_tokens, loaded_metadata, base_path, base = (
+                generator._load_delta_prompt_checkpoint("/tmp/delta-5.safetensors")
+            )
+
+        self.assertEqual(prompt_cache_token_length(merged), 5)
+        self.assertEqual(cached_tokens, target_tokens)
+        self.assertEqual(stored_tokens, target_tokens)
+        self.assertIs(loaded_metadata, metadata)
+        self.assertEqual(base_path, "/tmp/base-3.safetensors")
+        self.assertEqual(base, base_tokens)
 
     def test_shutdown_flush_saves_current_model_continued_checkpoint(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
