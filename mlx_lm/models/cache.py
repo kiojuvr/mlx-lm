@@ -56,7 +56,7 @@ PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY = (
     "checkpoint_delta_cache_tokens"
 )
 DEFAULT_PROMPT_CHECKPOINT_MAX_FILES = 256
-DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES = 128 * 1024**3
+DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES = 1024**4
 DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS = 0
 
 _CHECKPOINT_REQUIRED_METADATA_KEYS = (
@@ -366,10 +366,33 @@ _PROMPT_CHECKPOINT_MANIFEST_KINDS = {
 }
 
 
+_ENV_INT_SIZE_SUFFIXES = {
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+}
+
+
 def _env_int(name, default):
     value = os.environ.get(name)
     if value is None:
         return default
+    if isinstance(value, str):
+        value = value.strip()
+        lower_value = value.lower()
+        for suffix, multiplier in _ENV_INT_SIZE_SUFFIXES.items():
+            if lower_value.endswith(suffix):
+                number = value[: -len(suffix)].strip()
+                try:
+                    value = int(number) * multiplier
+                except (TypeError, ValueError):
+                    return default
+                break
     try:
         value = int(value)
     except (TypeError, ValueError):

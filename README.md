@@ -267,10 +267,14 @@ To clear only prompt checkpoints while keeping the reserved cache root:
 The prompt checkpoint manifest/pruning layer uses these default limits:
 
     MLX_LM_PROMPT_CHECKPOINT_MAX_FILES=256
-    MLX_LM_PROMPT_CHECKPOINT_MAX_BYTES=128GiB
+    MLX_LM_PROMPT_CHECKPOINT_MAX_BYTES=1TiB
     MLX_LM_PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN=16
 
 They bound checkpoint file count, total checkpoint storage, and frontier checkpoint saves per generation run.
+The byte limit accepts plain bytes or binary/decimal suffixes such as `512GiB`,
+`1TiB`, or `2TB`. The 1TiB default is intentionally sized for long GLM-5.2
+coding-agent sessions so a 1M-token checkpoint chain has room for base,
+frontier, and delta files before pruning starts.
 
 ### Important limitations
 

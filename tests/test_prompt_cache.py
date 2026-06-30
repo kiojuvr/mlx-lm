@@ -25,6 +25,7 @@ from mlx_lm.models.cache import (
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
+    DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES,
     EMPTY_ARRAYS_METADATA_KEY,
     GlmMlaKVCache,
     KVCache,
@@ -51,6 +52,7 @@ from mlx_lm.models.cache import (
     load_prompt_checkpoint_with_metadata_prefix,
     load_prompt_cache,
     make_prompt_cache,
+    prompt_checkpoint_budget_from_env,
     prompt_checkpoint_file,
     prompt_checkpoint_manifest_file,
     prompt_cache_token_length,
@@ -241,6 +243,21 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 os.environ[name] = old_value
 
         self.addCleanup(restore_env)
+
+    def test_prompt_checkpoint_budget_default_max_bytes_covers_long_context(self):
+        self._clear_env(PROMPT_CHECKPOINT_MAX_BYTES_ENV)
+
+        budget = prompt_checkpoint_budget_from_env()
+
+        self.assertEqual(budget["max_bytes"], DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES)
+        self.assertEqual(DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES, 1024**4)
+
+    def test_prompt_checkpoint_budget_parses_size_suffixes(self):
+        self._set_env(PROMPT_CHECKPOINT_MAX_BYTES_ENV, "2GiB")
+
+        budget = prompt_checkpoint_budget_from_env()
+
+        self.assertEqual(budget["max_bytes"], 2 * 1024**3)
 
     def _filled_kv_cache(self, shape=(1, 2, 4, 8), dtype=mx.float32):
         cache = [KVCache() for _ in range(2)]
