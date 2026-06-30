@@ -2074,6 +2074,15 @@ class ResponseGenerator:
                 prompt_token_count,
             )
             generated_text_parts = []
+            finish_reason = None
+            logging.info(
+                "generation request: prompt_tokens=%s max_tokens=%s "
+                "stop_words=%s prompt_cached_tokens=%s",
+                prompt_token_count,
+                args.max_tokens,
+                len(args.stop_words),
+                ctx.prompt_cache_count,
+            )
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -2142,6 +2151,16 @@ class ResponseGenerator:
                     break
 
             rqueue.put(None)
+            generated_tokens = max(0, len(cache_key) - prompt_token_count)
+            logging.info(
+                "generation complete: prompt_tokens=%s generated_tokens=%s "
+                "finish_reason=%s stopped_by_client=%s cache_tokens=%s",
+                prompt_token_count,
+                generated_tokens,
+                finish_reason,
+                ctx._should_stop,
+                len(cache_key),
+            )
 
             rendered_continuation = None
             if rendered_prompt is not None and generated_text_parts:
@@ -2335,10 +2354,14 @@ class APIHandler(BaseHTTPRequestHandler):
         )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
+        self.max_tokens_source = "max_completion_tokens"
         if self.max_tokens is None:
-            self.max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
-            )
+            if "max_tokens" in self.body:
+                self.max_tokens = self.body["max_tokens"]
+                self.max_tokens_source = "max_tokens"
+            else:
+                self.max_tokens = self.response_generator.cli_args.max_tokens
+                self.max_tokens_source = "cli_default"
         self.temperature = self.body.get(
             "temperature", self.response_generator.cli_args.temp
         )
@@ -2359,6 +2382,17 @@ class APIHandler(BaseHTTPRequestHandler):
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         self.validate_model_parameters()
+        logging.info(
+            "request parameters: path=%s stream=%s model=%s "
+            "max_tokens=%s max_tokens_source=%s temperature=%s top_p=%s",
+            self.path,
+            self.stream,
+            self.requested_model,
+            self.max_tokens,
+            self.max_tokens_source,
+            self.temperature,
+            self.top_p,
+        )
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -2767,6 +2801,22 @@ class APIHandler(BaseHTTPRequestHandler):
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
 
+            logging.info(
+                "completion finished: request_id=%s prompt_tokens=%s "
+                "generated_tokens=%s finish_reason=%s stream=%s "
+                "client_connected=%s max_tokens=%s max_tokens_source=%s "
+                "made_tool_call=%s",
+                self.request_id,
+                len(ctx.prompt),
+                len(tokens),
+                finish_reason,
+                self.stream,
+                client_connected,
+                self.max_tokens,
+                self.max_tokens_source,
+                made_tool_call,
+            )
+
             if self.stream:
                 if client_connected:
                     resp = self.generate_response(
@@ -3124,6 +3174,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 made_tool_call = True
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
+            logging.info(
+                "responses completion finished: request_id=%s prompt_tokens=%s "
+                "generated_tokens=%s finish_reason=%s stream=%s "
+                "client_connected=%s max_tokens=%s max_tokens_source=%s "
+                "made_tool_call=%s",
+                self.request_id,
+                len(ctx.prompt),
+                len(tokens),
+                finish_reason,
+                self.stream,
+                client_connected,
+                self.max_tokens,
+                self.max_tokens_source,
+                made_tool_call,
+            )
         finally:
             ctx.stop()
 
