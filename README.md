@@ -52,8 +52,6 @@ python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
   --port 8000 \
-  --temp 0.4 \
-  --top-p 0.95 \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
@@ -78,7 +76,7 @@ when `limit.output` is set higher. `--request-max-tokens-floor 384000` raises
 that request cap on the server side so long coding-agent turns are not cut off
 early with `finish_reason=length`.
 
-`--temp 0.4` and `--top-p 0.95` are recommended as conservative default sampling settings for coding-agent and long-context workflows. In local use, lower-temperature sampling helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
+The recommended server command intentionally leaves `--temp` and `--top-p` unset so request-side clients can control sampling. In local use, lower-temperature request settings helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
 
 `--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it. If the model still enters near-duplicate but non-exact loops, lower request sampling first (`temperature`, `top_p`) and add a small request-side `repetition_penalty` such as `1.05` to `1.10` when your client supports it.
 
@@ -96,8 +94,6 @@ python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
   --port 8000 \
-  --temp 0.4 \
-  --top-p 0.95 \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
