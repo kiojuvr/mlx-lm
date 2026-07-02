@@ -64,7 +64,9 @@ python benchmarks/glm52_prefill_benchmark.py \
 ```
 
 Expected fields include `native_smoke_passed=True` and
-`native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`.
+`native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`. The same smoke run
+also checks the native q8 V-up projection used for quantized GLM DSA
+`unembed_out` weights; expect `native_q8_vup_smoke_passed=True`.
 
 ### Recommended target model
 
@@ -255,6 +257,12 @@ Benchmark rows include `glm_dsa_native_sparse_prefill_route_state`,
 `--kv-bits 8 --quantized-kv-start 4096` long-context setting, expect
 `quantized_kv_at_native_threshold`: the extension is loaded, but the current
 native sparse MLA route does not consume int8 GLM MLA KV cache.
+
+The vendored native `glm_dsa_q8_vup_flat` kernel is used separately for
+quantized GLM DSA `unembed_out` projection when the fixed M3 GLM shape matches
+64 heads, latent dim 512, value dim 256, affine int8 weights, and group size 64.
+Benchmark rows report `glm_dsa_native_q8_vup_hits` and
+`glm_dsa_native_q8_vup_fallback_reasons`.
 
 **Bottleneck hypothesis**
 The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.

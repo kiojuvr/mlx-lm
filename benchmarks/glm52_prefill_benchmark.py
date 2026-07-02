@@ -369,6 +369,11 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
     elif native_sparse_prefill == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "0"
+    native_q8_vup = getattr(args, "native_q8_vup", "default")
+    if native_q8_vup == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "1"
+    elif native_q8_vup == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "0"
     if args.fast_prefill_query_chunk is not None:
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
@@ -399,6 +404,7 @@ def reset_glm_dsa_profile():
 def collect_glm_dsa_profile(args):
     profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
     native_status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
+    native_q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
     stage_values = {}
     for stage, values in profile["stages"].items():
         key = f"glm_dsa_{stage}_seconds"
@@ -444,7 +450,19 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_native_sparse_prefill_fallback_reasons": profile[
             "native_sparse_prefill_fallback_reasons"
         ],
+        "glm_dsa_native_q8_vup_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV,
+            "default-on",
+        ),
+        "glm_dsa_native_q8_vup_available": native_q8_vup_status["available"],
+        "glm_dsa_native_q8_vup_source": native_q8_vup_status["source"],
+        "glm_dsa_native_q8_vup_import_error": native_q8_vup_status["import_error"],
+        "glm_dsa_native_q8_vup_hits": profile["native_q8_vup_hits"],
+        "glm_dsa_native_q8_vup_fallback_reasons": profile[
+            "native_q8_vup_fallback_reasons"
+        ],
         **native_sparse_prefill_route_diagnostics(args, profile, native_status),
+        "glm_dsa_native_q8_vup": getattr(args, "native_q8_vup", "default"),
         **stage_values,
     }
 
@@ -588,6 +606,21 @@ def _native_smoke_kernel(source):
     return loader()
 
 
+def _native_q8_vup_smoke_kernel(source):
+    if source in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        fast = __import__(source, fromlist=["fast"]).fast
+        return fast.glm_dsa_q8_vup_flat
+    if source == "mlx.core.fast":
+        return mx.fast.glm_dsa_q8_vup_flat
+    loader = getattr(glm_moe_dsa, "_native_q8_vup_kernel", None)
+    if loader is None:
+        return None
+    return loader()
+
+
 def _native_smoke_dense_reference(q_latent, q_pe, kv_latent, k_pe, scale):
     B, H, L, _ = q_latent.shape
     K = kv_latent.shape[2]
@@ -605,8 +638,64 @@ def _native_smoke_dense_reference(q_latent, q_pe, kv_latent, k_pe, scale):
     return mx.matmul(weights, latent)
 
 
+def _run_native_q8_vup_smoke(row, args, status):
+    if not status["available"]:
+        row["native_q8_vup_smoke_error"] = "native q8 V-up kernel unavailable"
+        return
+    try:
+        kernel = _native_q8_vup_smoke_kernel(status["source"])
+        if kernel is None:
+            raise RuntimeError("native q8 V-up kernel unavailable")
+
+        B, H = 1, 64
+        L = args.native_smoke_q_len
+        latent_dim = 512
+        value_dim = 256
+        mx.random.seed(args.native_smoke_seed + 1)
+        x = mx.random.normal((B, H, L, latent_dim), dtype=mx.float16) * 0.02
+        weight = mx.random.normal(
+            (H, value_dim, latent_dim), dtype=mx.float16
+        ) * 0.02
+        q_weight, scales, biases = mx.quantize(
+            weight,
+            group_size=64,
+            bits=8,
+            mode="affine",
+        )
+        output = kernel(x, q_weight, scales, biases)
+        reference = mx.quantized_matmul(
+            x,
+            q_weight,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=64,
+            bits=8,
+            mode="affine",
+        )
+        reference = reference.transpose(0, 2, 1, 3).reshape(B, L, H * value_dim)
+        diff = mx.abs(output.astype(mx.float32) - reference.astype(mx.float32))
+        mx.eval(output, reference, diff)
+
+        max_abs_diff = float(mx.max(diff).item())
+        mean_abs_diff = float(mx.mean(diff).item())
+        row.update(
+            {
+                "native_q8_vup_smoke_shape": list(output.shape),
+                "native_q8_vup_smoke_max_abs_diff": max_abs_diff,
+                "native_q8_vup_smoke_mean_abs_diff": mean_abs_diff,
+                "native_q8_vup_smoke_passed": (
+                    max_abs_diff <= args.native_smoke_max_diff
+                ),
+            }
+        )
+    except Exception as exc:
+        row["native_q8_vup_smoke_error"] = repr(exc)
+
+
 def run_native_kernel_smoke(args):
     status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
+    q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
     row = {
         "case": "native-smoke",
         "mode": "native-smoke",
@@ -623,66 +712,74 @@ def run_native_kernel_smoke(args):
         "native_smoke_mean_abs_diff": None,
         "native_smoke_passed": False,
         "native_smoke_error": None,
+        "native_q8_vup_smoke_available": q8_vup_status["available"],
+        "native_q8_vup_smoke_source": q8_vup_status["source"],
+        "native_q8_vup_smoke_import_error": q8_vup_status["import_error"],
+        "native_q8_vup_smoke_shape": None,
+        "native_q8_vup_smoke_max_abs_diff": None,
+        "native_q8_vup_smoke_mean_abs_diff": None,
+        "native_q8_vup_smoke_passed": False,
+        "native_q8_vup_smoke_error": None,
     }
     row.update(_native_smoke_status_fields(args, status))
     if not status["available"]:
         row["native_smoke_error"] = "native sparse MLA kernel unavailable"
-        return row
+    else:
+        try:
+            symbols = _native_smoke_symbols(status["source"])
+            kernel = _native_smoke_kernel(status["source"])
+            if kernel is None:
+                raise RuntimeError("native sparse MLA kernel unavailable")
 
-    try:
-        symbols = _native_smoke_symbols(status["source"])
-        kernel = _native_smoke_kernel(status["source"])
-        if kernel is None:
-            raise RuntimeError("native sparse MLA kernel unavailable")
+            B, H = 1, 64
+            L = args.native_smoke_q_len
+            K = args.native_smoke_k_len
+            latent_dim = 512
+            rope_dim = 64
+            mx.random.seed(args.native_smoke_seed)
+            q_latent = mx.random.normal(
+                (B, H, L, latent_dim), dtype=mx.float16
+            ) * 0.02
+            q_pe = mx.random.normal((B, H, L, rope_dim), dtype=mx.float16) * 0.02
+            kv_latent = mx.random.normal(
+                (B, 1, K, latent_dim), dtype=mx.float16
+            ) * 0.02
+            k_pe = mx.random.normal((B, 1, K, rope_dim), dtype=mx.float16) * 0.02
+            topk_indices = mx.broadcast_to(
+                mx.arange(K, dtype=mx.uint32).reshape(1, 1, 1, K),
+                (B, 1, L, K),
+            )
+            scale = 1.0 / math.sqrt(latent_dim + rope_dim)
 
-        B, H = 1, 64
-        L = args.native_smoke_q_len
-        K = args.native_smoke_k_len
-        latent_dim = 512
-        rope_dim = 64
-        mx.random.seed(args.native_smoke_seed)
-        q_latent = mx.random.normal(
-            (B, H, L, latent_dim), dtype=mx.float16
-        ) * 0.02
-        q_pe = mx.random.normal((B, H, L, rope_dim), dtype=mx.float16) * 0.02
-        kv_latent = mx.random.normal(
-            (B, 1, K, latent_dim), dtype=mx.float16
-        ) * 0.02
-        k_pe = mx.random.normal((B, 1, K, rope_dim), dtype=mx.float16) * 0.02
-        topk_indices = mx.broadcast_to(
-            mx.arange(K, dtype=mx.uint32).reshape(1, 1, 1, K),
-            (B, 1, L, K),
-        )
-        scale = 1.0 / math.sqrt(latent_dim + rope_dim)
+            output = kernel(
+                q_latent,
+                q_pe,
+                kv_latent,
+                k_pe,
+                topk_indices,
+                scale,
+                causal=True,
+            )
+            reference = _native_smoke_dense_reference(
+                q_latent, q_pe, kv_latent, k_pe, scale
+            )
+            diff = mx.abs(output.astype(mx.float32) - reference.astype(mx.float32))
+            mx.eval(output, reference, diff)
 
-        output = kernel(
-            q_latent,
-            q_pe,
-            kv_latent,
-            k_pe,
-            topk_indices,
-            scale,
-            causal=True,
-        )
-        reference = _native_smoke_dense_reference(
-            q_latent, q_pe, kv_latent, k_pe, scale
-        )
-        diff = mx.abs(output.astype(mx.float32) - reference.astype(mx.float32))
-        mx.eval(output, reference, diff)
-
-        max_abs_diff = float(mx.max(diff).item())
-        mean_abs_diff = float(mx.mean(diff).item())
-        row.update(
-            {
-                "native_smoke_symbols": symbols,
-                "native_smoke_shape": list(output.shape),
-                "native_smoke_max_abs_diff": max_abs_diff,
-                "native_smoke_mean_abs_diff": mean_abs_diff,
-                "native_smoke_passed": max_abs_diff <= args.native_smoke_max_diff,
-            }
-        )
-    except Exception as exc:
-        row["native_smoke_error"] = repr(exc)
+            max_abs_diff = float(mx.max(diff).item())
+            mean_abs_diff = float(mx.mean(diff).item())
+            row.update(
+                {
+                    "native_smoke_symbols": symbols,
+                    "native_smoke_shape": list(output.shape),
+                    "native_smoke_max_abs_diff": max_abs_diff,
+                    "native_smoke_mean_abs_diff": mean_abs_diff,
+                    "native_smoke_passed": max_abs_diff <= args.native_smoke_max_diff,
+                }
+            )
+        except Exception as exc:
+            row["native_smoke_error"] = repr(exc)
+    _run_native_q8_vup_smoke(row, args, q8_vup_status)
     return row
 
 
@@ -1212,6 +1309,13 @@ def print_table(rows, output_format):
         "glm_dsa_native_sparse_prefill_primary_fallback",
         "glm_dsa_native_sparse_prefill_config_blocker",
         "glm_dsa_native_sparse_prefill_attempt_min_context",
+        "glm_dsa_native_q8_vup",
+        "glm_dsa_native_q8_vup_env",
+        "glm_dsa_native_q8_vup_available",
+        "glm_dsa_native_q8_vup_source",
+        "glm_dsa_native_q8_vup_import_error",
+        "glm_dsa_native_q8_vup_hits",
+        "glm_dsa_native_q8_vup_fallback_reasons",
         "native_smoke_available",
         "native_smoke_source",
         "native_smoke_import_error",
@@ -1225,11 +1329,20 @@ def print_table(rows, output_format):
         "native_smoke_mean_abs_diff",
         "native_smoke_passed",
         "native_smoke_error",
+        "native_q8_vup_smoke_available",
+        "native_q8_vup_smoke_source",
+        "native_q8_vup_smoke_import_error",
+        "native_q8_vup_smoke_shape",
+        "native_q8_vup_smoke_max_abs_diff",
+        "native_q8_vup_smoke_mean_abs_diff",
+        "native_q8_vup_smoke_passed",
+        "native_q8_vup_smoke_error",
         "glm_dsa_q_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
         "glm_dsa_latent_kv_dequantization_seconds",
         "glm_dsa_latent_kv_projection_seconds",
+        "glm_dsa_native_q8_vup_seconds",
         "glm_dsa_sparse_gather_seconds",
         "glm_dsa_attention_seconds",
         "glm_dsa_native_sparse_attention_seconds",
@@ -1894,6 +2007,16 @@ def main():
         help=(
             "Minimum effective context length before trying the native sparse "
             "MLA route."
+        ),
+    )
+    parser.add_argument(
+        "--native-q8-vup",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the optional native q8 V-up projection for quantized GLM "
+            "DSA unembed_out weights. The default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_Q8_VUP unchanged; unset means enabled."
         ),
     )
     parser.add_argument(

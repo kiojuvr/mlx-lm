@@ -132,7 +132,9 @@ python benchmarks/glm52_prefill_benchmark.py \
 ```
 
 The expected result is `native_smoke_passed=True` with
-`native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`.
+`native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`. The same run also
+checks the native q8 V-up projection for quantized GLM DSA `unembed_out`
+weights; expect `native_q8_vup_smoke_passed=True`.
 
 For full benchmark runs, the native route diagnostics are:
 
@@ -147,6 +149,21 @@ With the usual long-context memory-saving configuration
 That means the extension is loaded, but the current native sparse MLA route is
 not used for the real prefill chunks because the GLM MLA KV cache has already
 become int8 by the time native sparse MLA would be eligible.
+
+The q8 V-up route is independent from sparse MLA. When `unembed_out` is a
+quantized affine `QuantizedMultiLinear` with the fixed GLM-5.2 M3 shape
+64 heads, latent dim 512, value dim 256, group size 64, the model can use the
+vendored `glm_dsa_q8_vup_flat` kernel for the latent-to-value projection.
+Benchmark rows report:
+
+- `glm_dsa_native_q8_vup`
+- `glm_dsa_native_q8_vup_available`
+- `glm_dsa_native_q8_vup_source`
+- `glm_dsa_native_q8_vup_hits`
+- `glm_dsa_native_q8_vup_fallback_reasons`
+
+Use `--native-q8-vup enabled|disabled|default` to force or disable this route
+for comparison runs.
 
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:
