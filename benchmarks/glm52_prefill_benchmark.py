@@ -369,6 +369,11 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
     elif native_sparse_prefill == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "0"
+    native_indexer = getattr(args, "native_indexer", "default")
+    if native_indexer == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "1"
+    elif native_indexer == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "0"
     native_q8_vup = getattr(args, "native_q8_vup", "default")
     if native_q8_vup == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "1"
@@ -404,6 +409,7 @@ def reset_glm_dsa_profile():
 def collect_glm_dsa_profile(args):
     profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
     native_status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
+    native_indexer_status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
     native_q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
     stage_values = {}
     for stage, values in profile["stages"].items():
@@ -450,6 +456,25 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_native_sparse_prefill_fallback_reasons": profile[
             "native_sparse_prefill_fallback_reasons"
         ],
+        "glm_dsa_native_indexer": getattr(args, "native_indexer", "default"),
+        "glm_dsa_native_indexer_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV,
+            "default-on",
+        ),
+        "glm_dsa_native_indexer_available": native_indexer_status["available"],
+        "glm_dsa_native_indexer_source": native_indexer_status["source"],
+        "glm_dsa_native_indexer_import_error": native_indexer_status["import_error"],
+        "glm_dsa_native_indexer_scores_available": native_indexer_status[
+            "scores_available"
+        ],
+        "glm_dsa_native_indexer_topk_available": native_indexer_status[
+            "topk_available"
+        ],
+        "glm_dsa_native_indexer_min_context": native_indexer_status["min_context"],
+        "glm_dsa_native_indexer_hits": profile.get("native_indexer_hits", 0),
+        "glm_dsa_native_indexer_fallback_reasons": profile.get(
+            "native_indexer_fallback_reasons", {}
+        ),
         "glm_dsa_native_q8_vup_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV,
             "default-off",
@@ -712,6 +737,96 @@ def _native_q8_vup_reference(x, q_weight, scales, biases):
     return reference.transpose(0, 2, 1, 3).reshape(B, L, H * V)
 
 
+def _native_indexer_smoke_reference(q, k, weights, *, causal=True):
+    scores = q @ k.swapaxes(-1, -2)
+    scores = mx.maximum(scores, 0)
+    scores = scores * weights.swapaxes(-1, -2)[..., None]
+    scores = scores.sum(axis=1, keepdims=True)
+    if causal:
+        L = q.shape[2]
+        K = k.shape[2]
+        q_positions = mx.arange(L).reshape(1, 1, L, 1)
+        k_positions = mx.arange(K).reshape(1, 1, 1, K)
+        causal_mask = k_positions <= (K - L + q_positions)
+        scores = mx.where(causal_mask, scores, mx.array(-1e9, dtype=scores.dtype))
+    return scores
+
+
+def _run_native_indexer_smoke(row, args, status):
+    if not status["available"]:
+        row["native_indexer_smoke_error"] = "native DSA indexer kernels unavailable"
+        return
+    try:
+        B = 1
+        H = 32
+        L = max(64, ((args.native_smoke_q_len + 63) // 64) * 64)
+        K = max(4096, args.native_smoke_k_len)
+        D = 128
+        topk = 2048
+        mx.random.seed(args.native_smoke_seed + 3)
+        q = mx.random.normal((B, H, L, D), dtype=mx.float16) * 0.02
+        k = mx.random.normal((B, 1, K, D), dtype=mx.float16) * 0.02
+        weights = mx.random.normal((B, L, H), dtype=mx.float16) * 0.02
+        scores = glm_moe_dsa._native_indexer_scores(
+            q,
+            k,
+            weights,
+            causal=True,
+            skip_causal_future_store=False,
+            causal_q_offset=K - L,
+        )
+        if scores is None:
+            raise RuntimeError("native DSA indexer score kernel unavailable")
+        reference = _native_indexer_smoke_reference(q, k, weights, causal=True)
+        q_positions = mx.arange(L).reshape(1, 1, L, 1)
+        k_positions = mx.arange(K).reshape(1, 1, 1, K)
+        causal_mask = k_positions <= (K - L + q_positions)
+        diff = mx.where(
+            causal_mask,
+            mx.abs(scores.astype(mx.float32) - reference.astype(mx.float32)),
+            mx.zeros(scores.shape, dtype=mx.float32),
+        )
+        topk_indices = glm_moe_dsa._native_indexer_topk_indices(
+            scores,
+            topk,
+            bucketed=True,
+            causal_valid_prefix=True,
+        )
+        if topk_indices is None:
+            raise RuntimeError("native DSA indexer top-k kernel unavailable")
+        selected = mx.take_along_axis(
+            reference,
+            topk_indices.astype(mx.int32),
+            axis=-1,
+        )
+        threshold = mx.sort(reference, axis=-1)[..., -topk:]
+        threshold_min = mx.min(threshold, axis=-1, keepdims=True)
+        topk_margin = mx.min(selected - threshold_min)
+        mx.eval(scores, reference, diff, topk_indices, selected, threshold, topk_margin)
+
+        max_abs_diff = float(mx.max(diff).item())
+        mean_abs_diff = float(mx.mean(diff).item())
+        min_topk_margin = float(topk_margin.item())
+        row.update(
+            {
+                "native_indexer_smoke_available": status["available"],
+                "native_indexer_smoke_source": status["source"],
+                "native_indexer_smoke_import_error": status["import_error"],
+                "native_indexer_smoke_score_shape": list(scores.shape),
+                "native_indexer_smoke_topk_shape": list(topk_indices.shape),
+                "native_indexer_smoke_max_abs_diff": max_abs_diff,
+                "native_indexer_smoke_mean_abs_diff": mean_abs_diff,
+                "native_indexer_smoke_min_topk_margin": min_topk_margin,
+                "native_indexer_smoke_passed": (
+                    max_abs_diff <= args.native_smoke_max_diff
+                    and min_topk_margin >= -args.native_smoke_max_diff
+                ),
+            }
+        )
+    except Exception as exc:
+        row["native_indexer_smoke_error"] = repr(exc)
+
+
 def _run_native_q8_vup_benchmark(
     row,
     args,
@@ -770,6 +885,7 @@ def _run_native_q8_vup_benchmark(
 
 def run_native_kernel_smoke(args):
     status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
+    indexer_status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
     q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
     row = {
         "case": "native-smoke",
@@ -787,6 +903,16 @@ def run_native_kernel_smoke(args):
         "native_smoke_mean_abs_diff": None,
         "native_smoke_passed": False,
         "native_smoke_error": None,
+        "native_indexer_smoke_available": indexer_status["available"],
+        "native_indexer_smoke_source": indexer_status["source"],
+        "native_indexer_smoke_import_error": indexer_status["import_error"],
+        "native_indexer_smoke_score_shape": None,
+        "native_indexer_smoke_topk_shape": None,
+        "native_indexer_smoke_max_abs_diff": None,
+        "native_indexer_smoke_mean_abs_diff": None,
+        "native_indexer_smoke_min_topk_margin": None,
+        "native_indexer_smoke_passed": False,
+        "native_indexer_smoke_error": None,
         "native_q8_vup_smoke_available": q8_vup_status["available"],
         "native_q8_vup_smoke_source": q8_vup_status["source"],
         "native_q8_vup_smoke_import_error": q8_vup_status["import_error"],
@@ -871,6 +997,7 @@ def run_native_kernel_smoke(args):
             )
         except Exception as exc:
             row["native_smoke_error"] = repr(exc)
+    _run_native_indexer_smoke(row, args, indexer_status)
     _run_native_q8_vup_smoke(row, args, q8_vup_status)
     return row
 
@@ -1401,6 +1528,16 @@ def print_table(rows, output_format):
         "glm_dsa_native_sparse_prefill_primary_fallback",
         "glm_dsa_native_sparse_prefill_config_blocker",
         "glm_dsa_native_sparse_prefill_attempt_min_context",
+        "glm_dsa_native_indexer",
+        "glm_dsa_native_indexer_env",
+        "glm_dsa_native_indexer_available",
+        "glm_dsa_native_indexer_source",
+        "glm_dsa_native_indexer_import_error",
+        "glm_dsa_native_indexer_scores_available",
+        "glm_dsa_native_indexer_topk_available",
+        "glm_dsa_native_indexer_min_context",
+        "glm_dsa_native_indexer_hits",
+        "glm_dsa_native_indexer_fallback_reasons",
         "glm_dsa_native_q8_vup",
         "glm_dsa_native_q8_vup_env",
         "glm_dsa_native_q8_vup_available",
@@ -1421,6 +1558,16 @@ def print_table(rows, output_format):
         "native_smoke_mean_abs_diff",
         "native_smoke_passed",
         "native_smoke_error",
+        "native_indexer_smoke_available",
+        "native_indexer_smoke_source",
+        "native_indexer_smoke_import_error",
+        "native_indexer_smoke_score_shape",
+        "native_indexer_smoke_topk_shape",
+        "native_indexer_smoke_max_abs_diff",
+        "native_indexer_smoke_mean_abs_diff",
+        "native_indexer_smoke_min_topk_margin",
+        "native_indexer_smoke_passed",
+        "native_indexer_smoke_error",
         "native_q8_vup_smoke_available",
         "native_q8_vup_smoke_source",
         "native_q8_vup_smoke_import_error",
@@ -1443,6 +1590,8 @@ def print_table(rows, output_format):
         "glm_dsa_q_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
+        "glm_dsa_native_indexer_scores_seconds",
+        "glm_dsa_native_indexer_topk_seconds",
         "glm_dsa_latent_kv_dequantization_seconds",
         "glm_dsa_latent_kv_projection_seconds",
         "glm_dsa_native_q8_vup_seconds",
@@ -2110,6 +2259,17 @@ def main():
         help=(
             "Minimum effective context length before trying the native sparse "
             "MLA route."
+        ),
+    )
+    parser.add_argument(
+        "--native-indexer",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the optional native GLM DSA indexer score/top-k route. "
+            "The default leaves MLX_LM_GLM_DSA_NATIVE_INDEXER unchanged; "
+            "unset means enabled when compatible vendored symbols and shapes "
+            "are available."
         ),
     )
     parser.add_argument(

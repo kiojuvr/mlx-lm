@@ -38,6 +38,7 @@ GLM_DSA_NATIVE_SPARSE_PREFILL_ENV = "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL"
 GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV = (
     "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT"
 )
+GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 
@@ -45,6 +46,8 @@ _PROFILE_STAGES = (
     "q_projection",
     "kv_cache_update",
     "dsa_indexer_topk",
+    "native_indexer_scores",
+    "native_indexer_topk",
     "latent_kv_dequantization",
     "latent_kv_projection",
     "native_q8_vup",
@@ -84,6 +87,10 @@ def _fast_prefill_enabled() -> bool:
 
 def _native_sparse_prefill_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_SPARSE_PREFILL_ENV, True)
+
+
+def _native_indexer_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_INDEXER_ENV, True)
 
 
 def _native_q8_vup_enabled() -> bool:
@@ -158,6 +165,8 @@ def _new_profile():
         "fallback_reasons": Counter(),
         "native_sparse_prefill_hits": 0,
         "native_sparse_prefill_fallback_reasons": Counter(),
+        "native_indexer_hits": 0,
+        "native_indexer_fallback_reasons": Counter(),
         "native_q8_vup_hits": 0,
         "native_q8_vup_fallback_reasons": Counter(),
     }
@@ -184,6 +193,10 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         ],
         "native_sparse_prefill_fallback_reasons": dict(
             _GLM_DSA_PREFILL_PROFILE["native_sparse_prefill_fallback_reasons"]
+        ),
+        "native_indexer_hits": _GLM_DSA_PREFILL_PROFILE["native_indexer_hits"],
+        "native_indexer_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_indexer_fallback_reasons"]
         ),
         "native_q8_vup_hits": _GLM_DSA_PREFILL_PROFILE["native_q8_vup_hits"],
         "native_q8_vup_fallback_reasons": dict(
@@ -236,6 +249,20 @@ def _record_native_sparse_prefill_decision(used: bool, reason: str):
             _LOGGER.info(
                 "GLM DSA native sparse MLA prefill fallback: %s", reason
             )
+
+
+def _record_native_indexer_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_indexer_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_indexer_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info("GLM DSA native indexer enabled")
+        else:
+            _LOGGER.info("GLM DSA native indexer fallback: %s", reason)
 
 
 def _record_native_q8_vup_decision(used: bool, reason: str):
@@ -341,6 +368,123 @@ def _native_q8_vup_kernel():
     return _NATIVE_Q8_VUP_KERNEL
 
 
+def _native_indexer_fast_module():
+    try:
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+    except Exception as exc:
+        return None, None, exc
+    source = (
+        "mlx_lm.custom_kernels.glm_moe_dsa"
+        if fast.is_native_available()
+        else "mlx.core.fast"
+    )
+    return fast, source, fast.import_error()
+
+
+def _native_indexer_available():
+    fast, _source, _error = _native_indexer_fast_module()
+    if fast is None:
+        return False
+    return fast.has_symbol("dsa_indexer_scores") and fast.has_symbol(
+        "dsa_topk_indices"
+    )
+
+
+def _native_indexer_scores(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    *,
+    causal: bool,
+    skip_causal_future_store: bool = False,
+    causal_q_offset: int = -1,
+):
+    fast, _source, _error = _native_indexer_fast_module()
+    if (
+        fast is None
+        or not fast.has_symbol("dsa_indexer_scores")
+        or len(queries.shape) != 4
+        or len(keys.shape) != 4
+        or len(weights.shape) != 3
+        or queries.shape[0] != keys.shape[0]
+        or queries.shape[0] != weights.shape[0]
+        or queries.shape[1] != 32
+        or keys.shape[1] != 1
+        or queries.shape[2] != weights.shape[1]
+        or queries.shape[1] != weights.shape[2]
+        or queries.shape[3] != 128
+        or keys.shape[3] != 128
+        or keys.shape[2] < 4096
+        or queries.dtype != keys.dtype
+        or queries.dtype != weights.dtype
+        or queries.dtype not in (mx.float16, mx.bfloat16)
+    ):
+        return None
+
+    _B, _H, L, _D = queries.shape
+    K = keys.shape[2]
+    q_pad = (-L) % 64
+    k_pad = (-K) % 64
+    if causal and causal_q_offset < 0 and (q_pad or k_pad):
+        causal_q_offset = K - L
+
+    q = queries
+    k = keys
+    w = weights
+    if q_pad:
+        q = mx.pad(q, [(0, 0), (0, 0), (0, q_pad), (0, 0)])
+        w = mx.pad(w, [(0, 0), (0, q_pad), (0, 0)])
+    if k_pad:
+        k = mx.pad(k, [(0, 0), (0, 0), (0, k_pad), (0, 0)])
+
+    try:
+        scores = fast.dsa_indexer_scores(
+            q,
+            k,
+            w,
+            causal=causal,
+            unused_causal_prefix_topk=0,
+            skip_causal_future_store=skip_causal_future_store,
+            causal_q_offset=causal_q_offset,
+            stream=mx.gpu,
+        )
+    except Exception:
+        return None
+    if q_pad or k_pad:
+        scores = scores[:, :, :L, :K]
+    return scores
+
+
+def _native_indexer_topk_indices(
+    scores: mx.array,
+    topk: int,
+    *,
+    bucketed: bool,
+    causal_valid_prefix: bool,
+):
+    fast, _source, _error = _native_indexer_fast_module()
+    if (
+        fast is None
+        or not fast.has_symbol("dsa_topk_indices")
+        or len(scores.shape) != 4
+        or scores.shape[1] != 1
+        or topk != 2048
+        or scores.shape[-1] < topk
+        or scores.dtype not in (mx.float16, mx.bfloat16)
+    ):
+        return None
+    try:
+        return fast.dsa_topk_indices(
+            scores,
+            topk,
+            bucketed=bucketed,
+            causal_valid_prefix=causal_valid_prefix,
+            stream=mx.gpu,
+        )
+    except Exception:
+        return None
+
+
 def get_glm_dsa_native_sparse_prefill_status():
     kernel = _native_sparse_mla_kernel()
     return {
@@ -353,6 +497,21 @@ def get_glm_dsa_native_sparse_prefill_status():
             else None
         ),
         "min_context": _native_sparse_prefill_min_context_length(),
+    }
+
+
+def get_glm_dsa_native_indexer_status():
+    fast, source, import_error = _native_indexer_fast_module()
+    scores_available = fast is not None and fast.has_symbol("dsa_indexer_scores")
+    topk_available = fast is not None and fast.has_symbol("dsa_topk_indices")
+    return {
+        "enabled": _native_indexer_enabled(),
+        "available": scores_available and topk_available,
+        "source": source if scores_available and topk_available else None,
+        "import_error": repr(import_error) if import_error is not None else None,
+        "scores_available": scores_available,
+        "topk_available": topk_available,
+        "min_context": 4096,
     }
 
 
@@ -597,6 +756,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0], dtype=k.dtype))
         if k.shape[2] <= indexer.index_topk:
             return None
+        native_indices = self._native_indexer_topk(q, x, k, mask)
+        if native_indices is not None:
+            return native_indices
         if (
             _fast_prefill_enabled()
             and b == 1
@@ -627,6 +789,94 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         return mx.argpartition(scores, kth=-indexer.index_topk, axis=-1)[
             ..., -indexer.index_topk :
         ]
+
+    def _native_indexer_decision(
+        self,
+        q: mx.array,
+        x: mx.array,
+        k: mx.array,
+        mask: Optional[mx.array],
+    ):
+        indexer = self.indexer
+        if not _fast_prefill_enabled():
+            return False, "fast_prefill_disabled"
+        if not _native_indexer_enabled():
+            return False, "disabled"
+        if not _native_indexer_available():
+            return False, "missing_symbol"
+        if mask is not None and len(mask.shape) != 4:
+            return False, "mask_rank"
+        B, H, L, D = q.shape
+        if B != 1:
+            return False, "batch_size_not_one"
+        if L <= 1:
+            return False, "decode"
+        if H != 32:
+            return False, f"unsupported_index_heads:{H}"
+        if D != 128:
+            return False, f"unsupported_index_head_dim:{D}"
+        if k.shape[1] != 1:
+            return False, "unsupported_kv_heads"
+        if k.shape[-1] != D:
+            return False, "mixed_index_head_dim"
+        if indexer.index_topk != 2048:
+            return False, f"unsupported_topk:{indexer.index_topk}"
+        if k.shape[2] < 4096:
+            return False, "below_native_indexer_min_context"
+        if q.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{q.dtype}"
+        if k.dtype != q.dtype:
+            return False, "mixed_dtype"
+        return True, "native_indexer"
+
+    def _native_indexer_topk(
+        self,
+        q: mx.array,
+        x: mx.array,
+        k: mx.array,
+        mask: Optional[mx.array],
+    ):
+        use_native, reason = self._native_indexer_decision(q, x, k, mask)
+        if not use_native:
+            _record_native_indexer_decision(False, reason)
+            return None
+
+        indexer = self.indexer
+        weights = indexer.weights_proj(x) * (
+            indexer.n_heads**-0.5 * indexer.softmax_scale
+        )
+        if weights.dtype != q.dtype:
+            _record_native_indexer_decision(False, "mixed_weight_dtype")
+            return None
+        causal = mask is not None
+        scores = _profile_stage(
+            "native_indexer_scores",
+            lambda: _native_indexer_scores(
+                q,
+                k,
+                weights,
+                causal=causal,
+                skip_causal_future_store=causal,
+                causal_q_offset=k.shape[2] - q.shape[2] if causal else -1,
+            ),
+        )
+        if scores is None:
+            _record_native_indexer_decision(False, "scores_unavailable")
+            return None
+        indices = _profile_stage(
+            "native_indexer_topk",
+            lambda: _native_indexer_topk_indices(
+                scores,
+                indexer.index_topk,
+                bucketed=True,
+                causal_valid_prefix=causal,
+            ),
+        )
+        if indices is None:
+            _record_native_indexer_decision(False, "topk_unavailable")
+            return None
+        _record_native_indexer_decision(True, reason)
+        return indices
 
     def _block_indexer_topk(
         self,

@@ -1,8 +1,8 @@
 # GLM MoE DSA Custom Kernels
 
 This package vendors the GLM MoE DSA native custom kernels from oMLX so this
-GLM-5.2-focused fork can build and run the native sparse MLA route without a
-runtime dependency on the changing oMLX repository.
+GLM-5.2-focused fork can build and run the native DSA indexer, sparse MLA, and
+q8 V-up routes without a runtime dependency on the changing oMLX repository.
 
 Vendored source:
 

@@ -122,6 +122,31 @@ The benchmark exposes `--native-sparse-prefill enabled|disabled|default` and
 symbol source, import error, hit count, and fallback reasons so a run can
 distinguish "native extension missing" from "shape or cache guard rejected".
 
+The same vendored extension can also accelerate the DSA indexer score/top-k
+stage before sparse MLA attention is selected. This route is enabled by default
+when `MLX_LM_GLM_DSA_NATIVE_INDEXER` is unset, and can be controlled with:
+
+```sh
+MLX_LM_GLM_DSA_NATIVE_INDEXER=0 python ...
+```
+
+or in the benchmark with `--native-indexer enabled|disabled|default`. The
+current native indexer route is intentionally limited to the fixed GLM-5.2 M3
+shape: 32 DSA indexer heads, head dim 128, top-k 2048, batch size 1, fp16/bf16
+inputs, and effective context at or above 4096. It remains compatible with GLM
+MLA int8 KV cache because it reads the separate DSA indexer cache rather than
+the quantized MLA latent KV cache.
+
+Benchmark rows report:
+
+- `glm_dsa_native_indexer`
+- `glm_dsa_native_indexer_available`
+- `glm_dsa_native_indexer_source`
+- `glm_dsa_native_indexer_scores_available`
+- `glm_dsa_native_indexer_topk_available`
+- `glm_dsa_native_indexer_hits`
+- `glm_dsa_native_indexer_fallback_reasons`
+
 Before a long model run, use the native smoke mode to check the self-contained
 extension and compare the tiny native sparse MLA output against a dense MLX
 reference. This mode does not load the GLM-5.2 model:
@@ -134,8 +159,10 @@ python benchmarks/glm52_prefill_benchmark.py \
 
 The expected result is `native_smoke_passed=True` with
 `native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`. The same run also
-checks the native q8 V-up projection for quantized GLM DSA `unembed_out`
-weights; expect `native_q8_vup_smoke_passed=True`.
+checks native DSA indexer score/top-k; expect
+`native_indexer_smoke_passed=True`. It also checks the native q8 V-up projection
+for quantized GLM DSA `unembed_out` weights; expect
+`native_q8_vup_smoke_passed=True`.
 
 Add timing runs to compare native q8 V-up with the MLX `quantized_matmul`
 reference without loading the GLM-5.2 model:
@@ -203,6 +230,11 @@ satisfied. Current fallback reasons include:
 - `non_scalar_offset`: cache offsets that cannot be resolved to one value;
 - `topk_shape`, `topk_heads`, `topk_rank`, `topk_exceeds_context`, and
   `unsupported_kv_heads`: shape/layout guards.
+- native indexer fallback reasons include `missing_symbol`,
+  `below_native_indexer_min_context`, `unsupported_index_heads:*`,
+  `unsupported_index_head_dim:*`, `unsupported_topk:*`, `unsupported_dtype:*`,
+  `mixed_dtype`, `mixed_weight_dtype`, `scores_unavailable`, and
+  `topk_unavailable`.
 
 These reasons are available from
 `mlx_lm.models.glm_moe_dsa.get_glm_dsa_prefill_profile()` and are also emitted
@@ -218,6 +250,8 @@ but reports:
 - `glm_dsa_q_projection_seconds`
 - `glm_dsa_kv_cache_update_seconds`
 - `glm_dsa_dsa_indexer_topk_seconds`
+- `glm_dsa_native_indexer_scores_seconds`
+- `glm_dsa_native_indexer_topk_seconds`
 - `glm_dsa_latent_kv_dequantization_seconds`
 - `glm_dsa_latent_kv_projection_seconds`
 - `glm_dsa_sparse_gather_seconds`

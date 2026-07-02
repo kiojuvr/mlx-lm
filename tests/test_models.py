@@ -654,6 +654,72 @@ class TestModels(unittest.TestCase):
             ) = native_state
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_native_indexer_decision_uses_real_shape(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        old_available = glm_moe_dsa._native_indexer_available
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "1"
+            glm_moe_dsa._native_indexer_available = lambda: True
+
+            fake_attention = type(
+                "FakeAttention",
+                (),
+                {"indexer": type("FakeIndexer", (), {"index_topk": 2048})()},
+            )()
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._native_indexer_decision(
+                fake_attention,
+                q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
+                x=mx.zeros((1, 64, 4096), dtype=mx.float16),
+                k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
+                mask=mx.ones((1, 1, 64, 4096), dtype=mx.bool_),
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(reason, "native_indexer")
+        finally:
+            glm_moe_dsa._native_indexer_available = old_available
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_indexer_decision_respects_master_switch(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        old_available = glm_moe_dsa._native_indexer_available
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "1"
+            glm_moe_dsa._native_indexer_available = lambda: True
+
+            fake_attention = type(
+                "FakeAttention",
+                (),
+                {"indexer": type("FakeIndexer", (), {"index_topk": 2048})()},
+            )()
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._native_indexer_decision(
+                fake_attention,
+                q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
+                x=mx.zeros((1, 64, 4096), dtype=mx.float16),
+                k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
+                mask=mx.ones((1, 1, 64, 4096), dtype=mx.bool_),
+            )
+
+            self.assertFalse(ready)
+            self.assertEqual(reason, "fast_prefill_disabled")
+        finally:
+            glm_moe_dsa._native_indexer_available = old_available
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_native_q8_vup_projection_matches_fallback(self):
         from mlx_lm.models import glm_moe_dsa
         from mlx_lm.models.mla import QuantizedMultiLinear
