@@ -363,6 +363,11 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
     elif args.fast_prefill == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+    native_sparse_prefill = getattr(args, "native_sparse_prefill", "default")
+    if native_sparse_prefill == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+    elif native_sparse_prefill == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "0"
     if args.fast_prefill_query_chunk is not None:
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
@@ -375,6 +380,13 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = str(
             args.fast_prefill_min_context
         )
+    native_sparse_prefill_min_context = getattr(
+        args, "native_sparse_prefill_min_context", None
+    )
+    if native_sparse_prefill_min_context is not None:
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV] = str(
+            native_sparse_prefill_min_context
+        )
     if args.prefill_profile:
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ENV] = "1"
 
@@ -385,6 +397,7 @@ def reset_glm_dsa_profile():
 
 def collect_glm_dsa_profile(args):
     profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+    native_status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
     stage_values = {}
     for stage, values in profile["stages"].items():
         key = f"glm_dsa_{stage}_seconds"
@@ -408,8 +421,28 @@ def collect_glm_dsa_profile(args):
             glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
             "default",
         ),
+        "glm_dsa_native_sparse_prefill": getattr(
+            args, "native_sparse_prefill", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            "default-on",
+        ),
+        "glm_dsa_native_sparse_prefill_available": native_status["available"],
+        "glm_dsa_native_sparse_prefill_source": native_status["source"],
+        "glm_dsa_native_sparse_prefill_import_error": native_status["import_error"],
+        "glm_dsa_native_sparse_prefill_min_context": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+            "default",
+        ),
         "glm_dsa_fast_prefill_hits": profile["fast_prefill_hits"],
         "glm_dsa_fast_prefill_fallback_reasons": profile["fallback_reasons"],
+        "glm_dsa_native_sparse_prefill_hits": profile[
+            "native_sparse_prefill_hits"
+        ],
+        "glm_dsa_native_sparse_prefill_fallback_reasons": profile[
+            "native_sparse_prefill_fallback_reasons"
+        ],
         **stage_values,
     }
 
@@ -920,8 +953,16 @@ def print_table(rows, output_format):
         "glm_dsa_fast_prefill_query_chunk",
         "glm_dsa_fast_prefill_key_block",
         "glm_dsa_sparse_prefill_min_context",
+        "glm_dsa_native_sparse_prefill",
+        "glm_dsa_native_sparse_prefill_env",
+        "glm_dsa_native_sparse_prefill_available",
+        "glm_dsa_native_sparse_prefill_source",
+        "glm_dsa_native_sparse_prefill_import_error",
+        "glm_dsa_native_sparse_prefill_min_context",
         "glm_dsa_fast_prefill_hits",
         "glm_dsa_fast_prefill_fallback_reasons",
+        "glm_dsa_native_sparse_prefill_hits",
+        "glm_dsa_native_sparse_prefill_fallback_reasons",
         "glm_dsa_q_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
@@ -929,6 +970,7 @@ def print_table(rows, output_format):
         "glm_dsa_latent_kv_projection_seconds",
         "glm_dsa_sparse_gather_seconds",
         "glm_dsa_attention_seconds",
+        "glm_dsa_native_sparse_attention_seconds",
         "glm_dsa_total_prefill_seconds",
     ]
     delimiter = "," if output_format == "csv" else "\t"
@@ -1566,6 +1608,25 @@ def main():
         help=(
             "Minimum effective context length before using the GLM DSA sparse "
             "prefill path."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-prefill",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the optional GLM DSA native sparse MLA prefill route. "
+            "The default leaves MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL unchanged; "
+            "unset means enabled but only used when a compatible native symbol "
+            "and shape are available."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-prefill-min-context",
+        type=int,
+        help=(
+            "Minimum effective context length before trying the native sparse "
+            "MLA route."
         ),
     )
     parser.add_argument(

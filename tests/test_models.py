@@ -504,6 +504,106 @@ class TestModels(unittest.TestCase):
         finally:
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_native_sparse_prefill_missing_symbol_falls_back(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        prefix = mx.array([[1, 2, 3, 4]])
+        suffix = mx.array([[5, 6, 7, 8]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL = None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE = None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR = RuntimeError("missing")
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            cache = make_prompt_cache(model)
+            model(prefix, cache=cache)
+            logits = model(suffix, cache=cache)
+            mx.eval(logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertGreater(profile["fast_prefill_hits"], 0)
+            self.assertEqual(profile["native_sparse_prefill_hits"], 0)
+            self.assertGreater(
+                profile["native_sparse_prefill_fallback_reasons"].get(
+                    "missing_symbol", 0
+                ),
+                0,
+            )
+            self.assertTrue(mx.all(mx.isfinite(logits)).item())
+        finally:
+            (
+                glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_sparse_prefill_quantized_kv_guard(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV
+            ] = "0"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL = lambda *args, **kwargs: None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE = "test"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {"num_heads": 64})()
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
+                fake_attention,
+                B=1,
+                L=2,
+                kv_cache=QuantizedGlmMlaKVCache(),
+                kv_latent=(),
+                k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+            )
+
+            self.assertFalse(ready)
+            self.assertEqual(reason, "quantized_kv")
+        finally:
+            (
+                glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_quantized_fast_prefill_dequantizes_selected_kv(self):
         from mlx_lm.models import glm_moe_dsa
 

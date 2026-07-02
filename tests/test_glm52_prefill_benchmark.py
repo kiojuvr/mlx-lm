@@ -483,6 +483,50 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["prefill_stop_after_tokens"], 6)
         self.assertGreater(row["prompt_tps"], 0)
 
+    def test_collect_profile_reports_native_sparse_prefill_status(self):
+        old_profile = benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile
+        old_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+
+        def fake_profile():
+            return {
+                "stages": {},
+                "fast_prefill_hits": 3,
+                "fallback_reasons": {"below_sparse_min_context": 1},
+                "native_sparse_prefill_hits": 2,
+                "native_sparse_prefill_fallback_reasons": {"quantized_kv": 1},
+            }
+
+        def fake_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "test",
+                "import_error": None,
+                "min_context": 0,
+            }
+
+        args = Namespace(
+            prefill_profile=False,
+            fast_prefill="enabled",
+            native_sparse_prefill="enabled",
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = fake_profile
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = fake_status
+        try:
+            profile = benchmark.collect_glm_dsa_profile(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = old_profile
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = old_status
+
+        self.assertEqual(profile["glm_dsa_native_sparse_prefill"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_sparse_prefill_available"])
+        self.assertEqual(profile["glm_dsa_native_sparse_prefill_source"], "test")
+        self.assertEqual(profile["glm_dsa_native_sparse_prefill_hits"], 2)
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_fallback_reasons"],
+            {"quantized_kv": 1},
+        )
+
     def test_policy_sweep_runs_isolated_candidates(self):
         args = Namespace(
             lcp_prefix_tokens=4,

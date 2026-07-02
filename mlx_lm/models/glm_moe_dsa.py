@@ -33,6 +33,10 @@ GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV = "MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK"
 GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV = (
     "MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT"
 )
+GLM_DSA_NATIVE_SPARSE_PREFILL_ENV = "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL"
+GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT"
+)
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 
 _PROFILE_STAGES = (
@@ -43,15 +47,21 @@ _PROFILE_STAGES = (
     "latent_kv_projection",
     "sparse_gather",
     "attention",
+    "native_sparse_attention",
     "total_prefill",
 )
 _DEFAULT_FAST_PREFILL_QUERY_CHUNK = 16
 _DEFAULT_FAST_PREFILL_KEY_BLOCK = 8192
 _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT = 131072
+_DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT = 11264
 _FAST_PREFILL_LARGE_TOPK_WARNING = 1024
 _LOGGER = logging.getLogger(__name__)
 _GLM_DSA_PREFILL_PROFILE = None
 _WARNED_FAST_PREFILL_LARGE_TOPK = False
+_NATIVE_SPARSE_MLA_LOOKUP_DONE = False
+_NATIVE_SPARSE_MLA_KERNEL = None
+_NATIVE_SPARSE_MLA_SOURCE = None
+_NATIVE_SPARSE_MLA_IMPORT_ERROR = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -63,6 +73,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _fast_prefill_enabled() -> bool:
     return _env_flag(GLM_DSA_FAST_PREFILL_ENV, True)
+
+
+def _native_sparse_prefill_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_SPARSE_PREFILL_ENV, True)
 
 
 def _prefill_profile_enabled() -> bool:
@@ -104,6 +118,16 @@ def _sparse_prefill_min_context_length() -> int:
     return _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT
 
 
+def _native_sparse_prefill_min_context_length() -> int:
+    raw_value = os.environ.get(GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV)
+    if raw_value is not None:
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            pass
+    return _DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT
+
+
 def _sparse_prefill_min_effective_context_length() -> int:
     # Generation prefill leaves the final prompt token for logits, so a nominal
     # N-token prompt can expose at most N-1 tokens to the attention call.
@@ -121,6 +145,8 @@ def _new_profile():
         },
         "fast_prefill_hits": 0,
         "fallback_reasons": Counter(),
+        "native_sparse_prefill_hits": 0,
+        "native_sparse_prefill_fallback_reasons": Counter(),
     }
 
 
@@ -140,6 +166,12 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         },
         "fast_prefill_hits": _GLM_DSA_PREFILL_PROFILE["fast_prefill_hits"],
         "fallback_reasons": dict(_GLM_DSA_PREFILL_PROFILE["fallback_reasons"]),
+        "native_sparse_prefill_hits": _GLM_DSA_PREFILL_PROFILE[
+            "native_sparse_prefill_hits"
+        ],
+        "native_sparse_prefill_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_sparse_prefill_fallback_reasons"]
+        ),
     }
     if reset:
         reset_glm_dsa_prefill_profile()
@@ -166,6 +198,79 @@ def _record_fast_prefill_decision(used: bool, reason: str):
             _LOGGER.info("GLM DSA fast sparse prefill enabled")
         else:
             _LOGGER.info("GLM DSA fast sparse prefill fallback: %s", reason)
+
+
+def _record_native_sparse_prefill_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_sparse_prefill_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_sparse_prefill_fallback_reasons"][
+            reason
+        ] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native sparse MLA prefill enabled: source=%s",
+                _NATIVE_SPARSE_MLA_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info(
+                "GLM DSA native sparse MLA prefill fallback: %s", reason
+            )
+
+
+def _native_sparse_mla_kernel():
+    global _NATIVE_SPARSE_MLA_LOOKUP_DONE
+    global _NATIVE_SPARSE_MLA_KERNEL
+    global _NATIVE_SPARSE_MLA_SOURCE
+    global _NATIVE_SPARSE_MLA_IMPORT_ERROR
+    if _NATIVE_SPARSE_MLA_LOOKUP_DONE:
+        return _NATIVE_SPARSE_MLA_KERNEL
+
+    _NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+    _NATIVE_SPARSE_MLA_KERNEL = None
+    _NATIVE_SPARSE_MLA_SOURCE = None
+    _NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as omlx_fast
+
+        has_symbol = getattr(omlx_fast, "has_symbol", None)
+        if (
+            has_symbol is not None
+            and has_symbol("glm_dsa_sparse_mla_attention")
+            and hasattr(omlx_fast, "glm_dsa_sparse_mla_attention")
+        ):
+            _NATIVE_SPARSE_MLA_KERNEL = omlx_fast.glm_dsa_sparse_mla_attention
+            _NATIVE_SPARSE_MLA_SOURCE = "omlx.custom_kernels.glm_moe_dsa"
+            return _NATIVE_SPARSE_MLA_KERNEL
+        if hasattr(omlx_fast, "import_error"):
+            _NATIVE_SPARSE_MLA_IMPORT_ERROR = omlx_fast.import_error()
+    except Exception as exc:
+        _NATIVE_SPARSE_MLA_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_sparse_mla_attention"):
+        _NATIVE_SPARSE_MLA_KERNEL = mx.fast.glm_dsa_sparse_mla_attention
+        _NATIVE_SPARSE_MLA_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_SPARSE_MLA_KERNEL
+
+
+def get_glm_dsa_native_sparse_prefill_status():
+    kernel = _native_sparse_mla_kernel()
+    return {
+        "enabled": _native_sparse_prefill_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_SPARSE_MLA_SOURCE,
+        "import_error": (
+            repr(_NATIVE_SPARSE_MLA_IMPORT_ERROR)
+            if _NATIVE_SPARSE_MLA_IMPORT_ERROR is not None
+            else None
+        ),
+        "min_context": _native_sparse_prefill_min_context_length(),
+    }
 
 
 def _warn_fast_prefill_large_topk(topk: int):
@@ -556,6 +661,98 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         _warn_fast_prefill_large_topk(K)
         return True, "fast"
 
+    def _native_sparse_prefill_decision(
+        self,
+        *,
+        B: int,
+        L: int,
+        kv_cache: Any,
+        kv_latent: Any,
+        k_pe: mx.array,
+        topk_indices: mx.array,
+    ):
+        if not _native_sparse_prefill_enabled():
+            return False, "disabled"
+        if _native_sparse_mla_kernel() is None:
+            return False, "missing_symbol"
+        if L <= 1:
+            return False, "decode"
+        if not isinstance(kv_cache, GlmMlaKVCache):
+            if isinstance(
+                kv_cache, (QuantizedGlmMlaKVCache, BatchQuantizedGlmMlaKVCache)
+            ):
+                return False, "quantized_kv"
+            if isinstance(kv_cache, BatchGlmMlaKVCache):
+                return False, "batched_kv_cache"
+            return False, f"unsupported_cache:{type(kv_cache).__name__}"
+        if isinstance(kv_latent, (tuple, list)):
+            return False, "quantized_kv_state"
+        if B != 1:
+            return False, "batch_size_not_one"
+        if topk_indices.shape[1] != 1:
+            return False, "topk_heads"
+        if self.num_heads != 64:
+            return False, "unsupported_heads"
+        rope_dim = k_pe.shape[-1]
+        if rope_dim != 64:
+            return False, f"unsupported_rope_dim:{rope_dim}"
+        if kv_latent.shape[1] != 1 or k_pe.shape[1] != 1:
+            return False, "unsupported_kv_heads"
+        if kv_latent.shape[-1] != 512:
+            return False, f"unsupported_latent_dim:{kv_latent.shape[-1]}"
+        if topk_indices.shape[-1] != 2048:
+            return False, f"unsupported_topk:{topk_indices.shape[-1]}"
+        if k_pe.shape[2] < _native_sparse_prefill_min_context_length():
+            return False, "below_native_sparse_min_context"
+        if kv_latent.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_kv_dtype:{kv_latent.dtype}"
+        if k_pe.dtype != kv_latent.dtype:
+            return False, "mixed_kv_dtype"
+        return True, "native_sparse_mla"
+
+    def _native_sparse_prefill_attention(
+        self,
+        q_nope: mx.array,
+        q_pe: mx.array,
+        kv_latent: mx.array,
+        k_pe: mx.array,
+        topk_indices: mx.array,
+    ):
+        kernel = _native_sparse_mla_kernel()
+        if kernel is None:
+            return None, "missing_symbol"
+        topk = (
+            topk_indices
+            if topk_indices.dtype == mx.uint32
+            else topk_indices.astype(mx.uint32)
+        )
+        try:
+            q_latent = _profile_stage(
+                "latent_kv_projection",
+                lambda: self.embed_q(q_nope),
+            )
+            output = _profile_stage(
+                "native_sparse_attention",
+                lambda: kernel(
+                    q_latent,
+                    q_pe,
+                    kv_latent,
+                    k_pe,
+                    topk,
+                    self.scale,
+                    causal=True,
+                ),
+            )
+            return (
+                _profile_stage(
+                    "latent_kv_projection",
+                    lambda: self.unembed_out(output),
+                ),
+                "native_sparse_mla",
+            )
+        except Exception as exc:
+            return None, f"runtime_error:{type(exc).__name__}"
+
     def _fast_sparse_prefill_attention(
         self,
         q_nope: mx.array,
@@ -739,6 +936,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             topk_indices = prev_topk_indices
 
         fast_sparse_prefill = False
+        native_sparse_prefill = False
+        native_sparse_prefill_reason = None
         if topk_indices is not None:
             if L == 1:
                 _record_fast_prefill_decision(False, "decode")
@@ -761,7 +960,22 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     k_pe=k_pe,
                 )
                 _record_fast_prefill_decision(fast_sparse_prefill, reason)
-                if not fast_sparse_prefill:
+                if fast_sparse_prefill:
+                    native_sparse_prefill, native_sparse_prefill_reason = (
+                        self._native_sparse_prefill_decision(
+                            B=B,
+                            L=L,
+                            kv_cache=kv_cache,
+                            kv_latent=kv_latent,
+                            k_pe=k_pe,
+                            topk_indices=topk_indices,
+                        )
+                    )
+                    if not native_sparse_prefill:
+                        _record_native_sparse_prefill_decision(
+                            False, native_sparse_prefill_reason
+                        )
+                else:
                     ensure_kv_latent_dequantized()
                     shape = list(topk_indices.shape)
                     shape[-1] = kv_latent.shape[2]
@@ -788,7 +1002,32 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     cache[0].keys, (cache[1].keys, cache[1].values)
                 )
 
-        if fast_sparse_prefill:
+        if native_sparse_prefill:
+            output, native_sparse_prefill_reason = self._native_sparse_prefill_attention(
+                q_nope,
+                q_pe,
+                kv_latent,
+                k_pe,
+                topk_indices,
+            )
+            if output is not None:
+                _record_native_sparse_prefill_decision(
+                    True, native_sparse_prefill_reason
+                )
+            else:
+                _record_native_sparse_prefill_decision(
+                    False, native_sparse_prefill_reason
+                )
+                output = self._fast_sparse_prefill_attention(
+                    q_nope,
+                    q_pe,
+                    kv_cache,
+                    kv_latent,
+                    k_pe,
+                    topk_indices,
+                    mask,
+                )
+        elif fast_sparse_prefill:
             output = self._fast_sparse_prefill_attention(
                 q_nope,
                 q_pe,

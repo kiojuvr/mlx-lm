@@ -106,6 +106,20 @@ The sparse handoff point can be tuned with:
 MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 python ...
 ```
 
+When a compatible native sparse MLA symbol is available, the model can try a
+deeper native route inside the sparse fast path. It is enabled by default but
+only activates for the fixed M3 GLM shape currently supported by the oMLX kernel:
+64 heads, latent dim 512, RoPE dim 64, top-k 2048, unquantized `GlmMlaKVCache`,
+and an effective context at or above
+`MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 11264). Quantized
+GLM MLA KV cache still falls back to the existing selected-KV sparse path so it
+does not force full-cache dequantization.
+
+The benchmark exposes `--native-sparse-prefill enabled|disabled|default` and
+`--native-sparse-prefill-min-context`. It also reports native availability,
+symbol source, import error, hit count, and fallback reasons so a run can
+distinguish "native extension missing" from "shape or cache guard rejected".
+
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:
 
@@ -143,6 +157,7 @@ but reports:
 - `glm_dsa_latent_kv_projection_seconds`
 - `glm_dsa_sparse_gather_seconds`
 - `glm_dsa_attention_seconds`
+- `glm_dsa_native_sparse_attention_seconds`
 - `glm_dsa_total_prefill_seconds`
 
 ## Longest-Prefix Checkpoint Reuse
