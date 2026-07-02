@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,6 +12,52 @@ sys.path.append(str(package_dir))
 from _version import __version__
 
 MIN_MLX_VERSION = "0.31.2"
+CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
+TRUTHY = {"1", "true", "yes", "on"}
+DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
+
+
+def _with_custom_kernel() -> bool:
+    if CUSTOM_KERNEL_FLAG in sys.argv:
+        sys.argv.remove(CUSTOM_KERNEL_FLAG)
+        return True
+    return (
+        os.environ.get("MLX_LM_WITH_CUSTOM_KERNEL", "").strip().lower() in TRUTHY
+        or os.environ.get("OMLX_WITH_CUSTOM_KERNEL", "").strip().lower() in TRUTHY
+    )
+
+
+def _custom_kernel_build_kwargs() -> dict:
+    if not _with_custom_kernel():
+        return {}
+    if sys.platform != "darwin":
+        raise RuntimeError("GLM custom kernels can only be built on macOS.")
+
+    target = (
+        os.environ.get("MLX_LM_CUSTOM_KERNEL_DEPLOYMENT_TARGET")
+        or os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+        or DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET
+    )
+    os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", target)
+    cmake_args = os.environ.get("CMAKE_ARGS", "").strip()
+    if "CMAKE_OSX_DEPLOYMENT_TARGET" not in cmake_args:
+        target_arg = f"-DCMAKE_OSX_DEPLOYMENT_TARGET={target}"
+        os.environ["CMAKE_ARGS"] = (
+            f"{cmake_args} {target_arg}".strip() if cmake_args else target_arg
+        )
+
+    from mlx import extension
+
+    return {
+        "ext_modules": [
+            extension.CMakeExtension(
+                "mlx_lm.custom_kernels.glm_moe_dsa._ext",
+                sourcedir="mlx_lm/custom_kernels/glm_moe_dsa/csrc",
+            ),
+        ],
+        "cmdclass": {"build_ext": extension.CMakeBuild},
+    }
+
 
 setup(
     name="mlx-lm",
@@ -39,12 +86,24 @@ setup(
         "mlx_lm.tuner",
         "mlx_lm.tool_parsers",
         "mlx_lm.chat_templates",
+        "mlx_lm.custom_kernels",
+        "mlx_lm.custom_kernels.glm_moe_dsa",
     ],
+    package_data={
+        "mlx_lm.custom_kernels.glm_moe_dsa": [
+            "*.metallib",
+            "*.dylib",
+            "*.so",
+            "LICENSE",
+            "README.md",
+        ],
+    },
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
+        "custom-kernel": ["cmake>=3.27", "nanobind==2.12.0"],
         "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],
         "cuda12": [f"mlx[cuda12]>={MIN_MLX_VERSION}"],
         "cpu": [f"mlx[cpu]>={MIN_MLX_VERSION}"],
@@ -71,4 +130,5 @@ setup(
             "mlx_lm.upload = mlx_lm.upload:main",
         ]
     },
+    **_custom_kernel_build_kwargs(),
 )

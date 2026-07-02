@@ -14,6 +14,46 @@ This branch is not intended as an upstream `mlx-lm` PR. Several changes intentio
 - GLM-5.2-specific MLA latent int8 KV cache support via `--kv-bits 8`.
 - Server-side support for `--kv-bits`, `--kv-group-size`, and `--quantized-kv-start`.
 - Local GLM-5.2 runtime cache layout designed for one-command invalidation.
+- Vendored GLM MoE DSA native custom kernels for optional native sparse MLA
+  prefill. These are built from this repository and no longer require a runtime
+  oMLX checkout.
+
+### Native custom-kernel build
+
+The GLM DSA native sparse MLA route is optional. Without it, the server still
+runs with the Python/MLX sparse prefill fallback. To build the native kernels
+self-contained from this repository, install Apple's full Xcode, not only
+Command Line Tools. Xcode 26 may also require the separate Metal Toolchain
+component:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcodebuild -downloadComponent MetalToolchain
+```
+
+The build requires MLX 0.31.2, CMake 3.27+, nanobind 2.12.0, and wheel/setuptools
+inside the isolated build environment. The `pyproject.toml` build-system section
+pins those build dependencies. With `uv`, rebuild the editable install with:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+MLX_LM_WITH_CUSTOM_KERNEL=1 \
+uv pip install --python /Users/kioju/.venvs/mlx-glm52/bin/python --no-deps -e .
+```
+
+Verify that the vendored native extension is visible:
+
+```sh
+python - <<'PY'
+from mlx_lm.models import glm_moe_dsa
+print(glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status())
+PY
+```
+
+Expected fields include `available=True` and
+`source='mlx_lm.custom_kernels.glm_moe_dsa'`. The vendored sources live under
+`mlx_lm/custom_kernels/glm_moe_dsa` and are derived from oMLX's Apache-2.0 GLM
+custom kernels; see the license file in that directory.
 
 ### Recommended target model
 
@@ -196,7 +236,7 @@ On the tested Mac Studio M3 Ultra 512GB setup, a controlled 10240-token run with
 
 ### Fast sparse DSA prefill caveat
 
-GLM DSA sparse prefill is enabled by default because the old dense fallback materialized full `(heads, query_length, context_length)` prefill tensors and could OOM well below the advertised long-context envelope. To avoid the exact sparse path becoming pathologically slow too early, it now waits until the effective context reaches one token below `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072), because generation prefill leaves the final prompt token for logits. For sparse chunks, MLA attention stays in latent space and avoids selected K/V projection; long chunks whose causal prefix already covers the full top-k set also skip the redundant selected-mask gather. Use `--fast-prefill disabled` only for short-context comparison runs. `--fast-prefill-query-chunk` controls selected-query microbatches, and `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK` controls the DSA indexer key block size. If an oMLX-compatible native sparse MLA symbol is installed, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL` can route supported unquantized GLM MLA chunks through it; int8 GLM MLA KV cache intentionally falls back to selected-KV sparse attention. The practical TTFT win for repeated coding-agent prefixes is still checkpoint reuse.
+GLM DSA sparse prefill is enabled by default because the old dense fallback materialized full `(heads, query_length, context_length)` prefill tensors and could OOM well below the advertised long-context envelope. To avoid the exact sparse path becoming pathologically slow too early, it now waits until the effective context reaches one token below `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072), because generation prefill leaves the final prompt token for logits. For sparse chunks, MLA attention stays in latent space and avoids selected K/V projection; long chunks whose causal prefix already covers the full top-k set also skip the redundant selected-mask gather. Use `--fast-prefill disabled` only for short-context comparison runs. `--fast-prefill-query-chunk` controls selected-query microbatches, and `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK` controls the DSA indexer key block size. If the vendored native sparse MLA extension is built, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL` can route supported unquantized GLM MLA chunks through it; int8 GLM MLA KV cache intentionally falls back to selected-KV sparse attention. The practical TTFT win for repeated coding-agent prefixes is still checkpoint reuse.
 
 **Bottleneck hypothesis**
 The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.

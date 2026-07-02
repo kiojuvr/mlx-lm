@@ -106,9 +106,10 @@ The sparse handoff point can be tuned with:
 MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 python ...
 ```
 
-When a compatible native sparse MLA symbol is available, the model can try a
+When the vendored native sparse MLA symbol is available, the model can try a
 deeper native route inside the sparse fast path. It is enabled by default but
-only activates for the fixed M3 GLM shape currently supported by the oMLX kernel:
+only activates for the fixed M3 GLM shape currently supported by the vendored
+kernel:
 64 heads, latent dim 512, RoPE dim 64, top-k 2048, unquantized `GlmMlaKVCache`,
 and an effective context at or above
 `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 11264). Quantized

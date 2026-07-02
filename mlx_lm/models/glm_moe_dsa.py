@@ -234,22 +234,28 @@ def _native_sparse_mla_kernel():
     _NATIVE_SPARSE_MLA_SOURCE = None
     _NATIVE_SPARSE_MLA_IMPORT_ERROR = None
 
-    try:
-        from omlx.custom_kernels.glm_moe_dsa import fast as omlx_fast
-
-        has_symbol = getattr(omlx_fast, "has_symbol", None)
-        if (
-            has_symbol is not None
-            and has_symbol("glm_dsa_sparse_mla_attention")
-            and hasattr(omlx_fast, "glm_dsa_sparse_mla_attention")
-        ):
-            _NATIVE_SPARSE_MLA_KERNEL = omlx_fast.glm_dsa_sparse_mla_attention
-            _NATIVE_SPARSE_MLA_SOURCE = "omlx.custom_kernels.glm_moe_dsa"
-            return _NATIVE_SPARSE_MLA_KERNEL
-        if hasattr(omlx_fast, "import_error"):
-            _NATIVE_SPARSE_MLA_IMPORT_ERROR = omlx_fast.import_error()
-    except Exception as exc:
-        _NATIVE_SPARSE_MLA_IMPORT_ERROR = exc
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_sparse_mla_attention")
+                and hasattr(fast, "glm_dsa_sparse_mla_attention")
+            ):
+                _NATIVE_SPARSE_MLA_KERNEL = fast.glm_dsa_sparse_mla_attention
+                _NATIVE_SPARSE_MLA_SOURCE = module_name
+                return _NATIVE_SPARSE_MLA_KERNEL
+            if _NATIVE_SPARSE_MLA_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_SPARSE_MLA_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_SPARSE_MLA_IMPORT_ERROR is None:
+                _NATIVE_SPARSE_MLA_IMPORT_ERROR = exc
 
     if hasattr(mx.fast, "glm_dsa_sparse_mla_attention"):
         _NATIVE_SPARSE_MLA_KERNEL = mx.fast.glm_dsa_sparse_mla_attention
