@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import re
 import statistics
@@ -445,6 +446,150 @@ def collect_glm_dsa_profile(args):
         ],
         **stage_values,
     }
+
+
+def _native_smoke_status_fields(args, status):
+    return {
+        "glm_dsa_native_sparse_prefill": getattr(
+            args, "native_sparse_prefill", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            "default-on",
+        ),
+        "glm_dsa_native_sparse_prefill_available": status["available"],
+        "glm_dsa_native_sparse_prefill_source": status["source"],
+        "glm_dsa_native_sparse_prefill_import_error": status["import_error"],
+        "glm_dsa_native_sparse_prefill_min_context": status["min_context"],
+    }
+
+
+def _native_smoke_symbols(source):
+    if source not in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        if source == "mlx.core.fast":
+            return ("glm_dsa_sparse_mla_attention",)
+        return ()
+    fast = __import__(source, fromlist=["fast"]).fast
+    native_symbols = getattr(fast, "native_symbols", None)
+    if native_symbols is None:
+        return ()
+    return tuple(native_symbols())
+
+
+def _native_smoke_kernel(source):
+    if source in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        fast = __import__(source, fromlist=["fast"]).fast
+        return fast.glm_dsa_sparse_mla_attention
+    if source == "mlx.core.fast":
+        return mx.fast.glm_dsa_sparse_mla_attention
+    loader = getattr(glm_moe_dsa, "_native_sparse_mla_kernel", None)
+    if loader is None:
+        return None
+    return loader()
+
+
+def _native_smoke_dense_reference(q_latent, q_pe, kv_latent, k_pe, scale):
+    B, H, L, _ = q_latent.shape
+    K = kv_latent.shape[2]
+    latent = mx.broadcast_to(kv_latent, (B, H, K, kv_latent.shape[-1]))
+    pe = mx.broadcast_to(k_pe, (B, H, K, k_pe.shape[-1]))
+    scores = mx.matmul(q_latent, mx.swapaxes(latent, -1, -2))
+    scores = scores + mx.matmul(q_pe, mx.swapaxes(pe, -1, -2))
+    scores = scores * scale
+
+    q_positions = mx.arange(L).reshape(1, 1, L, 1)
+    k_positions = mx.arange(K).reshape(1, 1, 1, K)
+    causal_mask = k_positions <= (K - L + q_positions)
+    scores = mx.where(causal_mask, scores, mx.array(-1e9, dtype=scores.dtype))
+    weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q_latent.dtype)
+    return mx.matmul(weights, latent)
+
+
+def run_native_kernel_smoke(args):
+    status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
+    row = {
+        "case": "native-smoke",
+        "mode": "native-smoke",
+        "native_smoke_available": status["available"],
+        "native_smoke_source": status["source"],
+        "native_smoke_import_error": status["import_error"],
+        "native_smoke_symbols": (),
+        "native_smoke_q_len": args.native_smoke_q_len,
+        "native_smoke_k_len": args.native_smoke_k_len,
+        "native_smoke_seed": args.native_smoke_seed,
+        "native_smoke_max_diff": args.native_smoke_max_diff,
+        "native_smoke_shape": None,
+        "native_smoke_max_abs_diff": None,
+        "native_smoke_mean_abs_diff": None,
+        "native_smoke_passed": False,
+        "native_smoke_error": None,
+    }
+    row.update(_native_smoke_status_fields(args, status))
+    if not status["available"]:
+        row["native_smoke_error"] = "native sparse MLA kernel unavailable"
+        return row
+
+    try:
+        symbols = _native_smoke_symbols(status["source"])
+        kernel = _native_smoke_kernel(status["source"])
+        if kernel is None:
+            raise RuntimeError("native sparse MLA kernel unavailable")
+
+        B, H = 1, 64
+        L = args.native_smoke_q_len
+        K = args.native_smoke_k_len
+        latent_dim = 512
+        rope_dim = 64
+        mx.random.seed(args.native_smoke_seed)
+        q_latent = mx.random.normal(
+            (B, H, L, latent_dim), dtype=mx.float16
+        ) * 0.02
+        q_pe = mx.random.normal((B, H, L, rope_dim), dtype=mx.float16) * 0.02
+        kv_latent = mx.random.normal(
+            (B, 1, K, latent_dim), dtype=mx.float16
+        ) * 0.02
+        k_pe = mx.random.normal((B, 1, K, rope_dim), dtype=mx.float16) * 0.02
+        topk_indices = mx.broadcast_to(
+            mx.arange(K, dtype=mx.uint32).reshape(1, 1, 1, K),
+            (B, 1, L, K),
+        )
+        scale = 1.0 / math.sqrt(latent_dim + rope_dim)
+
+        output = kernel(
+            q_latent,
+            q_pe,
+            kv_latent,
+            k_pe,
+            topk_indices,
+            scale,
+            causal=True,
+        )
+        reference = _native_smoke_dense_reference(
+            q_latent, q_pe, kv_latent, k_pe, scale
+        )
+        diff = mx.abs(output.astype(mx.float32) - reference.astype(mx.float32))
+        mx.eval(output, reference, diff)
+
+        max_abs_diff = float(mx.max(diff).item())
+        mean_abs_diff = float(mx.mean(diff).item())
+        row.update(
+            {
+                "native_smoke_symbols": symbols,
+                "native_smoke_shape": list(output.shape),
+                "native_smoke_max_abs_diff": max_abs_diff,
+                "native_smoke_mean_abs_diff": mean_abs_diff,
+                "native_smoke_passed": max_abs_diff <= args.native_smoke_max_diff,
+            }
+        )
+    except Exception as exc:
+        row["native_smoke_error"] = repr(exc)
+    return row
 
 
 def prefill_config_summary(args):
@@ -963,6 +1108,19 @@ def print_table(rows, output_format):
         "glm_dsa_fast_prefill_fallback_reasons",
         "glm_dsa_native_sparse_prefill_hits",
         "glm_dsa_native_sparse_prefill_fallback_reasons",
+        "native_smoke_available",
+        "native_smoke_source",
+        "native_smoke_import_error",
+        "native_smoke_symbols",
+        "native_smoke_q_len",
+        "native_smoke_k_len",
+        "native_smoke_seed",
+        "native_smoke_max_diff",
+        "native_smoke_shape",
+        "native_smoke_max_abs_diff",
+        "native_smoke_mean_abs_diff",
+        "native_smoke_passed",
+        "native_smoke_error",
         "glm_dsa_q_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
@@ -1382,7 +1540,11 @@ def run_prefill_sweep(model, tokenizer, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Local path or HF repo.")
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Local path or HF repo. Not required for --mode native-smoke.",
+    )
     parser.add_argument(
         "--mode",
         choices=(
@@ -1392,6 +1554,7 @@ def main():
             "controlled-lcp",
             "policy-sweep",
             "prefill-sweep",
+            "native-smoke",
         ),
         default="single",
     )
@@ -1630,6 +1793,30 @@ def main():
         ),
     )
     parser.add_argument(
+        "--native-smoke-q-len",
+        type=int,
+        default=2,
+        help="Query length for --mode native-smoke. Must be greater than 1.",
+    )
+    parser.add_argument(
+        "--native-smoke-k-len",
+        type=int,
+        default=32,
+        help="Context length for --mode native-smoke. Must be at least 16.",
+    )
+    parser.add_argument(
+        "--native-smoke-seed",
+        type=int,
+        default=7,
+        help="Random seed for --mode native-smoke.",
+    )
+    parser.add_argument(
+        "--native-smoke-max-diff",
+        type=float,
+        default=0.02,
+        help="Maximum allowed absolute difference for --mode native-smoke.",
+    )
+    parser.add_argument(
         "--prefill-profile",
         action="store_true",
         help=(
@@ -1647,8 +1834,8 @@ def main():
     )
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
-    args.model = args.model.strip()
-    if not args.model:
+    args.model = (args.model or "").strip()
+    if args.mode != "native-smoke" and not args.model:
         parser.error(
             "--model is empty; set MODEL to your model directory or pass an "
             "explicit --model /path/to/model value."
@@ -1658,6 +1845,15 @@ def main():
         and args.prefill_stop_after_tokens <= 0
     ):
         parser.error("--prefill-stop-after-tokens must be positive when set.")
+    if args.mode == "native-smoke":
+        if args.native_smoke_q_len <= 1:
+            parser.error("--native-smoke-q-len must be greater than 1.")
+        if args.native_smoke_k_len < 16:
+            parser.error("--native-smoke-k-len must be at least 16.")
+        if args.native_smoke_k_len < args.native_smoke_q_len:
+            parser.error("--native-smoke-k-len must be >= --native-smoke-q-len.")
+        if args.native_smoke_max_diff < 0:
+            parser.error("--native-smoke-max-diff must be non-negative.")
     if args.checkpoint_save_exact is None:
         args.checkpoint_save_exact = (
             "disabled"
@@ -1666,6 +1862,13 @@ def main():
         )
     args.target_tokens = None
     configure_glm_dsa_fast_prefill(args)
+    if args.mode == "native-smoke":
+        rows = [run_native_kernel_smoke(args)]
+        print_table(rows, args.output_format)
+        if args.json_output:
+            write_json_output(args.json_output, rows)
+        return
+
     old_checkpoint_cache_dir = configure_checkpoint_cache_dir(args)
 
     try:

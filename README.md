@@ -55,6 +55,17 @@ Expected fields include `available=True` and
 `mlx_lm/custom_kernels/glm_moe_dsa` and are derived from oMLX's Apache-2.0 GLM
 custom kernels; see the license file in that directory.
 
+For a quick arithmetic smoke test that does not load the full model:
+
+```sh
+python benchmarks/glm52_prefill_benchmark.py \
+  --mode native-smoke \
+  --json-output glm52-native-smoke.json
+```
+
+Expected fields include `native_smoke_passed=True` and
+`native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`.
+
 ### Recommended target model
 
 This branch has been tested with:

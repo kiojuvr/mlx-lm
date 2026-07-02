@@ -527,6 +527,70 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             {"quantized_kv": 1},
         )
 
+    def test_native_kernel_smoke_reports_unavailable_status(self):
+        old_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+
+        def fake_status():
+            return {
+                "enabled": True,
+                "available": False,
+                "source": None,
+                "import_error": "ImportError('missing')",
+                "min_context": 11264,
+            }
+
+        args = Namespace(
+            native_sparse_prefill="default",
+            native_smoke_q_len=2,
+            native_smoke_k_len=32,
+            native_smoke_seed=7,
+            native_smoke_max_diff=0.02,
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = fake_status
+        try:
+            row = benchmark.run_native_kernel_smoke(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = old_status
+
+        self.assertFalse(row["native_smoke_available"])
+        self.assertFalse(row["native_smoke_passed"])
+        self.assertEqual(row["native_smoke_import_error"], "ImportError('missing')")
+        self.assertEqual(row["native_smoke_error"], "native sparse MLA kernel unavailable")
+        self.assertEqual(row["glm_dsa_native_sparse_prefill_min_context"], 11264)
+
+    def test_main_native_smoke_does_not_load_model(self):
+        old_argv = sys.argv
+        old_load = benchmark.load
+        old_run_native_kernel_smoke = benchmark.run_native_kernel_smoke
+        calls = []
+
+        def fake_load(*_args, **_kwargs):
+            raise AssertionError("native-smoke should not load a model")
+
+        def fake_run_native_kernel_smoke(args):
+            calls.append(args.model)
+            return {
+                "case": "native-smoke",
+                "mode": "native-smoke",
+                "native_smoke_passed": True,
+            }
+
+        sys.argv = ["glm52_prefill_benchmark.py", "--mode", "native-smoke"]
+        benchmark.load = fake_load
+        benchmark.run_native_kernel_smoke = fake_run_native_kernel_smoke
+        try:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                benchmark.main()
+        finally:
+            sys.argv = old_argv
+            benchmark.load = old_load
+            benchmark.run_native_kernel_smoke = old_run_native_kernel_smoke
+
+        self.assertEqual(calls, [""])
+        self.assertIn("native_smoke_passed", stdout.getvalue())
+        self.assertIn("True", stdout.getvalue())
+
     def test_policy_sweep_runs_isolated_candidates(self):
         args = Namespace(
             lcp_prefix_tokens=4,

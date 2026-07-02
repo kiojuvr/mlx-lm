@@ -121,6 +121,19 @@ The benchmark exposes `--native-sparse-prefill enabled|disabled|default` and
 symbol source, import error, hit count, and fallback reasons so a run can
 distinguish "native extension missing" from "shape or cache guard rejected".
 
+Before a long model run, use the native smoke mode to check the self-contained
+extension and compare the tiny native sparse MLA output against a dense MLX
+reference. This mode does not load the GLM-5.2 model:
+
+```sh
+python benchmarks/glm52_prefill_benchmark.py \
+  --mode native-smoke \
+  --json-output glm52-native-smoke.json
+```
+
+The expected result is `native_smoke_passed=True` with
+`native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`.
+
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:
 
