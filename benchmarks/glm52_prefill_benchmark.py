@@ -452,7 +452,7 @@ def collect_glm_dsa_profile(args):
         ],
         "glm_dsa_native_q8_vup_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV,
-            "default-on",
+            "default-off",
         ),
         "glm_dsa_native_q8_vup_available": native_q8_vup_status["available"],
         "glm_dsa_native_q8_vup_source": native_q8_vup_status["source"],
@@ -638,6 +638,26 @@ def _native_smoke_dense_reference(q_latent, q_pe, kv_latent, k_pe, scale):
     return mx.matmul(weights, latent)
 
 
+def benchmark_mx_callable(fn, runs, warmup_runs):
+    for _ in range(warmup_runs):
+        value = fn()
+        mx.eval(value)
+    mx.synchronize()
+
+    timings = []
+    for _ in range(runs):
+        start = time.perf_counter()
+        value = fn()
+        mx.eval(value)
+        mx.synchronize()
+        timings.append(time.perf_counter() - start)
+    return {
+        "mean": statistics.mean(timings),
+        "min": min(timings),
+        "p50": percentile(timings, 50),
+    }
+
+
 def _run_native_q8_vup_smoke(row, args, status):
     if not status["available"]:
         row["native_q8_vup_smoke_error"] = "native q8 V-up kernel unavailable"
@@ -663,17 +683,7 @@ def _run_native_q8_vup_smoke(row, args, status):
             mode="affine",
         )
         output = kernel(x, q_weight, scales, biases)
-        reference = mx.quantized_matmul(
-            x,
-            q_weight,
-            scales=scales,
-            biases=biases,
-            transpose=True,
-            group_size=64,
-            bits=8,
-            mode="affine",
-        )
-        reference = reference.transpose(0, 2, 1, 3).reshape(B, L, H * value_dim)
+        reference = _native_q8_vup_reference(x, q_weight, scales, biases)
         diff = mx.abs(output.astype(mx.float32) - reference.astype(mx.float32))
         mx.eval(output, reference, diff)
 
@@ -689,8 +699,91 @@ def _run_native_q8_vup_smoke(row, args, status):
                 ),
             }
         )
+        benchmark_runs = getattr(args, "native_smoke_benchmark_runs", 0)
+        if benchmark_runs > 0:
+            _run_native_q8_vup_benchmark(
+                row,
+                args,
+                kernel,
+                q_weight,
+                scales,
+                biases,
+                H,
+                latent_dim,
+            )
     except Exception as exc:
         row["native_q8_vup_smoke_error"] = repr(exc)
+
+
+def _native_q8_vup_reference(x, q_weight, scales, biases):
+    B, H, L, V = (*x.shape[:3], q_weight.shape[1])
+    reference = mx.quantized_matmul(
+        x,
+        q_weight,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=64,
+        bits=8,
+        mode="affine",
+    )
+    return reference.transpose(0, 2, 1, 3).reshape(B, L, H * V)
+
+
+def _run_native_q8_vup_benchmark(
+    row,
+    args,
+    kernel,
+    q_weight,
+    scales,
+    biases,
+    heads,
+    latent_dim,
+):
+    benchmark_runs = args.native_smoke_benchmark_runs
+    benchmark_q_len = args.native_q8_vup_benchmark_q_len
+    warmup_runs = args.native_smoke_benchmark_warmup_runs
+    row.update(
+        {
+            "native_q8_vup_benchmark_runs": benchmark_runs,
+            "native_q8_vup_benchmark_warmup_runs": warmup_runs,
+            "native_q8_vup_benchmark_q_len": benchmark_q_len,
+        }
+    )
+    try:
+        mx.random.seed(args.native_smoke_seed + 2)
+        x = mx.random.normal(
+            (1, heads, benchmark_q_len, latent_dim), dtype=mx.float16
+        ) * 0.02
+
+        native_timings = benchmark_mx_callable(
+            lambda: kernel(x, q_weight, scales, biases),
+            benchmark_runs,
+            warmup_runs,
+        )
+        reference_timings = benchmark_mx_callable(
+            lambda: _native_q8_vup_reference(x, q_weight, scales, biases),
+            benchmark_runs,
+            warmup_runs,
+        )
+        native_mean = native_timings["mean"]
+        reference_mean = reference_timings["mean"]
+        row.update(
+            {
+                "native_q8_vup_native_seconds_mean": native_mean,
+                "native_q8_vup_native_seconds_min": native_timings["min"],
+                "native_q8_vup_native_seconds_p50": native_timings["p50"],
+                "native_q8_vup_reference_seconds_mean": reference_mean,
+                "native_q8_vup_reference_seconds_min": reference_timings["min"],
+                "native_q8_vup_reference_seconds_p50": reference_timings["p50"],
+                "native_q8_vup_speedup_mean": (
+                    reference_mean / native_mean if native_mean > 0 else None
+                ),
+                "native_q8_vup_benchmark_error": None,
+            }
+        )
+    except Exception as exc:
+        row["native_q8_vup_benchmark_error"] = repr(exc)
 
 
 def run_native_kernel_smoke(args):
@@ -720,6 +813,23 @@ def run_native_kernel_smoke(args):
         "native_q8_vup_smoke_mean_abs_diff": None,
         "native_q8_vup_smoke_passed": False,
         "native_q8_vup_smoke_error": None,
+        "native_q8_vup_benchmark_runs": getattr(
+            args, "native_smoke_benchmark_runs", 0
+        ),
+        "native_q8_vup_benchmark_warmup_runs": getattr(
+            args, "native_smoke_benchmark_warmup_runs", 0
+        ),
+        "native_q8_vup_benchmark_q_len": getattr(
+            args, "native_q8_vup_benchmark_q_len", None
+        ),
+        "native_q8_vup_native_seconds_mean": None,
+        "native_q8_vup_native_seconds_min": None,
+        "native_q8_vup_native_seconds_p50": None,
+        "native_q8_vup_reference_seconds_mean": None,
+        "native_q8_vup_reference_seconds_min": None,
+        "native_q8_vup_reference_seconds_p50": None,
+        "native_q8_vup_speedup_mean": None,
+        "native_q8_vup_benchmark_error": None,
     }
     row.update(_native_smoke_status_fields(args, status))
     if not status["available"]:
@@ -1337,6 +1447,17 @@ def print_table(rows, output_format):
         "native_q8_vup_smoke_mean_abs_diff",
         "native_q8_vup_smoke_passed",
         "native_q8_vup_smoke_error",
+        "native_q8_vup_benchmark_runs",
+        "native_q8_vup_benchmark_warmup_runs",
+        "native_q8_vup_benchmark_q_len",
+        "native_q8_vup_native_seconds_mean",
+        "native_q8_vup_native_seconds_min",
+        "native_q8_vup_native_seconds_p50",
+        "native_q8_vup_reference_seconds_mean",
+        "native_q8_vup_reference_seconds_min",
+        "native_q8_vup_reference_seconds_p50",
+        "native_q8_vup_speedup_mean",
+        "native_q8_vup_benchmark_error",
         "glm_dsa_q_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
@@ -2016,7 +2137,7 @@ def main():
         help=(
             "Control the optional native q8 V-up projection for quantized GLM "
             "DSA unembed_out weights. The default leaves "
-            "MLX_LM_GLM_DSA_NATIVE_Q8_VUP unchanged; unset means enabled."
+            "MLX_LM_GLM_DSA_NATIVE_Q8_VUP unchanged; unset means disabled."
         ),
     )
     parser.add_argument(
@@ -2042,6 +2163,27 @@ def main():
         type=float,
         default=0.02,
         help="Maximum allowed absolute difference for --mode native-smoke.",
+    )
+    parser.add_argument(
+        "--native-smoke-benchmark-runs",
+        type=int,
+        default=0,
+        help=(
+            "Optional timing runs for --mode native-smoke. When positive, "
+            "benchmarks native q8 V-up against the MLX quantized_matmul reference."
+        ),
+    )
+    parser.add_argument(
+        "--native-smoke-benchmark-warmup-runs",
+        type=int,
+        default=2,
+        help="Warmup runs before native-smoke q8 V-up timing.",
+    )
+    parser.add_argument(
+        "--native-q8-vup-benchmark-q-len",
+        type=int,
+        default=256,
+        help="Query length used for native-smoke q8 V-up timing.",
     )
     parser.add_argument(
         "--prefill-profile",
@@ -2081,6 +2223,14 @@ def main():
             parser.error("--native-smoke-k-len must be >= --native-smoke-q-len.")
         if args.native_smoke_max_diff < 0:
             parser.error("--native-smoke-max-diff must be non-negative.")
+        if args.native_smoke_benchmark_runs < 0:
+            parser.error("--native-smoke-benchmark-runs must be non-negative.")
+        if args.native_smoke_benchmark_warmup_runs < 0:
+            parser.error(
+                "--native-smoke-benchmark-warmup-runs must be non-negative."
+            )
+        if args.native_q8_vup_benchmark_q_len <= 0:
+            parser.error("--native-q8-vup-benchmark-q-len must be positive.")
     if args.checkpoint_save_exact is None:
         args.checkpoint_save_exact = (
             "disabled"

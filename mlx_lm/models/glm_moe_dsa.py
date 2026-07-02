@@ -87,7 +87,7 @@ def _native_sparse_prefill_enabled() -> bool:
 
 
 def _native_q8_vup_enabled() -> bool:
-    return _env_flag(GLM_DSA_NATIVE_Q8_VUP_ENV, True)
+    return _env_flag(GLM_DSA_NATIVE_Q8_VUP_ENV, False)
 
 
 def _prefill_profile_enabled() -> bool:

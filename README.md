@@ -68,6 +68,17 @@ Expected fields include `native_smoke_passed=True` and
 also checks the native q8 V-up projection used for quantized GLM DSA
 `unembed_out` weights; expect `native_q8_vup_smoke_passed=True`.
 
+To time native q8 V-up against the MLX `quantized_matmul` fallback without
+loading the model:
+
+```sh
+python benchmarks/glm52_prefill_benchmark.py \
+  --mode native-smoke \
+  --native-smoke-benchmark-runs 20 \
+  --native-q8-vup-benchmark-q-len 256 \
+  --json-output glm52-native-smoke-bench.json
+```
+
 ### Recommended target model
 
 This branch has been tested with:
@@ -258,10 +269,12 @@ Benchmark rows include `glm_dsa_native_sparse_prefill_route_state`,
 `quantized_kv_at_native_threshold`: the extension is loaded, but the current
 native sparse MLA route does not consume int8 GLM MLA KV cache.
 
-The vendored native `glm_dsa_q8_vup_flat` kernel is used separately for
+The vendored native `glm_dsa_q8_vup_flat` kernel can be enabled separately for
 quantized GLM DSA `unembed_out` projection when the fixed M3 GLM shape matches
 64 heads, latent dim 512, value dim 256, affine int8 weights, and group size 64.
-Benchmark rows report `glm_dsa_native_q8_vup_hits` and
+It is opt-in via `MLX_LM_GLM_DSA_NATIVE_Q8_VUP=1` or `--native-q8-vup enabled`
+because the model-free microbench can be slower than MLX `quantized_matmul` on
+some lengths. Benchmark rows report `glm_dsa_native_q8_vup_hits` and
 `glm_dsa_native_q8_vup_fallback_reasons`.
 
 **Bottleneck hypothesis**

@@ -680,6 +680,71 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["native_smoke_error"], "native sparse MLA kernel unavailable")
         self.assertEqual(row["glm_dsa_native_sparse_prefill_min_context"], 11264)
 
+    def test_native_q8_vup_smoke_benchmark_reports_timings(self):
+        old_sparse_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+        old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q8_kernel = benchmark._native_q8_vup_smoke_kernel
+
+        def fake_sparse_status():
+            return {
+                "enabled": True,
+                "available": False,
+                "source": None,
+                "import_error": "missing",
+                "min_context": 11264,
+            }
+
+        def fake_q8_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q8-test",
+                "import_error": None,
+            }
+
+        def fake_q8_kernel(_source):
+            def kernel(x, q_weight, scales, biases):
+                return benchmark._native_q8_vup_reference(
+                    x,
+                    q_weight,
+                    scales,
+                    biases,
+                )
+
+            return kernel
+
+        args = Namespace(
+            native_sparse_prefill="default",
+            native_smoke_q_len=2,
+            native_smoke_k_len=32,
+            native_smoke_seed=7,
+            native_smoke_max_diff=0.02,
+            native_smoke_benchmark_runs=1,
+            native_smoke_benchmark_warmup_runs=0,
+            native_q8_vup_benchmark_q_len=2,
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = (
+            fake_sparse_status
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark._native_q8_vup_smoke_kernel = fake_q8_kernel
+        try:
+            row = benchmark.run_native_kernel_smoke(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = (
+                old_sparse_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark._native_q8_vup_smoke_kernel = old_q8_kernel
+
+        self.assertTrue(row["native_q8_vup_smoke_passed"])
+        self.assertEqual(row["native_q8_vup_benchmark_runs"], 1)
+        self.assertEqual(row["native_q8_vup_benchmark_q_len"], 2)
+        self.assertIsNone(row["native_q8_vup_benchmark_error"])
+        self.assertGreater(row["native_q8_vup_native_seconds_mean"], 0)
+        self.assertGreater(row["native_q8_vup_reference_seconds_mean"], 0)
+        self.assertIsNotNone(row["native_q8_vup_speedup_mean"])
+
     def test_main_native_smoke_does_not_load_model(self):
         old_argv = sys.argv
         old_load = benchmark.load
