@@ -804,7 +804,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "disabled"
         if not _native_indexer_available():
             return False, "missing_symbol"
-        if mask is not None and len(mask.shape) != 4:
+        if isinstance(mask, str):
+            if mask != "causal":
+                return False, "mask_type"
+        elif mask is not None and len(mask.shape) not in (2, 4):
             return False, "mask_rank"
         B, H, L, D = q.shape
         if B != 1:

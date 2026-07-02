@@ -678,7 +678,7 @@ class TestModels(unittest.TestCase):
                 q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
                 x=mx.zeros((1, 64, 4096), dtype=mx.float16),
                 k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
-                mask=mx.ones((1, 1, 64, 4096), dtype=mx.bool_),
+                mask=mx.ones((64, 4096), dtype=mx.bool_),
             )
 
             self.assertTrue(ready)
@@ -711,7 +711,7 @@ class TestModels(unittest.TestCase):
                 q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
                 x=mx.zeros((1, 64, 4096), dtype=mx.float16),
                 k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
-                mask=mx.ones((1, 1, 64, 4096), dtype=mx.bool_),
+                mask=mx.ones((64, 4096), dtype=mx.bool_),
             )
 
             self.assertFalse(ready)
