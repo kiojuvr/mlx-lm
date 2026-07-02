@@ -10,7 +10,6 @@ import platform
 import socket
 import time
 import uuid
-import warnings
 from collections import deque
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -770,6 +769,10 @@ class ResponseGenerator:
         self._generation_thread.start()
 
     def stop_and_join(self):
+        logging.info(
+            "Shutdown requested: asking generation worker to stop. "
+            "Waiting for active generation or prompt checkpoint saves to finish..."
+        )
         self._stop = True
         self._generation_thread.join()
         self.shutdown()
@@ -883,8 +886,10 @@ class ResponseGenerator:
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
+        logging.info("Shutdown sequence started: flushing prompt checkpoints.")
         self.flush_shutdown_prompt_checkpoints()
         self.prune_shutdown_prompt_checkpoints()
+        logging.info("Shutdown sequence complete.")
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -3505,18 +3510,16 @@ def _run_http_server(
             **kwargs,
         ),
     )
-    warnings.warn(
-        "mlx_lm.server is not recommended for production as "
-        "it only implements basic security checks."
-    )
     logging.info(f"Starting httpd at {host} on port {port}...")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        pass
+        logging.info("Keyboard interrupt received; entering shutdown sequence.")
     finally:
+        logging.info("HTTP server stopping...")
         response_generator.stop_and_join()
         httpd.server_close()
+        logging.info("HTTP server stopped.")
 
 
 def run(

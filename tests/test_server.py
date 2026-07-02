@@ -9,6 +9,7 @@ import threading
 import types
 import unittest
 import unittest.mock as mock
+import warnings
 from pathlib import Path
 from queue import Queue
 
@@ -47,6 +48,7 @@ from mlx_lm.server import (
     _prompt_checkpoint_store_prefix_lengths,
     _process_control_tokens,
     _resolve_request_max_tokens,
+    _run_http_server,
     configure_checkpoint_cache_dir,
     setup_arg_parser,
 )
@@ -607,6 +609,63 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(stats["saved"], 1)
         self.assertEqual(captured["kwargs"]["prefix_tokens"], list(range(8)))
         self.assertIsNot(captured["cache"], current_cache)
+
+    def test_stop_and_join_logs_shutdown_start(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._stop = False
+        generator._shutdown_complete = False
+        generator._generation_thread = types.SimpleNamespace(join=mock.Mock())
+        generator.flush_shutdown_prompt_checkpoints = mock.Mock(return_value={})
+        generator.prune_shutdown_prompt_checkpoints = mock.Mock(return_value={})
+
+        with self.assertLogs(level="INFO") as captured:
+            generator.stop_and_join()
+
+        self.assertTrue(generator._stop)
+        generator._generation_thread.join.assert_called_once()
+        logs = "\n".join(captured.output)
+        self.assertIn("Shutdown requested", logs)
+        self.assertIn("Shutdown sequence started", logs)
+        self.assertIn("Shutdown sequence complete", logs)
+
+    def test_run_http_server_logs_keyboard_interrupt_shutdown(self):
+        calls = []
+
+        class FakeServer:
+            address_family = None
+
+            def __init__(self, server_address, handler):
+                self.server_address = server_address
+                self.handler = handler
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                calls.append("server_close")
+
+        response_generator = types.SimpleNamespace(
+            stop_and_join=lambda: calls.append("stop_and_join")
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertLogs(level="INFO") as captured:
+                _run_http_server(
+                    "127.0.0.1",
+                    0,
+                    response_generator,
+                    server_class=FakeServer,
+                )
+
+        self.assertEqual(calls, ["stop_and_join", "server_close"])
+        self.assertFalse(
+            any("not recommended for production" in str(w.message) for w in caught)
+        )
+        logs = "\n".join(captured.output)
+        self.assertIn("Keyboard interrupt received", logs)
+        self.assertIn("HTTP server stopping", logs)
+        self.assertIn("HTTP server stopped", logs)
 
     def test_render_and_tokenize_are_idempotent_for_tool_arguments(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
