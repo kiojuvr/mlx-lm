@@ -134,6 +134,20 @@ python benchmarks/glm52_prefill_benchmark.py \
 The expected result is `native_smoke_passed=True` with
 `native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`.
 
+For full benchmark runs, the native route diagnostics are:
+
+- `glm_dsa_native_sparse_prefill_route_state`
+- `glm_dsa_native_sparse_prefill_primary_fallback`
+- `glm_dsa_native_sparse_prefill_config_blocker`
+- `glm_dsa_native_sparse_prefill_attempt_min_context`
+
+With the usual long-context memory-saving configuration
+`--kv-bits 8 --quantized-kv-start 4096`, expect
+`glm_dsa_native_sparse_prefill_config_blocker=quantized_kv_at_native_threshold`.
+That means the extension is loaded, but the current native sparse MLA route is
+not used for the real prefill chunks because the GLM MLA KV cache has already
+become int8 by the time native sparse MLA would be eligible.
+
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:
 

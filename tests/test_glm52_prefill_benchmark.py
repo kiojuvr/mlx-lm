@@ -526,6 +526,92 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             profile["glm_dsa_native_sparse_prefill_fallback_reasons"],
             {"quantized_kv": 1},
         )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_route_state"],
+            "hit_with_fallbacks",
+        )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_primary_fallback"],
+            "quantized_kv",
+        )
+        self.assertIsNone(profile["glm_dsa_native_sparse_prefill_config_blocker"])
+
+    def test_collect_profile_reports_quantized_native_route_blocker(self):
+        old_profile = benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile
+        old_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+        env_key = benchmark.glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+        old_env = os.environ.get(env_key)
+
+        def fake_profile():
+            return {
+                "stages": {},
+                "fast_prefill_hits": 0,
+                "fallback_reasons": {},
+                "native_sparse_prefill_hits": 0,
+                "native_sparse_prefill_fallback_reasons": {},
+            }
+
+        def fake_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "mlx_lm.custom_kernels.glm_moe_dsa",
+                "import_error": None,
+                "min_context": 11264,
+            }
+
+        args = Namespace(
+            prefill_profile=False,
+            fast_prefill="enabled",
+            native_sparse_prefill="enabled",
+            mode="single",
+            batch_size=1,
+            kv_bits=8,
+            quantized_kv_start=4096,
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = fake_profile
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = fake_status
+        os.environ.pop(env_key, None)
+        try:
+            profile = benchmark.collect_glm_dsa_profile(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = old_profile
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = old_status
+            if old_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_env
+
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_route_state"],
+            "not_attempted_fast_sparse",
+        )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_config_blocker"],
+            "quantized_kv_at_native_threshold",
+        )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_attempt_min_context"],
+            131072,
+        )
+
+    def test_prefill_config_summary_reports_kv_quantization_settings(self):
+        args = Namespace(
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=4096,
+            prefill_step_size=1024,
+            prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_size=0,
+            glm_dsa_adaptive_prefill_after_tokens=0,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=0,
+        )
+
+        summary = benchmark.prefill_config_summary(args)
+
+        self.assertEqual(summary["kv_bits"], 8)
+        self.assertEqual(summary["kv_group_size"], 64)
+        self.assertEqual(summary["quantized_kv_start"], 4096)
 
     def test_native_kernel_smoke_reports_unavailable_status(self):
         old_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status

@@ -444,7 +444,101 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_native_sparse_prefill_fallback_reasons": profile[
             "native_sparse_prefill_fallback_reasons"
         ],
+        **native_sparse_prefill_route_diagnostics(args, profile, native_status),
         **stage_values,
+    }
+
+
+def primary_counter_reason(reasons):
+    if not reasons:
+        return None
+    return sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _fast_prefill_disabled_by_config(args):
+    if getattr(args, "fast_prefill", "default") == "disabled":
+        return True
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV)
+    if value is None:
+        return False
+    return value.strip().lower() in ("", "0", "false", "no", "off")
+
+
+def _current_sparse_prefill_min_context():
+    getter = getattr(glm_moe_dsa, "_sparse_prefill_min_context_length", None)
+    if getter is not None:
+        return getter()
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV)
+    if value is None:
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 0
+
+
+def native_sparse_prefill_attempt_min_context(native_status):
+    return max(
+        _current_sparse_prefill_min_context(),
+        int(native_status.get("min_context") or 0),
+    )
+
+
+def native_sparse_prefill_config_blocker(args, native_status):
+    if _fast_prefill_disabled_by_config(args):
+        return "fast_prefill_disabled"
+    if not native_status["enabled"]:
+        return "disabled"
+    if not native_status["available"]:
+        return "missing_symbol"
+    mode = getattr(args, "mode", "single")
+    batch_size = getattr(args, "batch_size", 1)
+    if mode == "batch" and batch_size != 1:
+        return "batch_size_not_one"
+    kv_bits = getattr(args, "kv_bits", None)
+    if kv_bits is None:
+        return None
+    if kv_bits != 8:
+        return f"unsupported_kv_bits:{kv_bits}"
+    attempt_min_context = native_sparse_prefill_attempt_min_context(native_status)
+    quantized_kv_start = getattr(args, "quantized_kv_start", 0)
+    if quantized_kv_start <= attempt_min_context:
+        return "quantized_kv_at_native_threshold"
+    return "quantized_kv_after_native_threshold"
+
+
+def native_sparse_prefill_route_state(profile, native_status):
+    hits = profile["native_sparse_prefill_hits"]
+    fallback_reasons = profile["native_sparse_prefill_fallback_reasons"]
+    if hits and fallback_reasons:
+        return "hit_with_fallbacks"
+    if hits:
+        return "hit"
+    if fallback_reasons:
+        return "fallback"
+    if not native_status["enabled"]:
+        return "disabled"
+    if not native_status["available"]:
+        return "unavailable"
+    if profile["fast_prefill_hits"]:
+        return "not_attempted"
+    return "not_attempted_fast_sparse"
+
+
+def native_sparse_prefill_route_diagnostics(args, profile, native_status):
+    return {
+        "glm_dsa_native_sparse_prefill_route_state": (
+            native_sparse_prefill_route_state(profile, native_status)
+        ),
+        "glm_dsa_native_sparse_prefill_primary_fallback": primary_counter_reason(
+            profile["native_sparse_prefill_fallback_reasons"]
+        ),
+        "glm_dsa_native_sparse_prefill_config_blocker": (
+            native_sparse_prefill_config_blocker(args, native_status)
+        ),
+        "glm_dsa_native_sparse_prefill_attempt_min_context": (
+            native_sparse_prefill_attempt_min_context(native_status)
+        ),
     }
 
 
@@ -594,6 +688,9 @@ def run_native_kernel_smoke(args):
 
 def prefill_config_summary(args):
     return {
+        "kv_bits": args.kv_bits,
+        "kv_group_size": args.kv_group_size,
+        "quantized_kv_start": args.quantized_kv_start,
         "prefill_step_size": args.prefill_step_size,
         "prefill_max_qk_tokens": getattr(
             args,
@@ -1078,6 +1175,9 @@ def print_table(rows, output_format):
         "ttft_p50_seconds",
         "ttft_p95_seconds",
         "prompt_tps",
+        "kv_bits",
+        "kv_group_size",
+        "quantized_kv_start",
         "prefill_step_size",
         "prefill_max_qk_tokens",
         "glm_dsa_adaptive_prefill_step_size",
@@ -1108,6 +1208,10 @@ def print_table(rows, output_format):
         "glm_dsa_fast_prefill_fallback_reasons",
         "glm_dsa_native_sparse_prefill_hits",
         "glm_dsa_native_sparse_prefill_fallback_reasons",
+        "glm_dsa_native_sparse_prefill_route_state",
+        "glm_dsa_native_sparse_prefill_primary_fallback",
+        "glm_dsa_native_sparse_prefill_config_blocker",
+        "glm_dsa_native_sparse_prefill_attempt_min_context",
         "native_smoke_available",
         "native_smoke_source",
         "native_smoke_import_error",

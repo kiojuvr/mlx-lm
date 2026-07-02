@@ -249,6 +249,13 @@ On the tested Mac Studio M3 Ultra 512GB setup, a controlled 10240-token run with
 
 GLM DSA sparse prefill is enabled by default because the old dense fallback materialized full `(heads, query_length, context_length)` prefill tensors and could OOM well below the advertised long-context envelope. To avoid the exact sparse path becoming pathologically slow too early, it now waits until the effective context reaches one token below `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072), because generation prefill leaves the final prompt token for logits. For sparse chunks, MLA attention stays in latent space and avoids selected K/V projection; long chunks whose causal prefix already covers the full top-k set also skip the redundant selected-mask gather. Use `--fast-prefill disabled` only for short-context comparison runs. `--fast-prefill-query-chunk` controls selected-query microbatches, and `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK` controls the DSA indexer key block size. If the vendored native sparse MLA extension is built, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL` can route supported unquantized GLM MLA chunks through it; int8 GLM MLA KV cache intentionally falls back to selected-KV sparse attention. The practical TTFT win for repeated coding-agent prefixes is still checkpoint reuse.
 
+Benchmark rows include `glm_dsa_native_sparse_prefill_route_state`,
+`glm_dsa_native_sparse_prefill_primary_fallback`, and
+`glm_dsa_native_sparse_prefill_config_blocker`. With the usual
+`--kv-bits 8 --quantized-kv-start 4096` long-context setting, expect
+`quantized_kv_at_native_threshold`: the extension is loaded, but the current
+native sparse MLA route does not consume int8 GLM MLA KV cache.
+
 **Bottleneck hypothesis**
 The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.
 
