@@ -620,7 +620,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
 
         self.assertEqual(
             profile["glm_dsa_native_sparse_prefill_route_state"],
-            "not_attempted_fast_sparse",
+            "not_attempted",
         )
         self.assertEqual(
             profile["glm_dsa_native_sparse_prefill_config_blocker"],
@@ -628,7 +628,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         )
         self.assertEqual(
             profile["glm_dsa_native_sparse_prefill_attempt_min_context"],
-            131072,
+            11264,
         )
 
     def test_prefill_config_summary_reports_kv_quantization_settings(self):

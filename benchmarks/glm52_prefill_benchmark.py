@@ -482,24 +482,8 @@ def _fast_prefill_disabled_by_config(args):
     return value.strip().lower() in ("", "0", "false", "no", "off")
 
 
-def _current_sparse_prefill_min_context():
-    getter = getattr(glm_moe_dsa, "_sparse_prefill_min_context_length", None)
-    if getter is not None:
-        return getter()
-    value = os.environ.get(glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV)
-    if value is None:
-        return 0
-    try:
-        return max(0, int(value))
-    except ValueError:
-        return 0
-
-
 def native_sparse_prefill_attempt_min_context(native_status):
-    return max(
-        _current_sparse_prefill_min_context(),
-        int(native_status.get("min_context") or 0),
-    )
+    return int(native_status.get("min_context") or 0)
 
 
 def native_sparse_prefill_config_blocker(args, native_status):
@@ -538,9 +522,7 @@ def native_sparse_prefill_route_state(profile, native_status):
         return "disabled"
     if not native_status["available"]:
         return "unavailable"
-    if profile["fast_prefill_hits"]:
-        return "not_attempted"
-    return "not_attempted_fast_sparse"
+    return "not_attempted"
 
 
 def native_sparse_prefill_route_diagnostics(args, profile, native_status):

@@ -74,13 +74,14 @@ The implementation order is intentionally conservative:
 - compute exact sparse attention over selected latent KV and project only the
   output back to value-head space.
 
-The fast path is on by default, but it waits until the effective context reaches
-one token below `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072)
-before using exact sparse attention. Generation prefill leaves the final prompt
-token for logits, so a 131072-token prompt can expose at most 131071 tokens to
-the attention call. This keeps short and early prefill chunks on the faster
-dense fallback while retaining the memory-bounded sparse path for longer
-contexts. Disable it only for short-context comparison runs with:
+The Python selected-KV sparse path is on by default, but it waits until the
+effective context reaches one token below
+`MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072) before using exact
+sparse attention. Generation prefill leaves the final prompt token for logits,
+so a 131072-token prompt can expose at most 131071 tokens to the attention call.
+This keeps short and early prefill chunks on the faster dense fallback while
+retaining the memory-bounded sparse path for longer contexts. Disable all GLM
+DSA sparse/native prefill routing only for short-context comparison runs with:
 
 ```sh
 MLX_LM_GLM_DSA_FAST_PREFILL=0 python ...
@@ -107,9 +108,9 @@ MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 python ...
 ```
 
 When the vendored native sparse MLA symbol is available, the model can try a
-deeper native route inside the sparse fast path. It is enabled by default but
-only activates for the fixed M3 GLM shape currently supported by the vendored
-kernel:
+deeper native route before the Python sparse handoff. It is enabled by default
+but only activates for the fixed M3 GLM shape currently supported by the
+vendored kernel:
 64 heads, latent dim 512, RoPE dim 64, top-k 2048, unquantized `GlmMlaKVCache`,
 and an effective context at or above
 `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 11264). Quantized
@@ -164,8 +165,8 @@ With the usual long-context memory-saving configuration
 `--kv-bits 8 --quantized-kv-start 4096`, expect
 `glm_dsa_native_sparse_prefill_config_blocker=quantized_kv_at_native_threshold`.
 That means the extension is loaded, but the current native sparse MLA route is
-not used for the real prefill chunks because the GLM MLA KV cache has already
-become int8 by the time native sparse MLA would be eligible.
+not used for those chunks because the GLM MLA KV cache becomes int8 before the
+native threshold.
 
 The q8 V-up route is independent from sparse MLA. When `unembed_out` is a
 quantized affine `QuantizedMultiLinear` with the fixed GLM-5.2 M3 shape

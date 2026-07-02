@@ -768,12 +768,18 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         k_pe: mx.array,
         topk_indices: mx.array,
     ):
+        if not _fast_prefill_enabled():
+            return False, "fast_prefill_disabled"
         if not _native_sparse_prefill_enabled():
             return False, "disabled"
         if _native_sparse_mla_kernel() is None:
             return False, "missing_symbol"
         if L <= 1:
             return False, "decode"
+        if len(topk_indices.shape) != 4:
+            return False, "topk_rank"
+        if topk_indices.shape[0] != B or topk_indices.shape[2] != L:
+            return False, "topk_shape"
         if not isinstance(kv_cache, GlmMlaKVCache):
             if isinstance(
                 kv_cache, (QuantizedGlmMlaKVCache, BatchQuantizedGlmMlaKVCache)
@@ -873,6 +879,17 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if isinstance(self.unembed_out, QuantizedMultiLinear):
             _record_native_q8_vup_decision(False, reason)
         return _profile_stage("latent_kv_projection", lambda: self.unembed_out(x))
+
+    def _dense_sparse_mask(self, mask, topk_indices, key_length: int):
+        shape = list(topk_indices.shape)
+        shape[-1] = key_length
+        sparse_mask = mx.zeros(shape, dtype=mx.bool_)
+        sparse_mask = mx.put_along_axis(
+            sparse_mask, topk_indices, mx.array(True), axis=-1
+        )
+        if mask is not None:
+            sparse_mask = sparse_mask & mask
+        return sparse_mask
 
     def _native_sparse_prefill_attention(
         self,
@@ -1099,6 +1116,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         fast_sparse_prefill = False
         native_sparse_prefill = False
         native_sparse_prefill_reason = None
+        dense_sparse_mask_applied = False
         if topk_indices is not None:
             if L == 1:
                 _record_fast_prefill_decision(False, "decode")
@@ -1113,40 +1131,32 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     mask = _gather_attention_mask(mask, topk_indices)
             else:
-                fast_sparse_prefill, reason = self._fast_prefill_decision(
-                    B=B,
-                    L=L,
-                    cache=cache,
-                    topk_indices=topk_indices,
-                    k_pe=k_pe,
+                native_sparse_prefill, native_sparse_prefill_reason = (
+                    self._native_sparse_prefill_decision(
+                        B=B,
+                        L=L,
+                        kv_cache=kv_cache,
+                        kv_latent=kv_latent,
+                        k_pe=k_pe,
+                        topk_indices=topk_indices,
+                    )
                 )
-                _record_fast_prefill_decision(fast_sparse_prefill, reason)
-                if fast_sparse_prefill:
-                    native_sparse_prefill, native_sparse_prefill_reason = (
-                        self._native_sparse_prefill_decision(
-                            B=B,
-                            L=L,
-                            kv_cache=kv_cache,
-                            kv_latent=kv_latent,
-                            k_pe=k_pe,
-                            topk_indices=topk_indices,
-                        )
+                if not native_sparse_prefill:
+                    _record_native_sparse_prefill_decision(
+                        False, native_sparse_prefill_reason
                     )
-                    if not native_sparse_prefill:
-                        _record_native_sparse_prefill_decision(
-                            False, native_sparse_prefill_reason
-                        )
-                else:
+                    fast_sparse_prefill, reason = self._fast_prefill_decision(
+                        B=B,
+                        L=L,
+                        cache=cache,
+                        topk_indices=topk_indices,
+                        k_pe=k_pe,
+                    )
+                    _record_fast_prefill_decision(fast_sparse_prefill, reason)
+                if not native_sparse_prefill and not fast_sparse_prefill:
                     ensure_kv_latent_dequantized()
-                    shape = list(topk_indices.shape)
-                    shape[-1] = kv_latent.shape[2]
-                    sparse_mask = mx.zeros(shape, dtype=mx.bool_)
-                    sparse_mask = mx.put_along_axis(
-                        sparse_mask, topk_indices, mx.array(True), axis=-1
-                    )
-                    if mask is not None:
-                        sparse_mask = sparse_mask & mask
-                    mask = sparse_mask
+                    mask = self._dense_sparse_mask(mask, topk_indices, k_pe.shape[2])
+                    dense_sparse_mask_applied = True
         elif L > 1:
             _record_fast_prefill_decision(False, "no_topk_indices")
 
@@ -1163,6 +1173,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     cache[0].keys, (cache[1].keys, cache[1].values)
                 )
 
+        output = None
         if native_sparse_prefill:
             output, native_sparse_prefill_reason = self._native_sparse_prefill_attention(
                 q_nope,
@@ -1179,16 +1190,20 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 _record_native_sparse_prefill_decision(
                     False, native_sparse_prefill_reason
                 )
-                output = self._fast_sparse_prefill_attention(
-                    q_nope,
-                    q_pe,
-                    kv_cache,
-                    kv_latent,
-                    k_pe,
-                    topk_indices,
-                    mask,
+                fast_sparse_prefill, reason = self._fast_prefill_decision(
+                    B=B,
+                    L=L,
+                    cache=cache,
+                    topk_indices=topk_indices,
+                    k_pe=k_pe,
                 )
-        elif fast_sparse_prefill:
+                _record_fast_prefill_decision(fast_sparse_prefill, reason)
+                if not fast_sparse_prefill and not dense_sparse_mask_applied:
+                    ensure_kv_latent_dequantized()
+                    mask = self._dense_sparse_mask(mask, topk_indices, k_pe.shape[2])
+                    dense_sparse_mask_applied = True
+
+        if output is None and fast_sparse_prefill:
             output = self._fast_sparse_prefill_attention(
                 q_nope,
                 q_pe,
@@ -1198,7 +1213,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 topk_indices,
                 mask,
             )
-        else:
+        if output is None:
             ensure_kv_latent_dequantized()
             pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
             if mask is not None:
