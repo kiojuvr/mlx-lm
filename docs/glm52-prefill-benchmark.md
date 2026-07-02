@@ -114,13 +114,33 @@ vendored kernel:
 64 heads, latent dim 512, RoPE dim 64, top-k 2048, unquantized `GlmMlaKVCache`,
 and an effective context at or above
 `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 11264). Quantized
-GLM MLA KV cache still falls back to the existing selected-KV sparse path so it
-does not force full-cache dequantization.
+GLM MLA KV cache remains on the existing selected-KV sparse path unless the
+explicit quantized-KV native sparse option below is enabled.
 
 The benchmark exposes `--native-sparse-prefill enabled|disabled|default` and
 `--native-sparse-prefill-min-context`. It also reports native availability,
 symbol source, import error, hit count, and fallback reasons so a run can
 distinguish "native extension missing" from "shape or cache guard rejected".
+
+For latency experiments with `--kv-bits 8`, the native sparse MLA route can be
+enabled over int8 GLM MLA KV cache with:
+
+```sh
+--native-sparse-quantized-kv enabled \
+--native-sparse-quantized-kv-max-context 65536
+```
+
+This keeps the persistent cache quantized but temporarily dequantizes the full
+latent KV tensor for the native sparse MLA kernel. The route is disabled by
+default because the transient full-cache dequantization trades memory for
+latency; keep the max-context guard bounded until the target prompt length is
+profiled.
+
+Benchmark rows report:
+
+- `glm_dsa_native_sparse_prefill_quantized_kv`
+- `glm_dsa_native_sparse_prefill_quantized_kv_env`
+- `glm_dsa_native_sparse_prefill_quantized_kv_max_context`
 
 The same vendored extension can also accelerate the DSA indexer score/top-k
 stage before sparse MLA attention is selected. This route is enabled by default
@@ -235,6 +255,9 @@ satisfied. Current fallback reasons include:
   `unsupported_index_head_dim:*`, `unsupported_topk:*`, `unsupported_dtype:*`,
   `mixed_dtype`, `mixed_weight_dtype`, `scores_unavailable`, and
   `topk_unavailable`.
+- native sparse MLA over int8 KV can additionally report
+  `batched_quantized_kv_cache`, `quantized_kv_context_exceeds_limit`,
+  `unsupported_kv_bits:*`, and `unsupported_kv_group_size:*`.
 
 These reasons are available from
 `mlx_lm.models.glm_moe_dsa.get_glm_dsa_prefill_profile()` and are also emitted
@@ -254,6 +277,7 @@ but reports:
 - `glm_dsa_native_indexer_topk_seconds`
 - `glm_dsa_latent_kv_dequantization_seconds`
 - `glm_dsa_latent_kv_projection_seconds`
+- `glm_dsa_native_sparse_kv_dequantization_seconds`
 - `glm_dsa_sparse_gather_seconds`
 - `glm_dsa_attention_seconds`
 - `glm_dsa_native_sparse_attention_seconds`

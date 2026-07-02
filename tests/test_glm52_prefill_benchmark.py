@@ -599,7 +599,11 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         )
         old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
         env_key = benchmark.glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+        quantized_env_key = (
+            benchmark.glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        )
         old_env = os.environ.get(env_key)
+        old_quantized_env = os.environ.get(quantized_env_key)
 
         def fake_profile():
             return {
@@ -660,6 +664,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         )
         benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
         os.environ.pop(env_key, None)
+        os.environ.pop(quantized_env_key, None)
         try:
             profile = benchmark.collect_glm_dsa_profile(args)
         finally:
@@ -673,6 +678,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 os.environ.pop(env_key, None)
             else:
                 os.environ[env_key] = old_env
+            if old_quantized_env is None:
+                os.environ.pop(quantized_env_key, None)
+            else:
+                os.environ[quantized_env_key] = old_quantized_env
 
         self.assertEqual(
             profile["glm_dsa_native_sparse_prefill_route_state"],
@@ -686,6 +695,39 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             profile["glm_dsa_native_sparse_prefill_attempt_min_context"],
             11264,
         )
+
+    def test_native_sparse_config_blocker_allows_quantized_kv_opt_in(self):
+        env_key = (
+            benchmark.glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        )
+        old_env = os.environ.get(env_key)
+        args = Namespace(
+            fast_prefill="enabled",
+            native_sparse_prefill="enabled",
+            mode="single",
+            batch_size=1,
+            kv_bits=8,
+            quantized_kv_start=4096,
+        )
+        native_status = {
+            "enabled": True,
+            "available": True,
+            "min_context": 11264,
+        }
+
+        os.environ[env_key] = "1"
+        try:
+            blocker = benchmark.native_sparse_prefill_config_blocker(
+                args,
+                native_status,
+            )
+        finally:
+            if old_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_env
+
+        self.assertIsNone(blocker)
 
     def test_prefill_config_summary_reports_kv_quantization_settings(self):
         args = Namespace(

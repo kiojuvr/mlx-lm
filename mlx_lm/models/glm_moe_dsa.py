@@ -38,6 +38,12 @@ GLM_DSA_NATIVE_SPARSE_PREFILL_ENV = "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL"
 GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV = (
     "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT"
 )
+GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV"
+)
+GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT"
+)
 GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
@@ -50,6 +56,7 @@ _PROFILE_STAGES = (
     "native_indexer_topk",
     "latent_kv_dequantization",
     "latent_kv_projection",
+    "native_sparse_kv_dequantization",
     "native_q8_vup",
     "sparse_gather",
     "attention",
@@ -87,6 +94,10 @@ def _fast_prefill_enabled() -> bool:
 
 def _native_sparse_prefill_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_SPARSE_PREFILL_ENV, True)
+
+
+def _native_sparse_prefill_quantized_kv_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV, False)
 
 
 def _native_indexer_enabled() -> bool:
@@ -144,6 +155,18 @@ def _native_sparse_prefill_min_context_length() -> int:
         except ValueError:
             pass
     return _DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT
+
+
+def _native_sparse_prefill_quantized_kv_max_context_length() -> int:
+    raw_value = os.environ.get(
+        GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV
+    )
+    if raw_value is not None:
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            pass
+    return 65536
 
 
 def _sparse_prefill_min_effective_context_length() -> int:
@@ -497,6 +520,10 @@ def get_glm_dsa_native_sparse_prefill_status():
             else None
         ),
         "min_context": _native_sparse_prefill_min_context_length(),
+        "quantized_kv_enabled": _native_sparse_prefill_quantized_kv_enabled(),
+        "quantized_kv_max_context": (
+            _native_sparse_prefill_quantized_kv_max_context_length()
+        ),
     }
 
 
@@ -1033,15 +1060,18 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "topk_rank"
         if topk_indices.shape[0] != B or topk_indices.shape[2] != L:
             return False, "topk_shape"
+        quantized_kv = isinstance(kv_cache, QuantizedGlmMlaKVCache)
         if not isinstance(kv_cache, GlmMlaKVCache):
-            if isinstance(
-                kv_cache, (QuantizedGlmMlaKVCache, BatchQuantizedGlmMlaKVCache)
-            ):
-                return False, "quantized_kv"
-            if isinstance(kv_cache, BatchGlmMlaKVCache):
+            if quantized_kv:
+                if not _native_sparse_prefill_quantized_kv_enabled():
+                    return False, "quantized_kv"
+            elif isinstance(kv_cache, BatchQuantizedGlmMlaKVCache):
+                return False, "batched_quantized_kv_cache"
+            elif isinstance(kv_cache, BatchGlmMlaKVCache):
                 return False, "batched_kv_cache"
-            return False, f"unsupported_cache:{type(kv_cache).__name__}"
-        if isinstance(kv_latent, (tuple, list)):
+            else:
+                return False, f"unsupported_cache:{type(kv_cache).__name__}"
+        if isinstance(kv_latent, (tuple, list)) and not quantized_kv:
             return False, "quantized_kv_state"
         if B != 1:
             return False, "batch_size_not_one"
@@ -1052,19 +1082,33 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         rope_dim = k_pe.shape[-1]
         if rope_dim != 64:
             return False, f"unsupported_rope_dim:{rope_dim}"
-        if kv_latent.shape[1] != 1 or k_pe.shape[1] != 1:
+        if k_pe.shape[1] != 1:
             return False, "unsupported_kv_heads"
-        if kv_latent.shape[-1] != 512:
-            return False, f"unsupported_latent_dim:{kv_latent.shape[-1]}"
+        if quantized_kv:
+            if kv_cache.bits != 8:
+                return False, f"unsupported_kv_bits:{kv_cache.bits}"
+            if kv_cache.group_size != 64:
+                return False, f"unsupported_kv_group_size:{kv_cache.group_size}"
+            max_context = _native_sparse_prefill_quantized_kv_max_context_length()
+            if max_context and k_pe.shape[2] > max_context:
+                return False, "quantized_kv_context_exceeds_limit"
+        else:
+            if kv_latent.shape[1] != 1:
+                return False, "unsupported_kv_heads"
+            if kv_latent.shape[-1] != 512:
+                return False, f"unsupported_latent_dim:{kv_latent.shape[-1]}"
+            if kv_latent.dtype not in (mx.float16, mx.bfloat16):
+                return False, f"unsupported_kv_dtype:{kv_latent.dtype}"
+            if k_pe.dtype != kv_latent.dtype:
+                return False, "mixed_kv_dtype"
         if topk_indices.shape[-1] != 2048:
             return False, f"unsupported_topk:{topk_indices.shape[-1]}"
         if k_pe.shape[2] < _native_sparse_prefill_min_context_length():
             return False, "below_native_sparse_min_context"
-        if kv_latent.dtype not in (mx.float16, mx.bfloat16):
-            return False, f"unsupported_kv_dtype:{kv_latent.dtype}"
-        if k_pe.dtype != kv_latent.dtype:
-            return False, "mixed_kv_dtype"
-        return True, "native_sparse_mla"
+        return (
+            True,
+            "native_sparse_mla_quantized_kv" if quantized_kv else "native_sparse_mla",
+        )
 
     def _native_q8_vup_decision(self, x: mx.array):
         if not _native_q8_vup_enabled():
@@ -1148,7 +1192,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         self,
         q_nope: mx.array,
         q_pe: mx.array,
-        kv_latent: mx.array,
+        kv_cache: Any,
+        kv_latent: Any,
         k_pe: mx.array,
         topk_indices: mx.array,
     ):
@@ -1165,6 +1210,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 "latent_kv_projection",
                 lambda: self.embed_q(q_nope),
             )
+            if isinstance(kv_cache, QuantizedGlmMlaKVCache):
+                kv_latent = _profile_stage(
+                    "native_sparse_kv_dequantization",
+                    lambda: kv_cache.dequantize_keys(kv_latent),
+                )
             output = _profile_stage(
                 "native_sparse_attention",
                 lambda: kernel(
@@ -1179,7 +1229,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             )
             return (
                 self._unembed_out_project(output),
-                "native_sparse_mla",
+                (
+                    "native_sparse_mla_quantized_kv"
+                    if isinstance(kv_cache, QuantizedGlmMlaKVCache)
+                    else "native_sparse_mla"
+                ),
             )
         except Exception as exc:
             return None, f"runtime_error:{type(exc).__name__}"
@@ -1428,12 +1482,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         output = None
         if native_sparse_prefill:
-            output, native_sparse_prefill_reason = self._native_sparse_prefill_attention(
-                q_nope,
-                q_pe,
-                kv_latent,
-                k_pe,
-                topk_indices,
+            output, native_sparse_prefill_reason = (
+                self._native_sparse_prefill_attention(
+                    q_nope,
+                    q_pe,
+                    kv_cache,
+                    kv_latent,
+                    k_pe,
+                    topk_indices,
+                )
             )
             if output is not None:
                 _record_native_sparse_prefill_decision(

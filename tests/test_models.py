@@ -604,6 +604,66 @@ class TestModels(unittest.TestCase):
             ) = native_state
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_native_sparse_prefill_quantized_kv_opt_in(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV
+            ] = "0"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+            ] = "1"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV
+            ] = "4096"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL = lambda *args, **kwargs: None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE = "test"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {"num_heads": 64})()
+            ready, reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
+                    fake_attention,
+                    B=1,
+                    L=2,
+                    kv_cache=QuantizedGlmMlaKVCache(),
+                    kv_latent=(
+                        mx.zeros((1, 1, 2048, 64), dtype=mx.uint32),
+                        mx.zeros((1, 1, 2048, 8), dtype=mx.float16),
+                        mx.zeros((1, 1, 2048, 8), dtype=mx.float16),
+                    ),
+                    k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                    topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+                )
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(reason, "native_sparse_mla_quantized_kv")
+        finally:
+            (
+                glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_native_sparse_prefill_uses_native_min_context(self):
         from mlx_lm.models import glm_moe_dsa
 

@@ -369,6 +369,26 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
     elif native_sparse_prefill == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "0"
+    native_sparse_quantized_kv = getattr(
+        args, "native_sparse_quantized_kv", "default"
+    )
+    if native_sparse_quantized_kv == "enabled":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        ] = "1"
+    elif native_sparse_quantized_kv == "disabled":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        ] = "0"
+    native_sparse_quantized_kv_max_context = getattr(
+        args,
+        "native_sparse_quantized_kv_max_context",
+        None,
+    )
+    if native_sparse_quantized_kv_max_context is not None:
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV
+        ] = str(native_sparse_quantized_kv_max_context)
     native_indexer = getattr(args, "native_indexer", "default")
     if native_indexer == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "1"
@@ -446,6 +466,17 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_native_sparse_prefill_import_error": native_status["import_error"],
         "glm_dsa_native_sparse_prefill_min_context": os.environ.get(
             glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+            "default",
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv": getattr(
+            args, "native_sparse_quantized_kv", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_max_context": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
             "default",
         ),
         "glm_dsa_fast_prefill_hits": profile["fast_prefill_hits"],
@@ -527,6 +558,16 @@ def native_sparse_prefill_config_blocker(args, native_status):
         return None
     if kv_bits != 8:
         return f"unsupported_kv_bits:{kv_bits}"
+    quantized_kv_enabled = os.environ.get(
+        glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+    )
+    quantized_kv_opt_in = (
+        quantized_kv_enabled is not None
+        and quantized_kv_enabled.strip().lower()
+        not in ("", "0", "false", "no", "off")
+    )
+    if quantized_kv_opt_in:
+        return None
     attempt_min_context = native_sparse_prefill_attempt_min_context(native_status)
     quantized_kv_start = getattr(args, "quantized_kv_start", 0)
     if quantized_kv_start <= attempt_min_context:
@@ -580,6 +621,17 @@ def _native_smoke_status_fields(args, status):
         "glm_dsa_native_sparse_prefill_source": status["source"],
         "glm_dsa_native_sparse_prefill_import_error": status["import_error"],
         "glm_dsa_native_sparse_prefill_min_context": status["min_context"],
+        "glm_dsa_native_sparse_prefill_quantized_kv": getattr(
+            args, "native_sparse_quantized_kv", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_max_context": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
+            "default",
+        ),
     }
 
 
@@ -1520,6 +1572,9 @@ def print_table(rows, output_format):
         "glm_dsa_native_sparse_prefill_source",
         "glm_dsa_native_sparse_prefill_import_error",
         "glm_dsa_native_sparse_prefill_min_context",
+        "glm_dsa_native_sparse_prefill_quantized_kv",
+        "glm_dsa_native_sparse_prefill_quantized_kv_env",
+        "glm_dsa_native_sparse_prefill_quantized_kv_max_context",
         "glm_dsa_fast_prefill_hits",
         "glm_dsa_fast_prefill_fallback_reasons",
         "glm_dsa_native_sparse_prefill_hits",
@@ -1594,6 +1649,7 @@ def print_table(rows, output_format):
         "glm_dsa_native_indexer_topk_seconds",
         "glm_dsa_latent_kv_dequantization_seconds",
         "glm_dsa_latent_kv_projection_seconds",
+        "glm_dsa_native_sparse_kv_dequantization_seconds",
         "glm_dsa_native_q8_vup_seconds",
         "glm_dsa_sparse_gather_seconds",
         "glm_dsa_attention_seconds",
@@ -2259,6 +2315,26 @@ def main():
         help=(
             "Minimum effective context length before trying the native sparse "
             "MLA route."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-quantized-kv",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native sparse MLA route for int8 GLM MLA KV "
+            "cache. It temporarily dequantizes the full latent KV cache for "
+            "the native kernel; default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV unchanged, "
+            "and unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-quantized-kv-max-context",
+        type=int,
+        help=(
+            "Maximum effective context length allowed for the opt-in native "
+            "sparse MLA route over int8 GLM MLA KV cache. Use 0 for no limit."
         ),
     )
     parser.add_argument(
