@@ -467,6 +467,14 @@ def effective_native_q4_qa_tile() -> str:
     return tile
 
 
+def effective_sparse_mla_tile() -> str:
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV, "default")
+    tile = value.strip().lower()
+    if tile in ("", "default"):
+        return "bk256_dc32_wm8"
+    return tile
+
+
 def configure_glm_dsa_fast_prefill(args):
     if args.fast_prefill == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
@@ -525,6 +533,11 @@ def configure_glm_dsa_fast_prefill(args):
     native_q4_qa_tile = getattr(args, "native_q4_qa_tile", "default")
     if native_q4_qa_tile != "default":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_TILE_ENV] = native_q4_qa_tile
+    native_sparse_mla_tile = getattr(args, "native_sparse_mla_tile", "default")
+    if native_sparse_mla_tile != "default":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV
+        ] = native_sparse_mla_tile
     native_q4_qb = getattr(args, "native_q4_qb", "default")
     if native_q4_qb == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
@@ -626,6 +639,11 @@ def collect_glm_dsa_profile(args):
             glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
             "default",
         ),
+        "glm_dsa_sparse_mla_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_sparse_mla_tile": effective_sparse_mla_tile(),
         "glm_dsa_fast_prefill_hits": profile["fast_prefill_hits"],
         "glm_dsa_fast_prefill_fallback_reasons": profile["fallback_reasons"],
         "glm_dsa_native_sparse_prefill_hits": profile[
@@ -832,6 +850,11 @@ def _native_smoke_status_fields(args, status):
             glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
             "default",
         ),
+        "glm_dsa_sparse_mla_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_sparse_mla_tile": effective_sparse_mla_tile(),
     }
 
 
@@ -1787,6 +1810,8 @@ def print_table(rows, output_format):
         "glm_dsa_native_sparse_prefill_quantized_kv",
         "glm_dsa_native_sparse_prefill_quantized_kv_env",
         "glm_dsa_native_sparse_prefill_quantized_kv_max_context",
+        "glm_dsa_sparse_mla_tile_env",
+        "glm_dsa_sparse_mla_tile",
         "glm_dsa_fast_prefill_hits",
         "glm_dsa_fast_prefill_fallback_reasons",
         "glm_dsa_native_sparse_prefill_hits",
@@ -2583,6 +2608,24 @@ def main():
         help=(
             "Maximum effective context length allowed for the opt-in native "
             "sparse MLA route over int8 GLM MLA KV cache. Use 0 for no limit."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-mla-tile",
+        choices=(
+            "default",
+            "bk128",
+            "bk256",
+            "bk128_dc64",
+            "wm4",
+            "bk128_wm4",
+            "bk128_dc64_wm4",
+        ),
+        default="default",
+        help=(
+            "Select the experimental native sparse MLA tile. The default "
+            "leaves MLX_LM_GLM_DSA_SPARSE_MLA_TILE unchanged; unset means "
+            "bk256_dc32_wm8."
         ),
     )
     parser.add_argument(

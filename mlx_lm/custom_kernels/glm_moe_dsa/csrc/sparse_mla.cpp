@@ -36,6 +36,42 @@ bool last_dim_contiguous(const array& arr) {
   return arr.strides(-1) == 1;
 }
 
+struct SparseMlaTileConfig {
+  int bk;
+  int dc;
+  int wm;
+};
+
+SparseMlaTileConfig sparse_mla_tile_config() {
+  const char* value = std::getenv("MLX_LM_GLM_DSA_SPARSE_MLA_TILE");
+  const std::string tile =
+      (value == nullptr || value[0] == '\0') ? "bk256_dc32_wm8" : value;
+  if (tile == "default" || tile == "bk256" || tile == "bk256_dc32_wm8") {
+    return {256, 32, 8};
+  }
+  if (tile == "bk128" || tile == "bk128_dc32_wm8") {
+    return {128, 32, 8};
+  }
+  if (tile == "bk128_dc64" || tile == "bk128_dc64_wm8") {
+    return {128, 64, 8};
+  }
+  if (tile == "wm4" || tile == "bk256_dc32_wm4") {
+    return {256, 32, 4};
+  }
+  if (tile == "bk128_wm4" || tile == "bk128_dc32_wm4") {
+    return {128, 32, 4};
+  }
+  if (tile == "bk128_dc64_wm4") {
+    return {128, 64, 4};
+  }
+
+  std::ostringstream msg;
+  msg << "Unsupported MLX_LM_GLM_DSA_SPARSE_MLA_TILE value: " << tile
+      << ". Expected default, bk128, bk256, bk128_dc64, wm4, "
+      << "bk128_wm4, or bk128_dc64_wm4.";
+  throw std::invalid_argument(msg.str());
+}
+
 struct GlmDsaSparseMlaParams {
   int B;
   int H;
@@ -63,6 +99,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
  public:
   GlmDsaSparseMlaAttentionPrimitive(
       Stream stream,
+      SparseMlaTileConfig tile,
       float scale,
       bool do_causal,
       bool topk_valid_prefix,
@@ -70,6 +107,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
       bool has_topk_length,
       int causal_prefix_rows)
       : Primitive(stream),
+        tile_(tile),
         scale_(scale),
         do_causal_(do_causal),
         topk_valid_prefix_(topk_valid_prefix),
@@ -164,12 +202,10 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
     const array& topk_length = has_topk_length ? inputs[5] : topk;
     auto& o = outputs[0];
 
-    constexpr int bk = 256;
-    constexpr int dc = 32;
     constexpr int h = 64;
     constexpr int d_latent = 512;
     constexpr int d_pe = 64;
-    constexpr int wm = 8;
+    const auto& tile = tile_;
 
     const int B = q_latent.shape(0);
     const int H = q_latent.shape(1);
@@ -212,9 +248,9 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
         "steel_sparse_mla_",
         type_to_name(q_latent),
         "_bk",
-        bk,
+        tile.bk,
         "_dc",
-        dc,
+        tile.dc,
         "_h",
         h,
         "_d",
@@ -222,7 +258,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
         "_pe",
         d_pe,
         "_wm",
-        wm);
+        tile.wm);
 
     std::string hash_name;
     concatenate(
@@ -277,7 +313,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
     compute_encoder.set_bytes(params, 7);
 
     MTL::Size grid_dims = MTL::Size(qL, B, 1);
-    MTL::Size group_dims = MTL::Size(32, wm, 1);
+    MTL::Size group_dims = MTL::Size(32, tile.wm, 1);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 
@@ -286,7 +322,9 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs =
         static_cast<const GlmDsaSparseMlaAttentionPrimitive&>(other);
-    return scale_ == rhs.scale_ && do_causal_ == rhs.do_causal_ &&
+    return tile_.bk == rhs.tile_.bk && tile_.dc == rhs.tile_.dc &&
+        tile_.wm == rhs.tile_.wm && scale_ == rhs.scale_ &&
+        do_causal_ == rhs.do_causal_ &&
         topk_valid_prefix_ == rhs.topk_valid_prefix_ &&
         causal_prefix_indices_ == rhs.causal_prefix_indices_ &&
         has_topk_length_ == rhs.has_topk_length_ &&
@@ -295,6 +333,9 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
   auto state() const {
     return std::make_tuple(
         nullptr,
+        tile_.bk,
+        tile_.dc,
+        tile_.wm,
         scale_,
         do_causal_,
         topk_valid_prefix_,
@@ -304,6 +345,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
   }
 
  private:
+  SparseMlaTileConfig tile_;
   float scale_;
   bool do_causal_;
   bool topk_valid_prefix_;
@@ -439,6 +481,7 @@ array glm_dsa_sparse_mla_attention(
       final_type,
       std::make_shared<GlmDsaSparseMlaAttentionPrimitive>(
           stream,
+          sparse_mla_tile_config(),
           scale,
           causal,
           topk_valid_prefix,

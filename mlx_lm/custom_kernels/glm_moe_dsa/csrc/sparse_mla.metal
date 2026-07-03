@@ -19,3 +19,13 @@
 
 instantiate_sparse_mla(float16, half, 256, 32, 64, 512, 64, 8);
 instantiate_sparse_mla(bfloat16, bfloat16_t, 256, 32, 64, 512, 64, 8);
+instantiate_sparse_mla(float16, half, 128, 32, 64, 512, 64, 8);
+instantiate_sparse_mla(bfloat16, bfloat16_t, 128, 32, 64, 512, 64, 8);
+instantiate_sparse_mla(float16, half, 128, 64, 64, 512, 64, 8);
+instantiate_sparse_mla(bfloat16, bfloat16_t, 128, 64, 64, 512, 64, 8);
+instantiate_sparse_mla(float16, half, 256, 32, 64, 512, 64, 4);
+instantiate_sparse_mla(bfloat16, bfloat16_t, 256, 32, 64, 512, 64, 4);
+instantiate_sparse_mla(float16, half, 128, 32, 64, 512, 64, 4);
+instantiate_sparse_mla(bfloat16, bfloat16_t, 128, 32, 64, 512, 64, 4);
+instantiate_sparse_mla(float16, half, 128, 64, 64, 512, 64, 4);
+instantiate_sparse_mla(bfloat16, bfloat16_t, 128, 64, 64, 512, 64, 4);

@@ -399,6 +399,27 @@ native indexer top-k, 1.02s latent projection, and 16.87s native sparse MLA
 attention. That makes native sparse MLA attention the next meaningful
 attention-side optimization target; the indexer path is no longer the dominant
 cost at this length.
+
+For sparse MLA tile experiments, use
+`MLX_LM_GLM_DSA_SPARSE_MLA_TILE` or `--native-sparse-mla-tile`. Unset/default
+maps to `bk256_dc32_wm8`; available aliases are `bk128`, `bk256`,
+`bk128_dc64`, `wm4`, `bk128_wm4`, and `bk128_dc64_wm4`. The standalone
+model-free microbench checks a small dense reference and then times larger
+synthetic sparse MLA shapes:
+
+```sh
+python benchmarks/glm52_sparse_mla_tile_microbench.py \
+  --q-len 512 \
+  --k-len 8192 \
+  --topk 2048 \
+  --runs 5 \
+  --json-output /path/to/glm52-sparse-mla-tile-microbench-512.json
+```
+
+Treat this as an experimental measurement knob until full-prompt profiles show
+a stable win on the target prompt length. Initial synthetic sweeps at
+512x8192/topk2048 and 2048x16384/topk2048 still favored the default `bk256`
+tile.
 Benchmark rows report:
 
 - `glm_dsa_prefill_profile`
@@ -425,6 +446,8 @@ Benchmark rows report:
 - `glm_dsa_attention_seconds`
 - `glm_dsa_native_sparse_attention_seconds`
 - `glm_dsa_total_prefill_seconds`
+- `glm_dsa_sparse_mla_tile_env`
+- `glm_dsa_sparse_mla_tile`
 
 The prompt-checkpoint debug stream now also carries per-prefill-chunk GLM DSA
 route deltas. Benchmark JSON rows include `checkpoint_prefill_chunk_summaries`

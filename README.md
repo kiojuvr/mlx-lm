@@ -325,6 +325,16 @@ With isolated profiling extended across indexer and attention stages, the tested
 native sparse MLA attention, making sparse MLA attention the next attention-side
 target.
 
+The native sparse MLA kernel can also select an experimental tile with
+`MLX_LM_GLM_DSA_SPARSE_MLA_TILE` or `--native-sparse-mla-tile`; unset/default
+uses `bk256_dc32_wm8`. Available aliases are `bk128`, `bk256`,
+`bk128_dc64`, `wm4`, `bk128_wm4`, and `bk128_dc64_wm4`. This is a profiling
+knob, not a new recommended server default yet. For low-memory tile sweeps
+without loading the full model, use
+`benchmarks/glm52_sparse_mla_tile_microbench.py`. Initial synthetic sweeps at
+512x8192/topk2048 and 2048x16384/topk2048 still favored the default `bk256`
+tile.
+
 The q_a probe can also select a tile with
 `MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE` or `--native-q4-qa-tile`; unset/default uses
 `bk64`. Available tiles are `bk32`, `bk64`, `bm16`, `bn16`, `bn64`, `bm64`,
