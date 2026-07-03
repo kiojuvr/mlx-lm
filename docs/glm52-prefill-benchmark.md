@@ -310,6 +310,25 @@ native q4 q_a measured about 0.00860s / 0.00920s for `bk32`, 0.00880s /
 `bm16bn64`, and `bm64bn64` variants. This points to only a small tile-level
 margin, so q_a-side gains likely need a larger change than tile selection.
 
+The native q4 q_b probe has the same style of selector:
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE` or `--native-q4-qb-tile`. Unset/default maps
+to `bm64`; available tiles are `bk32`, `bk64`, `bm16`, `bn16`, `bn64`, `bm64`,
+`bm16bn64`, `bm64bn64`, and `bk64bn64`. Use the standalone q_b tile microbench
+for low-memory sweeps:
+
+```sh
+python benchmarks/glm52_q4_qb_tile_microbench.py \
+  --q-len 8192 \
+  --runs 5 \
+  --warmup-runs 1 \
+  --json-output /path/to/glm52-q4qb-tile-microbench-8192.json
+```
+
+On the tested synthetic 8192 run, `bm64` measured about 0.02203s best /
+0.02236s mean versus about 0.02245s / 0.02285s for the previous `bk32`
+template. The margin is small, but `bm64` is the better long-query default for
+the opt-in native q4 q_b route.
+
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
 matrices on first use and reuse them for later prefill calls in the same model
@@ -337,6 +356,8 @@ Benchmark rows report:
 - `glm_dsa_native_q4_qb`
 - `glm_dsa_native_q4_qb_available`
 - `glm_dsa_native_q4_qb_source`
+- `glm_dsa_native_q4_qb_tile_env`
+- `glm_dsa_native_q4_qb_tile`
 - `glm_dsa_native_q4_qb_hits`
 - `glm_dsa_native_q4_qb_fallback_reasons`
 

@@ -347,6 +347,13 @@ regressed to about 53.41s TTFT and 26.71s q_a projection, so `bn64` is not a
 long-context default. For low-memory tile sweeps without loading the full
 model, use `benchmarks/glm52_q4_qa_tile_microbench.py`.
 
+The q_b probe has a matching tile selector through
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE` or `--native-q4-qb-tile`; unset/default uses
+`bm64` for the opt-in native q4 q_b path. Available tiles are `bk32`, `bk64`,
+`bm16`, `bn16`, `bn64`, `bm64`, `bm16bn64`, `bm64bn64`, and `bk64bn64`. The
+standalone `benchmarks/glm52_q4_qb_tile_microbench.py` measured only a small
+tile-level margin, with `bm64` best on the 2048/8192 synthetic sweeps.
+
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It
 dequantizes each q4 `q_a_proj` weight to a dense fp16/bf16 matrix on first use

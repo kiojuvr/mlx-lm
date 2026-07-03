@@ -51,6 +51,12 @@ struct Q4QaTileConfig {
   int bn;
 };
 
+struct Q4QbTileConfig {
+  int bm;
+  int bk;
+  int bn;
+};
+
 Q4QaTileConfig q4_qa_tile_config() {
   const char* value = std::getenv("MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE");
   const std::string tile =
@@ -84,6 +90,45 @@ Q4QaTileConfig q4_qa_tile_config() {
   msg << "Unsupported MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE value: " << tile
       << ". Expected default, bk32, bk64, bm16, bn16, bn64, bm64, "
       << "bm16bn64, or bm64bn64.";
+  throw std::invalid_argument(msg.str());
+}
+
+Q4QbTileConfig q4_qb_tile_config() {
+  const char* value = std::getenv("MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE");
+  const std::string tile =
+      (value == nullptr || value[0] == '\0') ? "bm64" : value;
+  if (tile == "default" || tile == "bm64" || tile == "b64k32n32") {
+    return {64, 32, 32};
+  }
+  if (tile == "bk32" || tile == "b32k32n32") {
+    return {32, 32, 32};
+  }
+  if (tile == "bk64" || tile == "b32k64n32") {
+    return {32, 64, 32};
+  }
+  if (tile == "bm16" || tile == "b16k32n32") {
+    return {16, 32, 32};
+  }
+  if (tile == "bn16" || tile == "b32k32n16") {
+    return {32, 32, 16};
+  }
+  if (tile == "bn64" || tile == "b32k32n64") {
+    return {32, 32, 64};
+  }
+  if (tile == "bm16bn64" || tile == "b16k32n64") {
+    return {16, 32, 64};
+  }
+  if (tile == "bm64bn64" || tile == "b64k32n64") {
+    return {64, 32, 64};
+  }
+  if (tile == "bk64bn64" || tile == "b32k64n64") {
+    return {32, 64, 64};
+  }
+
+  std::ostringstream msg;
+  msg << "Unsupported MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE value: " << tile
+      << ". Expected default, bm64, bk32, bk64, bm16, bn16, bn64, "
+      << "bm16bn64, bm64bn64, or bk64bn64.";
   throw std::invalid_argument(msg.str());
 }
 
@@ -447,7 +492,8 @@ class GlmDsaQ4QaProjFlatPrimitive : public Primitive {
 
 class GlmDsaQ4QbProjFlatPrimitive : public Primitive {
  public:
-  explicit GlmDsaQ4QbProjFlatPrimitive(Stream stream) : Primitive(stream) {}
+  GlmDsaQ4QbProjFlatPrimitive(Stream stream, Q4QbTileConfig tile)
+      : Primitive(stream), tile_(tile) {}
 
   static bool unsupported(
       const array& x,
@@ -511,10 +557,9 @@ class GlmDsaQ4QbProjFlatPrimitive : public Primitive {
 
     constexpr int group_size = 64;
     constexpr int bits = 4;
-    constexpr int bm = 32;
-    constexpr int bn = 32;
     constexpr int H = 64;
     constexpr int N = 256;
+    const auto& tile = tile_;
 
     const int B = x.shape(0);
     const int M = x.shape(1);
@@ -530,6 +575,16 @@ class GlmDsaQ4QbProjFlatPrimitive : public Primitive {
         "_b_",
         bits,
         "_alN_true");
+    if (!(tile.bm == 32 && tile.bk == 32 && tile.bn == 32)) {
+      concatenate(
+          kname,
+          "_bm_",
+          tile.bm,
+          "_bk_",
+          tile.bk,
+          "_bn_",
+          tile.bn);
+    }
 
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
     auto kernel = d.get_kernel(kname, lib);
@@ -545,20 +600,25 @@ class GlmDsaQ4QbProjFlatPrimitive : public Primitive {
     compute_encoder.set_bytes(M, 7);
     compute_encoder.set_bytes(H, 8);
 
-    MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B * H);
+    MTL::Size grid_dims(
+        (N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm, B * H);
     MTL::Size group_dims(32, 2, 2);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 
   DEFINE_NAME(GlmDsaQ4QbProjFlatPrimitive)
   DEFINE_INPUT_OUTPUT_SHAPE()
-  bool is_equivalent(const Primitive& /* other */) const override {
-    return true;
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const GlmDsaQ4QbProjFlatPrimitive&>(other);
+    return tile_.bm == rhs.tile_.bm && tile_.bk == rhs.tile_.bk &&
+        tile_.bn == rhs.tile_.bn;
   }
   auto state() const {
-    return std::make_tuple(nullptr);
+    return std::make_tuple(nullptr, tile_.bm, tile_.bk, tile_.bn);
   }
 
+ private:
+  Q4QbTileConfig tile_;
 };
 
 class GlmMoeWeightedSumPrimitive : public Primitive {
@@ -931,7 +991,8 @@ array glm_dsa_q4_qb_proj_flat(
   return array(
       std::move(out_shape),
       x.dtype(),
-      std::make_shared<GlmDsaQ4QbProjFlatPrimitive>(stream),
+      std::make_shared<GlmDsaQ4QbProjFlatPrimitive>(
+          stream, q4_qb_tile_config()),
       std::move(inputs));
 }
 

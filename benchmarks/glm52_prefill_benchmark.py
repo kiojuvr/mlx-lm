@@ -467,6 +467,14 @@ def effective_native_q4_qa_tile() -> str:
     return tile
 
 
+def effective_native_q4_qb_tile() -> str:
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV, "default")
+    tile = value.strip().lower()
+    if tile in ("", "default"):
+        return "bm64"
+    return tile
+
+
 def effective_sparse_mla_tile() -> str:
     value = os.environ.get(glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV, "default")
     tile = value.strip().lower()
@@ -543,6 +551,9 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
     elif native_q4_qb == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "0"
+    native_q4_qb_tile = getattr(args, "native_q4_qb_tile", "default")
+    if native_q4_qb_tile != "default":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV] = native_q4_qb_tile
     if args.fast_prefill_query_chunk is not None:
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
@@ -728,6 +739,11 @@ def collect_glm_dsa_profile(args):
             glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
             "default-off",
         ),
+        "glm_dsa_native_q4_qb_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_native_q4_qb_tile": effective_native_q4_qb_tile(),
         "glm_dsa_native_q4_qb_available": native_q4_qb_status["available"],
         "glm_dsa_native_q4_qb_source": native_q4_qb_status["source"],
         "glm_dsa_native_q4_qb_import_error": native_q4_qb_status["import_error"],
@@ -1860,6 +1876,8 @@ def print_table(rows, output_format):
         "glm_dsa_native_q4_qa_fallback_reasons",
         "glm_dsa_native_q4_qb",
         "glm_dsa_native_q4_qb_env",
+        "glm_dsa_native_q4_qb_tile_env",
+        "glm_dsa_native_q4_qb_tile",
         "glm_dsa_native_q4_qb_available",
         "glm_dsa_native_q4_qb_source",
         "glm_dsa_native_q4_qb_import_error",
@@ -2667,6 +2685,27 @@ def main():
             "Control the opt-in native q4 q_b projection for GLM-5.2 M3 "
             "attention. The default leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB "
             "unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qb-tile",
+        choices=(
+            "default",
+            "bk32",
+            "bk64",
+            "bm16",
+            "bn16",
+            "bn64",
+            "bm64",
+            "bm16bn64",
+            "bm64bn64",
+            "bk64bn64",
+        ),
+        default="default",
+        help=(
+            "Select the opt-in native q4 q_b projection tile. The default "
+            "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE unchanged; unset means "
+            "bm64."
         ),
     )
     parser.add_argument(
