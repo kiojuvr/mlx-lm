@@ -551,6 +551,11 @@ def configure_glm_dsa_fast_prefill(args):
         )
     if args.prefill_profile:
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ENV] = "1"
+    prefill_profile_isolate = getattr(args, "prefill_profile_isolate", "default")
+    if prefill_profile_isolate == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV] = "1"
+    elif prefill_profile_isolate == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV] = "0"
 
 
 def reset_glm_dsa_profile():
@@ -571,6 +576,14 @@ def collect_glm_dsa_profile(args):
         stage_values[key] = values["seconds"] if args.prefill_profile else None
         stage_values[f"glm_dsa_{stage}_count"] = values["count"]
     return {
+        "glm_dsa_prefill_profile": bool(args.prefill_profile),
+        "glm_dsa_prefill_profile_isolate": getattr(
+            args, "prefill_profile_isolate", "default"
+        ),
+        "glm_dsa_prefill_profile_isolate_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV,
+            "default-off",
+        ),
         "glm_dsa_fast_prefill": args.fast_prefill,
         "glm_dsa_fast_prefill_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
@@ -1757,6 +1770,9 @@ def print_table(rows, output_format):
         "active_batch_size_max",
         "queued_request_count",
         "checkpoint_resolution",
+        "glm_dsa_prefill_profile",
+        "glm_dsa_prefill_profile_isolate",
+        "glm_dsa_prefill_profile_isolate_env",
         "glm_dsa_fast_prefill",
         "glm_dsa_fast_prefill_env",
         "glm_dsa_fast_prefill_query_chunk",
@@ -2703,6 +2719,16 @@ def main():
         help=(
             "Synchronize and report GLM DSA prefill stage timings. This adds "
             "profiling overhead and is intended for measurement runs."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-profile-isolate",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control profiling-only input synchronization before selected GLM "
+            "DSA stages. Enabling it reduces lazy-evaluation attribution drift "
+            "in q_projection sub-stage timings."
         ),
     )
     parser.add_argument("--trust-remote-code", action="store_true")

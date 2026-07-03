@@ -381,9 +381,22 @@ When the path is actually used with large `topk` values, the model logs a
 one-time warning because 4k GLM-5.2 profiling showed this exact gather path is
 currently slower than fallback at `index_topk=2048`.
 
-Use `--prefill-profile` to force synchronized stage timings. This adds overhead
-but reports:
+Use `--prefill-profile` to force synchronized stage timings. This adds overhead.
+Because MLX evaluates lazily, a stage can otherwise inherit unfinished work from
+earlier expressions when its output is synchronized. Add
+`--prefill-profile-isolate enabled` for q_projection investigation; it evaluates
+the selected q_projection inputs before timing q_a, q_a RMSNorm, and q_b so the
+sub-stage attribution is less likely to charge upstream work to q_a projection.
+On the tested 2K synthetic prefill, normal profiling reported about 9.18s in
+q_a projection, but isolated profiling reported about 0.23s q_a projection,
+0.03s q_a RMSNorm, 0.51s q_b projection, and 0.78s q_projection total. Treat
+non-isolated q_projection sub-stage timings as coarse synchronization markers,
+not literal kernel time.
+Benchmark rows report:
 
+- `glm_dsa_prefill_profile`
+- `glm_dsa_prefill_profile_isolate`
+- `glm_dsa_prefill_profile_isolate_env`
 - `glm_dsa_q_projection_seconds`
 - `glm_dsa_q_a_projection_seconds`
 - `glm_dsa_q_a_dense_cache_dequantization_seconds`

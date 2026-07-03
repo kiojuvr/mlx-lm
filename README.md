@@ -316,6 +316,10 @@ isolated profiling but are not part of the recommended server command yet. On
 the tested 8K cold prefill, q projection split into about 29.7s q_a projection,
 0.18s q_a RMSNorm, and 2.1s q_b projection; earlier q4 native probes did not
 reduce end-to-end TTFT.
+Use `--prefill-profile-isolate enabled` when reading q_projection sub-stage
+timings: without it, MLX lazy evaluation can charge upstream work to q_a. On a
+2K check, q_a changed from about 9.18s in normal profiling to about 0.23s with
+isolated profiling.
 
 The q_a probe can also select a tile with
 `MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE` or `--native-q4-qa-tile`; unset/default uses

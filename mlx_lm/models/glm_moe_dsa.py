@@ -52,6 +52,7 @@ GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
 GLM_DSA_NATIVE_Q4_QA_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE"
 GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
+GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
 
 _PROFILE_STAGES = (
     "q_projection",
@@ -151,6 +152,10 @@ def _native_q4_qb_enabled() -> bool:
 
 def _prefill_profile_enabled() -> bool:
     return _env_flag(GLM_DSA_PREFILL_PROFILE_ENV, False)
+
+
+def _prefill_profile_isolate_enabled() -> bool:
+    return _env_flag(GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV, False)
 
 
 def _fast_prefill_debug_enabled() -> bool:
@@ -903,9 +908,11 @@ def _eval_profile_value(value):
     mx.synchronize()
 
 
-def _profile_stage(stage: str, fn):
+def _profile_stage(stage: str, fn, *, inputs=None):
     if not _prefill_profile_enabled():
         return fn()
+    if inputs is not None and _prefill_profile_isolate_enabled():
+        _eval_profile_value(inputs)
     start = time.perf_counter()
     value = fn()
     _eval_profile_value(value)
@@ -1979,16 +1986,28 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         total_start = time.perf_counter() if profile_total else None
 
         def project_q():
-            q_a = _profile_stage("q_a_projection", lambda: self._q_a_project(x))
-            qr = _profile_stage("q_a_layernorm", lambda: self.q_a_layernorm(q_a))
-            q = _profile_stage("q_b_projection", lambda: self._q_b_project(qr))
+            q_a = _profile_stage(
+                "q_a_projection",
+                lambda: self._q_a_project(x),
+                inputs=x,
+            )
+            qr = _profile_stage(
+                "q_a_layernorm",
+                lambda: self.q_a_layernorm(q_a),
+                inputs=q_a,
+            )
+            q = _profile_stage(
+                "q_b_projection",
+                lambda: self._q_b_project(qr),
+                inputs=qr,
+            )
             q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(
                 0, 2, 1, 3
             )
             q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
             return qr, q_nope, q_pe
 
-        qr, q_nope, q_pe = _profile_stage("q_projection", project_q)
+        qr, q_nope, q_pe = _profile_stage("q_projection", project_q, inputs=x)
 
         offset = cache[0].offset if cache is not None else 0
 
