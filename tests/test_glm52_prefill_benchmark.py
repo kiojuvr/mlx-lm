@@ -690,7 +690,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "available": True,
                 "source": "mlx_lm.custom_kernels.glm_moe_dsa",
                 "import_error": None,
-                "min_context": 11264,
+                "min_context": 8192,
             }
 
         def fake_indexer_status():
@@ -784,7 +784,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         )
         self.assertEqual(
             profile["glm_dsa_native_sparse_prefill_attempt_min_context"],
-            11264,
+            8192,
         )
 
     def test_native_sparse_config_blocker_allows_quantized_kv_opt_in(self):
@@ -803,7 +803,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         native_status = {
             "enabled": True,
             "available": True,
-            "min_context": 11264,
+            "min_context": 8192,
         }
 
         os.environ[env_key] = "1"
@@ -850,7 +850,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "available": False,
                 "source": None,
                 "import_error": "ImportError('missing')",
-                "min_context": 11264,
+                "min_context": 8192,
             }
 
         def fake_indexer_status():
@@ -890,7 +890,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             row["native_smoke_error"],
             "native sparse MLA kernel unavailable",
         )
-        self.assertEqual(row["glm_dsa_native_sparse_prefill_min_context"], 11264)
+        self.assertEqual(row["glm_dsa_native_sparse_prefill_min_context"], 8192)
         self.assertFalse(row["native_indexer_smoke_available"])
         self.assertEqual(
             row["native_indexer_smoke_error"],
@@ -913,7 +913,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "available": False,
                 "source": None,
                 "import_error": "missing",
-                "min_context": 11264,
+                "min_context": 8192,
             }
 
         def fake_indexer_status():
