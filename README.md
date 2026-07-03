@@ -320,6 +320,10 @@ Use `--prefill-profile-isolate enabled` when reading q_projection sub-stage
 timings: without it, MLX lazy evaluation can charge upstream work to q_a. On a
 2K check, q_a changed from about 9.18s in normal profiling to about 0.23s with
 isolated profiling.
+With isolated profiling extended across indexer and attention stages, the tested
+8K native sparse run spent about 0.49s in DSA indexer top-k and about 16.87s in
+native sparse MLA attention, making sparse MLA attention the next attention-side
+target.
 
 The q_a probe can also select a tile with
 `MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE` or `--native-q4-qa-tile`; unset/default uses

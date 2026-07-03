@@ -392,6 +392,13 @@ q_a projection, but isolated profiling reported about 0.23s q_a projection,
 0.03s q_a RMSNorm, 0.51s q_b projection, and 0.78s q_projection total. Treat
 non-isolated q_projection sub-stage timings as coarse synchronization markers,
 not literal kernel time.
+After extending the same isolated-input handling to indexer and attention
+stages, an 8K native sparse profile measured about 53.27s TTFT, 2.75s
+q_projection, 0.49s DSA indexer top-k, 0.28s native indexer scores, 0.04s
+native indexer top-k, 1.02s latent projection, and 16.87s native sparse MLA
+attention. That makes native sparse MLA attention the next meaningful
+attention-side optimization target; the indexer path is no longer the dominant
+cost at this length.
 Benchmark rows report:
 
 - `glm_dsa_prefill_profile`

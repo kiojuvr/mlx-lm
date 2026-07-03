@@ -1212,6 +1212,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 skip_causal_future_store=causal,
                 causal_q_offset=k.shape[2] - q.shape[2] if causal else -1,
             ),
+            inputs=(q, k, weights),
         )
         if scores is None:
             _record_native_indexer_decision(False, "scores_unavailable")
@@ -1224,6 +1225,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 bucketed=True,
                 causal_valid_prefix=causal,
             ),
+            inputs=scores,
         )
         if indices is None:
             _record_native_indexer_decision(False, "topk_unavailable")
@@ -1741,6 +1743,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         self.q_b_proj["scales"],
                         self.q_b_proj["biases"],
                     ),
+                    inputs=x,
                 )
                 _record_native_q4_qb_decision(True, reason)
                 return output
@@ -1764,6 +1767,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         self.unembed_out["scales"],
                         self.unembed_out["biases"],
                     ),
+                    inputs=x,
                 )
                 B, H, L, _ = x.shape
                 V = flat.shape[-1] // H
@@ -1788,6 +1792,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         self.unembed_out["scales"],
                         self.unembed_out["biases"],
                     ),
+                    inputs=x,
                 )
                 B, H, L, _ = x.shape
                 V = flat.shape[-1] // H
@@ -1799,7 +1804,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         if isinstance(self.unembed_out, QuantizedMultiLinear):
             _record_native_q8_vup_decision(False, reason)
-        return _profile_stage("latent_kv_projection", lambda: self.unembed_out(x))
+        return _profile_stage(
+            "latent_kv_projection",
+            lambda: self.unembed_out(x),
+            inputs=x,
+        )
 
     def _dense_sparse_mask(self, mask, topk_indices, key_length: int):
         shape = list(topk_indices.shape)
@@ -1833,11 +1842,13 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             q_latent = _profile_stage(
                 "latent_kv_projection",
                 lambda: self.embed_q(q_nope),
+                inputs=q_nope,
             )
             if isinstance(kv_cache, QuantizedGlmMlaKVCache):
                 kv_latent = _profile_stage(
                     "native_sparse_kv_dequantization",
                     lambda: kv_cache.dequantize_keys(kv_latent),
+                    inputs=kv_latent,
                 )
             output = _profile_stage(
                 "native_sparse_attention",
@@ -1850,6 +1861,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     self.scale,
                     causal=True,
                 ),
+                inputs=(q_latent, q_pe, kv_latent, k_pe, topk),
             )
             return (
                 self._unembed_out_project(output),
@@ -1899,6 +1911,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         chunk_topk,
                     ),
                 ),
+                inputs=(kv_latent, k_pe, chunk_topk, gather_mask),
             )
 
             q_nope_chunk = q_nope[:, :, start:stop, :]
@@ -1910,6 +1923,13 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     q_pe_chunk=q_pe_chunk,
                     latent_selected=latent_selected,
                     k_pe_selected=k_pe_selected: self._fast_sparse_attention_chunk(
+                        q_nope_chunk,
+                        q_pe_chunk,
+                        latent_selected,
+                        k_pe_selected,
+                        mask_selected,
+                    ),
+                    inputs=(
                         q_nope_chunk,
                         q_pe_chunk,
                         latent_selected,
@@ -1934,6 +1954,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return _profile_stage(
                 "latent_kv_dequantization",
                 lambda selected=selected: kv_cache.dequantize_keys(selected),
+                inputs=selected,
             )
         return _gather_sequence_by_flat_index(kv_latent, topk_indices)
 
@@ -2030,7 +2051,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 return cache[0].update_and_fetch(kv_latent, k_pe), q_pe_rope
             return (kv_latent, k_pe), q_pe_rope
 
-        (kv_latent, k_pe), q_pe = _profile_stage("kv_cache_update", update_kv_cache)
+        (kv_latent, k_pe), q_pe = _profile_stage(
+            "kv_cache_update",
+            update_kv_cache,
+            inputs=(x, q_pe),
+        )
 
         kv_cache = cache[0] if cache is not None else None
         kv_latent_dequantized = not hasattr(kv_cache, "dequantize_keys")
@@ -2042,6 +2067,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             kv_latent = _profile_stage(
                 "latent_kv_dequantization",
                 lambda: kv_cache.dequantize_keys(kv_latent),
+                inputs=kv_latent,
             )
             kv_latent_dequantized = True
             return kv_latent
@@ -2053,6 +2079,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             topk_indices = _profile_stage(
                 "dsa_indexer_topk",
                 lambda: self._indexer_topk(x, qr, mask, cache=cache[1]),
+                inputs=(x, qr, mask),
             )
         else:
             topk_indices = prev_topk_indices
@@ -2180,6 +2207,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         self.embed_q(kv_latent, transpose=False),
                         self.unembed_out(kv_latent),
                     ),
+                    inputs=kv_latent,
                 )
 
             output = _profile_stage(
@@ -2187,6 +2215,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 lambda: scaled_dot_product_attention(
                     q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
                 ),
+                inputs=(q_nope, k, v, pe_scores),
             )
             if L == 1:
                 output = self._unembed_out_project(output)
