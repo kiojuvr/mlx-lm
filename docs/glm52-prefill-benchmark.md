@@ -14,7 +14,7 @@ uv run \
     --repeat-runs 2 \
     --repeat-prefix-tokens 8192 \
     --max-tokens 1 \
-    --prefill-step-size 2048 \
+    --prefill-step-size 4096 \
     --kv-bits 8 \
     --kv-group-size 64 \
     --quantized-kv-start 4096 \
@@ -127,6 +127,11 @@ about 111s while forcing 4096 made the 8K profile slower. The later chunk-route
 sweep favored 6144 over 8192: 8K prefill-stop improved from about 55.85s to
 53.72s, and 16K prefill-stop improved from about 110.28s to 109.90s. Delaying
 the handoff to 10240 regressed the 16K run to about 112.15s.
+With the 6144-token handoff and the QK cap left at 67108864, raising the base
+prefill step from 2048 to 4096 reduced 16K prefill-stop from about 109.90s to
+105.44s and 32K prefill-stop from about 225.18s to 219.63s. The QK cap kept
+the 32K run bounded by using 4096-token chunks up to 16K context, then shrinking
+later chunks automatically. The measured peak memory increase was about 2.5GB.
 
 For latency experiments with `--kv-bits 8`, the native sparse MLA route can be
 enabled over int8 GLM MLA KV cache with:
@@ -535,7 +540,7 @@ python benchmarks/glm52_prefill_benchmark.py \
   --model "$MODEL" --mode prefill-sweep \
   --lengths 8192,32768 \
   --max-tokens 1 \
-  --prefill-step-candidates 512,1024,2048 \
+  --prefill-step-candidates 1024,2048,4096 \
   --prefill-max-qk-token-candidates 67108864 \
   --glm-dsa-adaptive-prefill-step-candidates 0,8192 \
   --fast-prefill enabled \
@@ -549,7 +554,7 @@ python benchmarks/glm52_prefill_benchmark.py \
   --model "$MODEL" --mode prefill-sweep \
   --lengths 131072 \
   --max-tokens 1 \
-  --prefill-step-candidates 2048 \
+  --prefill-step-candidates 4096 \
   --prefill-max-qk-token-candidates 67108864 \
   --glm-dsa-adaptive-prefill-step-candidates 0 \
   --fast-prefill-min-context-candidates 98304,114688,131072 \
@@ -653,6 +658,8 @@ when 200K+ token prompts are common:
 MLX_LM_PROMPT_CHECKPOINT_DEBUG=1 \
 MLX_METAL_FAST_SYNCH=1 \
 MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 \
+MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1 \
+MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=65536 \
 python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
@@ -660,8 +667,9 @@ python -m mlx_lm server \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
-  --prefill-step-size 1024 \
+  --prefill-step-size 4096 \
   --prefill-max-qk-tokens 67108864 \
+  --glm-dsa-adaptive-prefill-step-size 0 \
   --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
   --checkpoint-min-tokens 512 \
   --checkpoint-cold-max-tokens 30000 \
@@ -683,12 +691,12 @@ python -m mlx_lm server \
 
 This keeps requests on the single-request checkpoint path, which is the lowest
 TTFT path for repeated or partially reused long prompts. Use
-`--prefill-step-size 2048` only after checking peak memory and Metal stability
-on your real prompt distribution. `--prefill-max-qk-tokens` keeps dense fallback
-chunks below the configured query-by-context budget and can be set to `0` to
-disable context-aware step shrinking.
+`--prefill-step-size 2048` if 4096 shows Metal recovery or memory pressure on
+your real prompt distribution, then 1024 if needed. `--prefill-max-qk-tokens`
+keeps prefill chunks below the configured query-by-context budget and can be set
+to `0` to disable context-aware step shrinking.
 
-For GLM DSA step-size tuning, keep the conservative base step above and try
+For GLM DSA step-size tuning, compare 2048 and 4096 first. Treat
 `--glm-dsa-adaptive-prefill-step-size 8192` as a benchmark-only knob. The
 adaptive step is GLM-only and still passes through the `--prefill-max-qk-tokens`
 cap, so it mainly helps earlier/mid-context prefill where the QK budget allows a
