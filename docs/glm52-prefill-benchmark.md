@@ -132,13 +132,20 @@ prefill step from 2048 to 4096 reduced 16K prefill-stop from about 109.90s to
 105.44s and 32K prefill-stop from about 225.18s to 219.63s. The QK cap kept
 the 32K run bounded by using 4096-token chunks up to 16K context, then shrinking
 later chunks automatically. The measured peak memory increase was about 2.5GB.
+At 64K, the same 4096 base step remained slightly faster than 2048, 476.15s
+versus 480.59s, while peak memory increased from about 332.93GB to 334.04GB.
+Raising `--native-sparse-quantized-kv-max-context` to 131072 let the 128K
+prefill-stop run stay on the native sparse MLA route and complete in about
+1104.75s with about 336.41GB peak memory. In that 128K run the large remaining
+stage totals were q projection at about 550.84s, native sparse attention at
+about 310.29s, and native indexer top-k at about 77.43s.
 
 For latency experiments with `--kv-bits 8`, the native sparse MLA route can be
 enabled over int8 GLM MLA KV cache with:
 
 ```sh
 --native-sparse-quantized-kv enabled \
---native-sparse-quantized-kv-max-context 65536
+--native-sparse-quantized-kv-max-context 131072
 ```
 
 This keeps the persistent cache quantized but temporarily dequantizes the full
@@ -659,7 +666,7 @@ MLX_LM_PROMPT_CHECKPOINT_DEBUG=1 \
 MLX_METAL_FAST_SYNCH=1 \
 MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 \
 MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1 \
-MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=65536 \
+MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=131072 \
 python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
@@ -694,7 +701,9 @@ TTFT path for repeated or partially reused long prompts. Use
 `--prefill-step-size 2048` if 4096 shows Metal recovery or memory pressure on
 your real prompt distribution, then 1024 if needed. `--prefill-max-qk-tokens`
 keeps prefill chunks below the configured query-by-context budget and can be set
-to `0` to disable context-aware step shrinking.
+to `0` to disable context-aware step shrinking. The native quantized-KV guard at
+131072 has been profiled through a 128K prefill-stop run on the tested setup;
+raise it beyond 131072 only after profiling the target context length.
 
 For GLM DSA step-size tuning, compare 2048 and 4096 first. Treat
 `--glm-dsa-adaptive-prefill-step-size 8192` as a benchmark-only knob. The
