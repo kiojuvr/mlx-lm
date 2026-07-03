@@ -140,12 +140,21 @@ indexer top-k dropped from about 77.43s to 75.21s. Peak memory stayed about
 336.41GB at 128K and rose by about 0.53GB at 16K through 64K compared with the
 4096-step runs.
 
+The 8192-step setting also held up when the native sparse quantized-KV guard was
+extended beyond 128K. On the tested Mac Studio M3 Ultra 512GB setup, 160K cold
+prefill measured about 1302.12s with 219 native chunks and 0 dense chunks,
+196608 tokens measured about 1646.78s with 311 native chunks and 0 dense
+chunks, and 204800 tokens measured about 1739.78s with 336 native chunks and 0
+dense chunks. The 204800 run peaked at about 340.64GB and reported about
+730.91s in q projection, 491.57s in native sparse attention, 196.14s in native
+indexer top-k, and 27.83s in native sparse KV dequantization.
+
 For latency experiments with `--kv-bits 8`, the native sparse MLA route can be
 enabled over int8 GLM MLA KV cache with:
 
 ```sh
 --native-sparse-quantized-kv enabled \
---native-sparse-quantized-kv-max-context 131072
+--native-sparse-quantized-kv-max-context 262144
 ```
 
 This keeps the persistent cache quantized but temporarily dequantizes the full
@@ -666,7 +675,7 @@ MLX_LM_PROMPT_CHECKPOINT_DEBUG=1 \
 MLX_METAL_FAST_SYNCH=1 \
 MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 \
 MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1 \
-MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=131072 \
+MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144 \
 python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
@@ -702,9 +711,11 @@ TTFT path for repeated or partially reused long prompts. Use
 your real prompt distribution, then 2048 and 1024 if needed.
 `--prefill-max-qk-tokens` keeps prefill chunks below the configured
 query-by-context budget and can be set to `0` to disable context-aware step
-shrinking. The native quantized-KV guard at 131072 has been profiled through a
-128K prefill-stop run on the tested setup; raise it beyond 131072 only after
-profiling the target context length.
+shrinking. A 131072 native quantized-KV guard was profiled through a 128K
+prefill-stop run on the tested setup, and the recommended 262144 guard has been
+profiled through a 204800-token prefill-stop run with native chunks 336/336 and
+dense chunks 0. Raise it beyond 262144 only after profiling the target context
+length.
 
 For GLM DSA step-size tuning, compare 4096 and 8192 first, with 2048 as the
 memory-pressure fallback. Treat `--glm-dsa-adaptive-prefill-step-size 8192` as a
