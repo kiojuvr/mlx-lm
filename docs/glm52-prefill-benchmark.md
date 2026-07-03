@@ -14,7 +14,7 @@ uv run \
     --repeat-runs 2 \
     --repeat-prefix-tokens 8192 \
     --max-tokens 1 \
-    --prefill-step-size 4096 \
+    --prefill-step-size 8192 \
     --kv-bits 8 \
     --kv-group-size 64 \
     --quantized-kv-start 4096 \
@@ -129,16 +129,16 @@ sweep favored 6144 over 8192: 8K prefill-stop improved from about 55.85s to
 the handoff to 10240 regressed the 16K run to about 112.15s.
 With the 6144-token handoff and the QK cap left at 67108864, raising the base
 prefill step from 2048 to 4096 reduced 16K prefill-stop from about 109.90s to
-105.44s and 32K prefill-stop from about 225.18s to 219.63s. The QK cap kept
-the 32K run bounded by using 4096-token chunks up to 16K context, then shrinking
-later chunks automatically. The measured peak memory increase was about 2.5GB.
-At 64K, the same 4096 base step remained slightly faster than 2048, 476.15s
-versus 480.59s, while peak memory increased from about 332.93GB to 334.04GB.
-Raising `--native-sparse-quantized-kv-max-context` to 131072 let the 128K
-prefill-stop run stay on the native sparse MLA route and complete in about
-1104.75s with about 336.41GB peak memory. In that 128K run the large remaining
-stage totals were q projection at about 550.84s, native sparse attention at
-about 310.29s, and native indexer top-k at about 77.43s.
+105.44s and 32K prefill-stop from about 225.18s to 219.63s. Raising the base
+step again to 8192 reduced 16K to 104.11s, 32K to 207.10s, 64K to 436.05s, and
+128K to 963.13s. The 8192-token first chunk crosses the native sparse handoff
+immediately, so the measured runs stayed on the native sparse MLA route with no
+early dense chunk; the QK cap shrank later chunks automatically. On the 128K
+run, q projection dropped from about 550.84s at 4096 to about 434.19s at 8192,
+native sparse attention dropped from about 310.29s to 297.42s, and native
+indexer top-k dropped from about 77.43s to 75.21s. Peak memory stayed about
+336.41GB at 128K and rose by about 0.53GB at 16K through 64K compared with the
+4096-step runs.
 
 For latency experiments with `--kv-bits 8`, the native sparse MLA route can be
 enabled over int8 GLM MLA KV cache with:
@@ -547,7 +547,7 @@ python benchmarks/glm52_prefill_benchmark.py \
   --model "$MODEL" --mode prefill-sweep \
   --lengths 8192,32768 \
   --max-tokens 1 \
-  --prefill-step-candidates 1024,2048,4096 \
+  --prefill-step-candidates 1024,2048,4096,8192 \
   --prefill-max-qk-token-candidates 67108864 \
   --glm-dsa-adaptive-prefill-step-candidates 0,8192 \
   --fast-prefill enabled \
@@ -674,7 +674,7 @@ python -m mlx_lm server \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
-  --prefill-step-size 4096 \
+  --prefill-step-size 8192 \
   --prefill-max-qk-tokens 67108864 \
   --glm-dsa-adaptive-prefill-step-size 0 \
   --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
@@ -698,18 +698,19 @@ python -m mlx_lm server \
 
 This keeps requests on the single-request checkpoint path, which is the lowest
 TTFT path for repeated or partially reused long prompts. Use
-`--prefill-step-size 2048` if 4096 shows Metal recovery or memory pressure on
-your real prompt distribution, then 1024 if needed. `--prefill-max-qk-tokens`
-keeps prefill chunks below the configured query-by-context budget and can be set
-to `0` to disable context-aware step shrinking. The native quantized-KV guard at
-131072 has been profiled through a 128K prefill-stop run on the tested setup;
-raise it beyond 131072 only after profiling the target context length.
+`--prefill-step-size 4096` if 8192 shows Metal recovery or memory pressure on
+your real prompt distribution, then 2048 and 1024 if needed.
+`--prefill-max-qk-tokens` keeps prefill chunks below the configured
+query-by-context budget and can be set to `0` to disable context-aware step
+shrinking. The native quantized-KV guard at 131072 has been profiled through a
+128K prefill-stop run on the tested setup; raise it beyond 131072 only after
+profiling the target context length.
 
-For GLM DSA step-size tuning, compare 2048 and 4096 first. Treat
-`--glm-dsa-adaptive-prefill-step-size 8192` as a benchmark-only knob. The
-adaptive step is GLM-only and still passes through the `--prefill-max-qk-tokens`
-cap, so it mainly helps earlier/mid-context prefill where the QK budget allows a
-larger chunk.
+For GLM DSA step-size tuning, compare 4096 and 8192 first, with 2048 as the
+memory-pressure fallback. Treat `--glm-dsa-adaptive-prefill-step-size 8192` as a
+benchmark-only knob. The adaptive step is GLM-only and still passes through the
+`--prefill-max-qk-tokens` cap, so it mainly helps earlier/mid-context prefill
+where the QK budget allows a larger chunk.
 
 The checkpoint defaults above are the current ds4-style policy: save stable
 boundaries rather than unstable tails, round continued checkpoints to a roughly
