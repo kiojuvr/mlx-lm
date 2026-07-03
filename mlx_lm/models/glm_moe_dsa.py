@@ -46,6 +46,7 @@ GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV = (
 )
 GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
+GLM_DSA_NATIVE_Q4_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_VUP"
 GLM_DSA_Q_A_DENSE_CACHE_ENV = "MLX_LM_GLM_DSA_Q_A_DENSE_CACHE"
 GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
 GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
@@ -68,6 +69,7 @@ _PROFILE_STAGES = (
     "latent_kv_projection",
     "native_sparse_kv_dequantization",
     "native_q8_vup",
+    "native_q4_vup",
     "sparse_gather",
     "attention",
     "native_sparse_attention",
@@ -89,6 +91,10 @@ _NATIVE_Q8_VUP_LOOKUP_DONE = False
 _NATIVE_Q8_VUP_KERNEL = None
 _NATIVE_Q8_VUP_SOURCE = None
 _NATIVE_Q8_VUP_IMPORT_ERROR = None
+_NATIVE_Q4_VUP_LOOKUP_DONE = False
+_NATIVE_Q4_VUP_KERNEL = None
+_NATIVE_Q4_VUP_SOURCE = None
+_NATIVE_Q4_VUP_IMPORT_ERROR = None
 _NATIVE_Q4_QA_LOOKUP_DONE = False
 _NATIVE_Q4_QA_KERNEL = None
 _NATIVE_Q4_QA_SOURCE = None
@@ -124,6 +130,10 @@ def _native_indexer_enabled() -> bool:
 
 def _native_q8_vup_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_Q8_VUP_ENV, False)
+
+
+def _native_q4_vup_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_VUP_ENV, False)
 
 
 def _q_a_dense_cache_enabled() -> bool:
@@ -222,6 +232,8 @@ def _new_profile():
         "native_indexer_fallback_reasons": Counter(),
         "native_q8_vup_hits": 0,
         "native_q8_vup_fallback_reasons": Counter(),
+        "native_q4_vup_hits": 0,
+        "native_q4_vup_fallback_reasons": Counter(),
         "q_a_dense_cache_hits": 0,
         "q_a_dense_cache_builds": 0,
         "q_a_dense_cache_fallback_reasons": Counter(),
@@ -261,6 +273,10 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         "native_q8_vup_hits": _GLM_DSA_PREFILL_PROFILE["native_q8_vup_hits"],
         "native_q8_vup_fallback_reasons": dict(
             _GLM_DSA_PREFILL_PROFILE["native_q8_vup_fallback_reasons"]
+        ),
+        "native_q4_vup_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_vup_hits"],
+        "native_q4_vup_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_vup_fallback_reasons"]
         ),
         "q_a_dense_cache_hits": _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_hits"],
         "q_a_dense_cache_builds": _GLM_DSA_PREFILL_PROFILE[
@@ -355,6 +371,23 @@ def _record_native_q8_vup_decision(used: bool, reason: str):
             )
         else:
             _LOGGER.info("GLM DSA native q8 V-up fallback: %s", reason)
+
+
+def _record_native_q4_vup_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_vup_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_vup_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 V-up projection enabled: source=%s",
+                _NATIVE_Q4_VUP_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 V-up fallback: %s", reason)
 
 
 def _record_native_q4_qb_decision(used: bool, reason: str):
@@ -499,6 +532,49 @@ def _native_q8_vup_kernel():
         _NATIVE_Q8_VUP_SOURCE = "mlx.core.fast"
 
     return _NATIVE_Q8_VUP_KERNEL
+
+
+def _native_q4_vup_kernel():
+    global _NATIVE_Q4_VUP_LOOKUP_DONE
+    global _NATIVE_Q4_VUP_KERNEL
+    global _NATIVE_Q4_VUP_SOURCE
+    global _NATIVE_Q4_VUP_IMPORT_ERROR
+    if _NATIVE_Q4_VUP_LOOKUP_DONE:
+        return _NATIVE_Q4_VUP_KERNEL
+
+    _NATIVE_Q4_VUP_LOOKUP_DONE = True
+    _NATIVE_Q4_VUP_KERNEL = None
+    _NATIVE_Q4_VUP_SOURCE = None
+    _NATIVE_Q4_VUP_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_vup_flat")
+                and hasattr(fast, "glm_dsa_q4_vup_flat")
+            ):
+                _NATIVE_Q4_VUP_KERNEL = fast.glm_dsa_q4_vup_flat
+                _NATIVE_Q4_VUP_SOURCE = module_name
+                return _NATIVE_Q4_VUP_KERNEL
+            if _NATIVE_Q4_VUP_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_VUP_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_VUP_IMPORT_ERROR is None:
+                _NATIVE_Q4_VUP_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_vup_flat"):
+        _NATIVE_Q4_VUP_KERNEL = mx.fast.glm_dsa_q4_vup_flat
+        _NATIVE_Q4_VUP_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_VUP_KERNEL
 
 
 def _native_q4_qb_kernel():
@@ -747,6 +823,20 @@ def get_glm_dsa_native_q8_vup_status():
         "import_error": (
             repr(_NATIVE_Q8_VUP_IMPORT_ERROR)
             if _NATIVE_Q8_VUP_IMPORT_ERROR is not None
+            else None
+        ),
+    }
+
+
+def get_glm_dsa_native_q4_vup_status():
+    kernel = _native_q4_vup_kernel()
+    return {
+        "enabled": _native_q4_vup_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q4_VUP_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q4_VUP_IMPORT_ERROR)
+            if _NATIVE_Q4_VUP_IMPORT_ERROR is not None
             else None
         ),
     }
@@ -1376,6 +1466,47 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "weight_group_shape"
         return True, "native_q8_vup"
 
+    def _native_q4_vup_decision(self, x: mx.array):
+        if not _native_q4_vup_enabled():
+            return False, "disabled"
+        if _native_q4_vup_kernel() is None:
+            return False, "missing_symbol"
+        if not isinstance(self.unembed_out, QuantizedMultiLinear):
+            return False, "unquantized_unembed_out"
+        if self.unembed_out.bits != 4:
+            return False, f"unsupported_bits:{self.unembed_out.bits}"
+        if self.unembed_out.group_size != 64:
+            return False, f"unsupported_group_size:{self.unembed_out.group_size}"
+        if self.unembed_out.mode != "affine":
+            return False, f"unsupported_mode:{self.unembed_out.mode}"
+        weight = self.unembed_out["weight"]
+        scales = self.unembed_out["scales"]
+        biases = self.unembed_out.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 4:
+            return False, "input_rank"
+        B, H, L, K = x.shape
+        if H != 64:
+            return False, f"unsupported_heads:{H}"
+        if K != 512:
+            return False, f"unsupported_latent_dim:{K}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 3 or len(scales.shape) != 3 or len(biases.shape) != 3:
+            return False, "weight_rank"
+        if weight.shape[0] != H or scales.shape[0] != H or biases.shape[0] != H:
+            return False, "weight_heads"
+        if scales.shape[1] != 256 or biases.shape[1] != 256:
+            return False, "unsupported_value_dim"
+        if weight.shape[2] * 8 != K:
+            return False, "weight_latent_dim"
+        if scales.shape[2] != K // 64 or biases.shape[2] != K // 64:
+            return False, "weight_group_shape"
+        return True, "native_q4_vup"
+
     def _q_a_dense_cache_decision(self, x: mx.array):
         if not _q_a_dense_cache_enabled():
             return False, "disabled"
@@ -1613,6 +1744,30 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         return self.q_b_proj(x)
 
     def _unembed_out_project(self, x: mx.array):
+        use_native, reason = self._native_q4_vup_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_vup_kernel()
+                flat = _profile_stage(
+                    "native_q4_vup",
+                    lambda: kernel(
+                        x,
+                        self.unembed_out["weight"],
+                        self.unembed_out["scales"],
+                        self.unembed_out["biases"],
+                    ),
+                )
+                B, H, L, _ = x.shape
+                V = flat.shape[-1] // H
+                output = flat.reshape(B, L, H, V).transpose(0, 2, 1, 3)
+                _record_native_q4_vup_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if isinstance(self.unembed_out, QuantizedMultiLinear):
+            _record_native_q4_vup_decision(False, reason)
+
         use_native, reason = self._native_q8_vup_decision(x)
         if use_native:
             try:

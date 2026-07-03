@@ -48,6 +48,13 @@ instantiate_quantized_head_flat(
     64,
     8,
     true);
+instantiate_quantized_head_flat(affine_qmm_t_head_flat, float16_t, 64, 4, true);
+instantiate_quantized_head_flat(
+    affine_qmm_t_head_flat,
+    bfloat16_t,
+    64,
+    4,
+    true);
 instantiate_quantized_head_broadcast(
     affine_qmm_t_head_broadcast,
     float16_t,

@@ -490,6 +490,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
         )
         old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q4_vup_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status
         old_q4_qa_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status
         old_q4_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status
 
@@ -506,6 +507,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 },
                 "native_q8_vup_hits": 4,
                 "native_q8_vup_fallback_reasons": {"unsupported_heads:1": 1},
+                "native_q4_vup_hits": 9,
+                "native_q4_vup_fallback_reasons": {"disabled": 1},
                 "q_a_dense_cache_hits": 8,
                 "q_a_dense_cache_builds": 2,
                 "q_a_dense_cache_fallback_reasons": {"disabled": 1},
@@ -543,6 +546,14 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "import_error": None,
             }
 
+        def fake_q4_vup_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q4-vup-test",
+                "import_error": None,
+            }
+
         def fake_q4_status():
             return {
                 "enabled": True,
@@ -565,6 +576,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             native_sparse_prefill="enabled",
             native_indexer="enabled",
             native_q8_vup="enabled",
+            native_q4_vup="enabled",
             q_a_dense_cache="enabled",
             native_q4_qa="enabled",
             native_q4_qb="enabled",
@@ -575,6 +587,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             fake_indexer_status
         )
         benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+            fake_q4_vup_status
+        )
         benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = fake_q4_qa_status
         benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = fake_q4_status
         try:
@@ -586,6 +601,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 old_indexer_status
             )
             benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+                old_q4_vup_status
+            )
             benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = (
                 old_q4_qa_status
             )
@@ -624,6 +642,14 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             profile["glm_dsa_native_q8_vup_fallback_reasons"],
             {"unsupported_heads:1": 1},
         )
+        self.assertEqual(profile["glm_dsa_native_q4_vup"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_q4_vup_available"])
+        self.assertEqual(profile["glm_dsa_native_q4_vup_source"], "q4-vup-test")
+        self.assertEqual(profile["glm_dsa_native_q4_vup_hits"], 9)
+        self.assertEqual(
+            profile["glm_dsa_native_q4_vup_fallback_reasons"],
+            {"disabled": 1},
+        )
         self.assertEqual(profile["glm_dsa_q_a_dense_cache"], "enabled")
         self.assertEqual(profile["glm_dsa_q_a_dense_cache_hits"], 8)
         self.assertEqual(profile["glm_dsa_q_a_dense_cache_builds"], 2)
@@ -655,6 +681,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
         )
         old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q4_vup_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status
         old_q4_qa_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status
         old_q4_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status
         env_key = benchmark.glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
@@ -675,6 +702,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "native_indexer_fallback_reasons": {},
                 "native_q8_vup_hits": 0,
                 "native_q8_vup_fallback_reasons": {},
+                "native_q4_vup_hits": 0,
+                "native_q4_vup_fallback_reasons": {},
                 "q_a_dense_cache_hits": 0,
                 "q_a_dense_cache_builds": 0,
                 "q_a_dense_cache_fallback_reasons": {},
@@ -712,6 +741,14 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "import_error": None,
             }
 
+        def fake_q4_vup_status():
+            return {
+                "enabled": False,
+                "available": True,
+                "source": "q4-vup-test",
+                "import_error": None,
+            }
+
         def fake_q4_status():
             return {
                 "enabled": False,
@@ -734,6 +771,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             native_sparse_prefill="enabled",
             native_indexer="enabled",
             native_q8_vup="enabled",
+            native_q4_vup="default",
             q_a_dense_cache="default",
             native_q4_qa="default",
             native_q4_qb="default",
@@ -748,6 +786,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             fake_indexer_status
         )
         benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+            fake_q4_vup_status
+        )
         benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = fake_q4_qa_status
         benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = fake_q4_status
         os.environ.pop(env_key, None)
@@ -761,6 +802,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 old_indexer_status
             )
             benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+                old_q4_vup_status
+            )
             benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = (
                 old_q4_qa_status
             )

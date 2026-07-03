@@ -283,6 +283,11 @@ because the model-free microbench can be slower than MLX `quantized_matmul` on
 some lengths. Benchmark rows report `glm_dsa_native_q8_vup_hits` and
 `glm_dsa_native_q8_vup_fallback_reasons`.
 
+For q4 `unembed_out` weights, `MLX_LM_GLM_DSA_NATIVE_Q4_VUP=1` /
+`--native-q4-vup enabled` enables the matching `glm_dsa_q4_vup_flat` probe. It
+is also disabled by default. On the tested 16K native sparse MLA profile it hit
+the q4 route but left end-to-end TTFT effectively unchanged.
+
 The vendored native q4 q projection probes are also opt-in:
 `MLX_LM_GLM_DSA_NATIVE_Q4_QA=1` / `--native-q4-qa enabled` and
 `MLX_LM_GLM_DSA_NATIVE_Q4_QB=1` / `--native-q4-qb enabled`. They are useful for

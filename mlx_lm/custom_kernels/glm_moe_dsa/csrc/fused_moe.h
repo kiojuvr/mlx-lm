@@ -15,6 +15,13 @@ mx::array glm_dsa_q8_vup_flat(
     const mx::array& biases,
     mx::StreamOrDevice s = {});
 
+mx::array glm_dsa_q4_vup_flat(
+    const mx::array& x,
+    const mx::array& weight,
+    const mx::array& scales,
+    const mx::array& biases,
+    mx::StreamOrDevice s = {});
+
 mx::array glm_dsa_q4_qa_proj_flat(
     const mx::array& x,
     const mx::array& weight,

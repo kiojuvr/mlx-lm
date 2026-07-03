@@ -218,12 +218,14 @@ That means the extension is loaded, but the current native sparse MLA route is
 not used for those chunks because the GLM MLA KV cache becomes int8 before the
 native threshold.
 
-The q8 V-up route is independent from sparse MLA. When `unembed_out` is a
+The V-up routes are independent from sparse MLA. When `unembed_out` is a
 quantized affine `QuantizedMultiLinear` with the fixed GLM-5.2 M3 shape
-64 heads, latent dim 512, value dim 256, group size 64, the model can use the
-vendored `glm_dsa_q8_vup_flat` kernel for the latent-to-value projection. It is
-opt-in because the model-free microbench can be slower than MLX
-`quantized_matmul` on some lengths.
+64 heads, latent dim 512, value dim 256, group size 64, the model can use
+vendored native kernels for the latent-to-value projection. The q8 route uses
+`glm_dsa_q8_vup_flat`; the q4 route uses `glm_dsa_q4_vup_flat`. They are opt-in
+because the model-free microbench can be slower than MLX `quantized_matmul` on
+some lengths, and q4 did not move end-to-end TTFT in the tested 16K native
+sparse MLA profile despite hitting the native route.
 Benchmark rows report:
 
 - `glm_dsa_native_q8_vup`
@@ -231,11 +233,17 @@ Benchmark rows report:
 - `glm_dsa_native_q8_vup_source`
 - `glm_dsa_native_q8_vup_hits`
 - `glm_dsa_native_q8_vup_fallback_reasons`
+- `glm_dsa_native_q4_vup`
+- `glm_dsa_native_q4_vup_available`
+- `glm_dsa_native_q4_vup_source`
+- `glm_dsa_native_q4_vup_hits`
+- `glm_dsa_native_q4_vup_fallback_reasons`
 
-Use `--native-q8-vup enabled|disabled|default` to force or disable this route
-for comparison runs. With the default environment, it remains disabled.
+Use `--native-q8-vup enabled|disabled|default` and
+`--native-q4-vup enabled|disabled|default` to force or disable these routes for
+comparison runs. With the default environment, both remain disabled.
 
-The q4 q projection probes are independent from sparse MLA and q8 V-up. They
+The q4 q projection probes are independent from sparse MLA and V-up routes. They
 route the fixed GLM-5.2 M3 affine q4 `q_a_proj` and `q_b_proj` calls through
 vendored native kernels:
 
@@ -336,6 +344,8 @@ but reports:
 - `glm_dsa_latent_kv_dequantization_seconds`
 - `glm_dsa_latent_kv_projection_seconds`
 - `glm_dsa_native_sparse_kv_dequantization_seconds`
+- `glm_dsa_native_q8_vup_seconds`
+- `glm_dsa_native_q4_vup_seconds`
 - `glm_dsa_sparse_gather_seconds`
 - `glm_dsa_attention_seconds`
 - `glm_dsa_native_sparse_attention_seconds`

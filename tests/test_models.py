@@ -780,11 +780,92 @@ class TestModels(unittest.TestCase):
             glm_moe_dsa._native_indexer_available = old_available
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_native_q4_vup_projection_matches_fallback(self):
+        from mlx_lm.models import glm_moe_dsa
+        from mlx_lm.models.mla import QuantizedMultiLinear
+
+        env_keys = [glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_Q4_VUP_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q4_VUP_KERNEL,
+            glm_moe_dsa._NATIVE_Q4_VUP_SOURCE,
+            glm_moe_dsa._NATIVE_Q4_VUP_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV] = "1"
+            projection = QuantizedMultiLinear(
+                input_dims=512,
+                output_dims=256,
+                num_heads=64,
+                group_size=64,
+                bits=4,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            def fake_q4_vup(x, weight, scales, biases):
+                output = mx.quantized_matmul(
+                    x,
+                    weight,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=64,
+                    bits=4,
+                    mode="affine",
+                )
+                B, H, L, V = output.shape
+                return output.transpose(0, 2, 1, 3).reshape(B, L, H * V)
+
+            glm_moe_dsa._NATIVE_Q4_VUP_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q4_VUP_KERNEL = fake_q4_vup
+            glm_moe_dsa._NATIVE_Q4_VUP_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q4_VUP_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.unembed_out = projection
+            fake_attention._native_q4_vup_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_vup_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 64, 2, 512), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            output = glm_moe_dsa.GlmMoeDsaAttention._unembed_out_project(
+                fake_attention,
+                x,
+            )
+            expected = projection(x)
+            mx.eval(output, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["native_q4_vup_hits"], 1)
+            self.assertTrue(mx.allclose(output, expected, rtol=1e-4, atol=1e-4))
+        finally:
+            (
+                glm_moe_dsa._NATIVE_Q4_VUP_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q4_VUP_KERNEL,
+                glm_moe_dsa._NATIVE_Q4_VUP_SOURCE,
+                glm_moe_dsa._NATIVE_Q4_VUP_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_native_q8_vup_projection_matches_fallback(self):
         from mlx_lm.models import glm_moe_dsa
         from mlx_lm.models.mla import QuantizedMultiLinear
 
-        env_keys = [glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV]
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV,
+        ]
         saved_env = {key: os.environ.get(key) for key in env_keys}
         native_state = (
             glm_moe_dsa._NATIVE_Q8_VUP_LOOKUP_DONE,
@@ -794,6 +875,7 @@ class TestModels(unittest.TestCase):
         )
         try:
             os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV] = "0"
             projection = QuantizedMultiLinear(
                 input_dims=512,
                 output_dims=256,
@@ -830,6 +912,12 @@ class TestModels(unittest.TestCase):
 
             fake_attention = type("FakeAttention", (), {})()
             fake_attention.unembed_out = projection
+            fake_attention._native_q4_vup_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_vup_decision(
+                    fake_attention,
+                    x,
+                )
+            )
             fake_attention._native_q8_vup_decision = (
                 lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q8_vup_decision(
                     fake_attention,
