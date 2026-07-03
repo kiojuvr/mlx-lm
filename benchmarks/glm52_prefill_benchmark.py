@@ -277,6 +277,29 @@ def build_queued_prompt_texts(tokenizer, args):
     return prompts
 
 
+def parse_checkpoint_log_value(value):
+    if value == "None":
+        return None
+    if value.startswith("{") or value.startswith("["):
+        return json.loads(value)
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def chunk_sparse_route(values):
+    if int(values.get("glm_dsa_native_sparse_prefill_hits", 0) or 0) > 0:
+        return "native_sparse"
+    if int(values.get("glm_dsa_fast_prefill_hits", 0) or 0) > 0:
+        return "fast_sparse"
+    return "dense"
+
+
 def extract_checkpoint_summary(messages):
     summary = {
         "checkpoint_total_prompt_tokens": None,
@@ -292,6 +315,16 @@ def extract_checkpoint_summary(messages):
         "checkpoint_prefill_chunks": 0,
         "checkpoint_max_adaptive_prefill_step_size": None,
         "checkpoint_max_effective_prefill_step_size": None,
+        "checkpoint_prefill_chunk_seconds_total": 0.0,
+        "checkpoint_max_prefill_chunk_seconds": None,
+        "checkpoint_slowest_prefill_chunk_start_tokens": None,
+        "checkpoint_slowest_prefill_chunk_tokens": None,
+        "checkpoint_slowest_prefill_chunk_route": None,
+        "checkpoint_native_sparse_prefill_chunks": 0,
+        "checkpoint_fast_sparse_prefill_chunks": 0,
+        "checkpoint_dense_prefill_chunks": 0,
+        "checkpoint_native_indexer_chunks": 0,
+        "checkpoint_prefill_chunk_summaries": [],
         "checkpoint_resolution": None,
         "checkpoint_lookup_seconds": None,
         "checkpoint_files_scanned": None,
@@ -303,7 +336,7 @@ def extract_checkpoint_summary(messages):
     }
     for message in messages:
         if "prefill summary " in message:
-            for key, value in re.findall(r"([a-z_]+)=([^ ]+)", message):
+            for key, value in re.findall(r"([a-z0-9_]+)=([^ ]+)", message):
                 output_key = {
                     "total_prompt_tokens": "checkpoint_total_prompt_tokens",
                     "prefill_step_size": "checkpoint_prefill_step_size",
@@ -339,8 +372,36 @@ def extract_checkpoint_summary(messages):
 
         if "prefill chunk " not in message:
             continue
-        values = dict(re.findall(r"([a-z_]+)=([^ ]+)", message))
+        values = {
+            key: parse_checkpoint_log_value(value)
+            for key, value in re.findall(r"([a-z0-9_]+)=([^ ]+)", message)
+        }
         summary["checkpoint_prefill_chunks"] += 1
+        route = chunk_sparse_route(values)
+        if route == "native_sparse":
+            summary["checkpoint_native_sparse_prefill_chunks"] += 1
+        elif route == "fast_sparse":
+            summary["checkpoint_fast_sparse_prefill_chunks"] += 1
+        else:
+            summary["checkpoint_dense_prefill_chunks"] += 1
+        if int(values.get("glm_dsa_native_indexer_hits", 0) or 0) > 0:
+            summary["checkpoint_native_indexer_chunks"] += 1
+        chunk_seconds = values.get("chunk_seconds")
+        if chunk_seconds is not None:
+            chunk_seconds = float(chunk_seconds)
+            summary["checkpoint_prefill_chunk_seconds_total"] += chunk_seconds
+            if (
+                summary["checkpoint_max_prefill_chunk_seconds"] is None
+                or chunk_seconds > summary["checkpoint_max_prefill_chunk_seconds"]
+            ):
+                summary["checkpoint_max_prefill_chunk_seconds"] = chunk_seconds
+                summary["checkpoint_slowest_prefill_chunk_start_tokens"] = values.get(
+                    "start_tokens"
+                )
+                summary["checkpoint_slowest_prefill_chunk_tokens"] = values.get(
+                    "chunk_tokens"
+                )
+                summary["checkpoint_slowest_prefill_chunk_route"] = route
         for key, output_key in (
             (
                 "adaptive_prefill_step_size",
@@ -356,6 +417,45 @@ def extract_checkpoint_summary(messages):
             value = int(values[key])
             current = summary[output_key]
             summary[output_key] = value if current is None else max(current, value)
+        chunk_summary = {
+            "start_tokens": values.get("start_tokens"),
+            "chunk_tokens": values.get("chunk_tokens"),
+            "processed_tokens": values.get("processed_tokens"),
+            "route": route,
+            "chunk_seconds": chunk_seconds,
+            "native_sparse_prefill_hits": values.get(
+                "glm_dsa_native_sparse_prefill_hits",
+                0,
+            ),
+            "fast_prefill_hits": values.get("glm_dsa_fast_prefill_hits", 0),
+            "native_indexer_hits": values.get("glm_dsa_native_indexer_hits", 0),
+            "native_sparse_prefill_fallback_reasons": values.get(
+                "glm_dsa_native_sparse_prefill_fallback_reasons",
+                {},
+            ),
+            "fast_prefill_fallback_reasons": values.get(
+                "glm_dsa_fallback_reasons",
+                {},
+            ),
+            "native_indexer_fallback_reasons": values.get(
+                "glm_dsa_native_indexer_fallback_reasons",
+                {},
+            ),
+            "native_indexer_scores_seconds": values.get(
+                "glm_dsa_native_indexer_scores_seconds"
+            ),
+            "native_indexer_topk_seconds": values.get(
+                "glm_dsa_native_indexer_topk_seconds"
+            ),
+            "native_sparse_attention_seconds": values.get(
+                "glm_dsa_native_sparse_attention_seconds"
+            ),
+            "attention_seconds": values.get("glm_dsa_attention_seconds"),
+            "latent_kv_projection_seconds": values.get(
+                "glm_dsa_latent_kv_projection_seconds"
+            ),
+        }
+        summary["checkpoint_prefill_chunk_summaries"].append(chunk_summary)
     return summary
 
 
@@ -1596,6 +1696,15 @@ def print_table(rows, output_format):
         "checkpoint_prefill_chunks",
         "checkpoint_max_adaptive_prefill_step_size",
         "checkpoint_max_effective_prefill_step_size",
+        "checkpoint_prefill_chunk_seconds_total",
+        "checkpoint_max_prefill_chunk_seconds",
+        "checkpoint_slowest_prefill_chunk_start_tokens",
+        "checkpoint_slowest_prefill_chunk_tokens",
+        "checkpoint_slowest_prefill_chunk_route",
+        "checkpoint_native_sparse_prefill_chunks",
+        "checkpoint_fast_sparse_prefill_chunks",
+        "checkpoint_dense_prefill_chunks",
+        "checkpoint_native_indexer_chunks",
         "checkpoint_cache_dir",
         "checkpoint_save_exact",
         "checkpoint_lookup_seconds",

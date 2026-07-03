@@ -34,7 +34,11 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "total_prompt_tokens=8192 prefill_step_size=2048 "
                     "adaptive_prefill_step_size=8192 "
                     "effective_prefill_step_size=2048 "
-                    "prefill_max_qk_tokens=67108864 chunk_seconds=1.000000"
+                    "prefill_max_qk_tokens=67108864 chunk_seconds=1.000000 "
+                    "glm_dsa_native_sparse_prefill_hits=78 "
+                    "glm_dsa_native_indexer_hits=21 "
+                    "glm_dsa_native_sparse_attention_seconds=0.500000 "
+                    "glm_dsa_native_indexer_scores_seconds=0.125000"
                 ),
             ]
         )
@@ -59,6 +63,25 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(summary["checkpoint_prefill_chunks"], 1)
         self.assertEqual(summary["checkpoint_max_adaptive_prefill_step_size"], 8192)
         self.assertEqual(summary["checkpoint_max_effective_prefill_step_size"], 2048)
+        self.assertEqual(summary["checkpoint_prefill_chunk_seconds_total"], 1.0)
+        self.assertEqual(summary["checkpoint_max_prefill_chunk_seconds"], 1.0)
+        self.assertEqual(summary["checkpoint_slowest_prefill_chunk_start_tokens"], 6144)
+        self.assertEqual(summary["checkpoint_slowest_prefill_chunk_tokens"], 2048)
+        self.assertEqual(
+            summary["checkpoint_slowest_prefill_chunk_route"],
+            "native_sparse",
+        )
+        self.assertEqual(summary["checkpoint_native_sparse_prefill_chunks"], 1)
+        self.assertEqual(summary["checkpoint_fast_sparse_prefill_chunks"], 0)
+        self.assertEqual(summary["checkpoint_dense_prefill_chunks"], 0)
+        self.assertEqual(summary["checkpoint_native_indexer_chunks"], 1)
+        self.assertEqual(len(summary["checkpoint_prefill_chunk_summaries"]), 1)
+        chunk = summary["checkpoint_prefill_chunk_summaries"][0]
+        self.assertEqual(chunk["route"], "native_sparse")
+        self.assertEqual(chunk["native_sparse_prefill_hits"], 78)
+        self.assertEqual(chunk["native_indexer_hits"], 21)
+        self.assertEqual(chunk["native_sparse_attention_seconds"], 0.5)
+        self.assertEqual(chunk["native_indexer_scores_seconds"], 0.125)
 
     def test_format_output_cell_serializes_compound_values(self):
         self.assertEqual(benchmark.format_output_cell({"decode": 156}), '{"decode":156}')

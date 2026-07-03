@@ -351,6 +351,23 @@ but reports:
 - `glm_dsa_native_sparse_attention_seconds`
 - `glm_dsa_total_prefill_seconds`
 
+The prompt-checkpoint debug stream now also carries per-prefill-chunk GLM DSA
+route deltas. Benchmark JSON rows include `checkpoint_prefill_chunk_summaries`
+with each chunk's token range, wall time, sparse route (`native_sparse`,
+`fast_sparse`, or `dense`), native indexer hits, sparse MLA hits, fallback
+reason deltas, and selected stage-time deltas when `--prefill-profile` is
+enabled. Table output summarizes this as:
+
+- `checkpoint_prefill_chunk_seconds_total`
+- `checkpoint_max_prefill_chunk_seconds`
+- `checkpoint_slowest_prefill_chunk_start_tokens`
+- `checkpoint_slowest_prefill_chunk_tokens`
+- `checkpoint_slowest_prefill_chunk_route`
+- `checkpoint_native_sparse_prefill_chunks`
+- `checkpoint_fast_sparse_prefill_chunks`
+- `checkpoint_dense_prefill_chunks`
+- `checkpoint_native_indexer_chunks`
+
 ## Longest-Prefix Checkpoint Reuse
 
 Practical TTFT improvement now comes from prompt-prefix reuse rather than exact

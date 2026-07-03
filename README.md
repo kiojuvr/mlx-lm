@@ -305,7 +305,7 @@ rather than a recommended server setting. On the tested 8K repeat run, the
 warmed path was effectively unchanged versus dense-cache disabled.
 
 **Bottleneck hypothesis**
-The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.
+The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now. Benchmark JSON now includes `checkpoint_prefill_chunk_summaries` plus slowest-chunk and route-count columns so native sparse MLA/indexer policy changes can be evaluated chunk by chunk.
 
 ### OpenCode configuration example
 
