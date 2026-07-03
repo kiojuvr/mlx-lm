@@ -61,16 +61,29 @@ Q4QaTileConfig q4_qa_tile_config() {
   if (tile == "bk32" || tile == "b32k32n32") {
     return {32, 32, 32};
   }
+  if (tile == "bm16" || tile == "b16k64n32") {
+    return {16, 64, 32};
+  }
+  if (tile == "bn16" || tile == "b32k64n16") {
+    return {32, 64, 16};
+  }
   if (tile == "bn64" || tile == "b32k64n64") {
     return {32, 64, 64};
   }
   if (tile == "bm64" || tile == "b64k64n32") {
     return {64, 64, 32};
   }
+  if (tile == "bm16bn64" || tile == "b16k64n64") {
+    return {16, 64, 64};
+  }
+  if (tile == "bm64bn64" || tile == "b64k64n64") {
+    return {64, 64, 64};
+  }
 
   std::ostringstream msg;
   msg << "Unsupported MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE value: " << tile
-      << ". Expected default, bk32, bk64, bn64, or bm64.";
+      << ". Expected default, bk32, bk64, bm16, bn16, bn64, bm64, "
+      << "bm16bn64, or bm64bn64.";
   throw std::invalid_argument(msg.str());
 }
 

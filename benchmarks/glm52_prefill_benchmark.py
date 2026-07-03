@@ -2634,7 +2634,17 @@ def main():
     )
     parser.add_argument(
         "--native-q4-qa-tile",
-        choices=("default", "bk32", "bk64", "bn64", "bm64"),
+        choices=(
+            "default",
+            "bk32",
+            "bk64",
+            "bm16",
+            "bn16",
+            "bn64",
+            "bm64",
+            "bm16bn64",
+            "bm64bn64",
+        ),
         default="default",
         help=(
             "Select the opt-in native q4 q_a projection tile. The default "

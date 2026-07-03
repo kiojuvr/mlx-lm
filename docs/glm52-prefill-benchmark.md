@@ -283,12 +283,32 @@ than recommended serving settings. On the tested 8K cold prefill,
 29.7s q_a projection, 0.18s q_a RMSNorm, and 2.1s q_b projection. Earlier q4
 native probes did not improve end-to-end TTFT in that run.
 
-`--native-q4-qa-tile default|bk32|bk64|bn64|bm64` selects the q_a native q4
-tile; default/unset currently maps to `bk64`. The same-build 8K comparison
-measured `bk64` at about 52.99s TTFT and 26.41s q_a projection versus about
+`--native-q4-qa-tile` selects the q_a native q4 tile; default/unset currently
+maps to `bk64`. Available tiles are `bk32`, `bk64`, `bm16`, `bn16`, `bn64`,
+`bm64`, `bm16bn64`, and `bm64bn64`. The same-build 8K comparison measured
+`bk64` at about 52.99s TTFT and 26.41s q_a projection versus about
 53.26s TTFT and 26.58s q_a projection with the q_a native q4 route disabled.
 `bn64` was best in a short 2K sweep but regressed at 8K to about 53.41s TTFT and
 26.71s q_a projection.
+
+Use the standalone q_a tile microbench when the full model is already resident
+or when only the projection kernel is under investigation:
+
+```sh
+python benchmarks/glm52_q4_qa_tile_microbench.py \
+  --q-len 8192 \
+  --runs 5 \
+  --warmup-runs 1 \
+  --json-output /path/to/glm52-q4qa-tile-microbench-8192.json
+```
+
+This synthetic benchmark compares the fixed GLM-5.2 M3 q_a shape against
+`mx.quantized_matmul` without loading model weights. On the tested 8K synthetic
+run, `mx.quantized_matmul` measured about 0.00905s best / 0.00932s mean;
+native q4 q_a measured about 0.00860s / 0.00920s for `bk32`, 0.00880s /
+0.00901s for `bk64`, and slower means for the newly exposed `bm16`, `bn16`,
+`bm16bn64`, and `bm64bn64` variants. This points to only a small tile-level
+margin, so q_a-side gains likely need a larger change than tile selection.
 
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16

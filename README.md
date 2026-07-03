@@ -316,14 +316,16 @@ the tested 8K cold prefill, q projection split into about 29.7s q_a projection,
 reduce end-to-end TTFT.
 
 The q_a probe can also select a tile with
-`MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE=bk32|bk64|bn64|bm64` or
-`--native-q4-qa-tile`; unset/default uses `bk64`. This is still an experimental
-measurement knob. On the same 8K
+`MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE` or `--native-q4-qa-tile`; unset/default uses
+`bk64`. Available tiles are `bk32`, `bk64`, `bm16`, `bn16`, `bn64`, `bm64`,
+`bm16bn64`, and `bm64bn64`. This is still an experimental measurement knob. On
+the same 8K
 benchmark build, native q4 q_a with `bk64` measured about 52.99s TTFT and
 26.41s q_a projection versus about 53.26s TTFT and 26.58s q_a projection with
 the native q4 q_a route disabled. The 2K run favored `bn64`, but the 8K run
 regressed to about 53.41s TTFT and 26.71s q_a projection, so `bn64` is not a
-long-context default.
+long-context default. For low-memory tile sweeps without loading the full
+model, use `benchmarks/glm52_q4_qa_tile_microbench.py`.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

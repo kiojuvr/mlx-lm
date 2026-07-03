@@ -125,6 +125,42 @@ instantiate_quantized_flat_tiled(
     64,
     4,
     true,
+    16,
+    64,
+    32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    16,
+    64,
+    32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    16);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    16);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
     32,
     64,
     64);
@@ -155,6 +191,42 @@ instantiate_quantized_flat_tiled(
     64,
     64,
     32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
+    16,
+    64,
+    64);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    16,
+    64,
+    64);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
+    64,
+    64,
+    64);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    64,
+    64,
+    64);
 
 instantiate_moe_weighted_sum_tiled(float16_t, float, 8, 256);
 instantiate_moe_weighted_sum_tiled(bfloat16_t, float, 8, 256);
