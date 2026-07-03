@@ -46,6 +46,7 @@ GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV = (
 )
 GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
+GLM_DSA_Q_A_DENSE_CACHE_ENV = "MLX_LM_GLM_DSA_Q_A_DENSE_CACHE"
 GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
 GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
@@ -53,6 +54,8 @@ GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 _PROFILE_STAGES = (
     "q_projection",
     "q_a_projection",
+    "q_a_dense_cache_dequantization",
+    "q_a_dense_projection",
     "native_q4_qa_projection",
     "q_a_layernorm",
     "q_b_projection",
@@ -121,6 +124,10 @@ def _native_indexer_enabled() -> bool:
 
 def _native_q8_vup_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_Q8_VUP_ENV, False)
+
+
+def _q_a_dense_cache_enabled() -> bool:
+    return _env_flag(GLM_DSA_Q_A_DENSE_CACHE_ENV, False)
 
 
 def _native_q4_qa_enabled() -> bool:
@@ -215,6 +222,9 @@ def _new_profile():
         "native_indexer_fallback_reasons": Counter(),
         "native_q8_vup_hits": 0,
         "native_q8_vup_fallback_reasons": Counter(),
+        "q_a_dense_cache_hits": 0,
+        "q_a_dense_cache_builds": 0,
+        "q_a_dense_cache_fallback_reasons": Counter(),
         "native_q4_qa_hits": 0,
         "native_q4_qa_fallback_reasons": Counter(),
         "native_q4_qb_hits": 0,
@@ -251,6 +261,13 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         "native_q8_vup_hits": _GLM_DSA_PREFILL_PROFILE["native_q8_vup_hits"],
         "native_q8_vup_fallback_reasons": dict(
             _GLM_DSA_PREFILL_PROFILE["native_q8_vup_fallback_reasons"]
+        ),
+        "q_a_dense_cache_hits": _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_hits"],
+        "q_a_dense_cache_builds": _GLM_DSA_PREFILL_PROFILE[
+            "q_a_dense_cache_builds"
+        ],
+        "q_a_dense_cache_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_fallback_reasons"]
         ),
         "native_q4_qa_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qa_hits"],
         "native_q4_qa_fallback_reasons": dict(
@@ -355,6 +372,30 @@ def _record_native_q4_qb_decision(used: bool, reason: str):
             )
         else:
             _LOGGER.info("GLM DSA native q4 q_b fallback: %s", reason)
+
+
+def _record_q_a_dense_cache_decision(
+    used: bool,
+    reason: str,
+    *,
+    built: bool = False,
+):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_hits"] += 1
+        if built:
+            _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_builds"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA q_a dense cache enabled%s",
+                " with build" if built else "",
+            )
+        else:
+            _LOGGER.info("GLM DSA q_a dense cache fallback: %s", reason)
 
 
 def _record_native_q4_qa_decision(used: bool, reason: str):
@@ -939,6 +980,7 @@ class ModelArgs(BaseModelArgs):
 class GlmMoeDsaAttention(DeepseekV32Attention):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__(config)
+        object.__setattr__(self, "_q_a_dense_cache", None)
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
         if self.skip_topk:
             self.indexer = None
@@ -1334,6 +1376,103 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "weight_group_shape"
         return True, "native_q8_vup"
 
+    def _q_a_dense_cache_decision(self, x: mx.array):
+        if not _q_a_dense_cache_enabled():
+            return False, "disabled"
+        if not hasattr(self.q_a_proj, "bits"):
+            return False, "unquantized_q_a_proj"
+        if self.q_a_proj.bits != 4:
+            return False, f"unsupported_bits:{self.q_a_proj.bits}"
+        if self.q_a_proj.group_size != 64:
+            return False, f"unsupported_group_size:{self.q_a_proj.group_size}"
+        if self.q_a_proj.mode != "affine":
+            return False, f"unsupported_mode:{self.q_a_proj.mode}"
+        weight = self.q_a_proj["weight"]
+        scales = self.q_a_proj["scales"]
+        biases = self.q_a_proj.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 3:
+            return False, "input_rank"
+        if x.shape[-1] != 6144:
+            return False, f"unsupported_input_dim:{x.shape[-1]}"
+        if self.q_lora_rank != 2048:
+            return False, f"unsupported_q_lora_rank:{self.q_lora_rank}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{x.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 2 or len(scales.shape) != 2 or len(biases.shape) != 2:
+            return False, "weight_rank"
+        if weight.shape[0] != self.q_lora_rank:
+            return False, "weight_output_dim"
+        if scales.shape[0] != weight.shape[0] or biases.shape[0] != weight.shape[0]:
+            return False, "scale_output_dim"
+        if weight.shape[1] * 8 != x.shape[-1]:
+            return False, "weight_input_dim"
+        if scales.shape[1] != x.shape[-1] // 64:
+            return False, "scale_group_shape"
+        if biases.shape[1] != x.shape[-1] // 64:
+            return False, "bias_group_shape"
+        return True, "q_a_dense_cache"
+
+    def _q_a_dense_cache_key(self, x: mx.array):
+        return (
+            x.dtype,
+            id(self.q_a_proj["weight"]),
+            id(self.q_a_proj["scales"]),
+            id(self.q_a_proj.get("biases")),
+        )
+
+    def _q_a_dense_weight(self, x: mx.array):
+        key = self._q_a_dense_cache_key(x)
+        cache = object.__getattribute__(self, "_q_a_dense_cache")
+        if cache is not None and cache[0] == key:
+            return cache[1], False
+
+        def dequantize_weight():
+            dense_weight = mx.dequantize(
+                self.q_a_proj["weight"],
+                scales=self.q_a_proj["scales"],
+                biases=self.q_a_proj["biases"],
+                group_size=self.q_a_proj.group_size,
+                bits=self.q_a_proj.bits,
+                mode=self.q_a_proj.mode,
+            )
+            if not _prefill_profile_enabled():
+                mx.eval(dense_weight)
+            return dense_weight
+
+        dense_weight = _profile_stage(
+            "q_a_dense_cache_dequantization",
+            dequantize_weight,
+        )
+        object.__setattr__(self, "_q_a_dense_cache", (key, dense_weight))
+        return dense_weight, True
+
+    def _q_a_dense_cache_project(self, x: mx.array):
+        use_dense, reason = self._q_a_dense_cache_decision(x)
+        if not use_dense:
+            if hasattr(self.q_a_proj, "bits"):
+                _record_q_a_dense_cache_decision(False, reason)
+            return None
+        try:
+            dense_weight, built = self._q_a_dense_weight(x)
+            output = _profile_stage(
+                "q_a_dense_projection",
+                lambda: x @ dense_weight.T,
+            )
+            _record_q_a_dense_cache_decision(True, reason, built=built)
+            return output
+        except Exception as exc:
+            _record_q_a_dense_cache_decision(
+                False,
+                f"runtime_error:{type(exc).__name__}",
+            )
+            return None
+
     def _native_q4_qa_decision(self, x: mx.array):
         if not _native_q4_qa_enabled():
             return False, "disabled"
@@ -1379,6 +1518,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         return True, "native_q4_qa"
 
     def _q_a_project(self, x: mx.array):
+        dense_output = self._q_a_dense_cache_project(x)
+        if dense_output is not None:
+            return dense_output
         use_native, reason = self._native_q4_qa_decision(x)
         if use_native:
             try:

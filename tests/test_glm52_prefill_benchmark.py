@@ -506,6 +506,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 },
                 "native_q8_vup_hits": 4,
                 "native_q8_vup_fallback_reasons": {"unsupported_heads:1": 1},
+                "q_a_dense_cache_hits": 8,
+                "q_a_dense_cache_builds": 2,
+                "q_a_dense_cache_fallback_reasons": {"disabled": 1},
                 "native_q4_qa_hits": 7,
                 "native_q4_qa_fallback_reasons": {"missing_symbol": 1},
                 "native_q4_qb_hits": 6,
@@ -562,6 +565,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             native_sparse_prefill="enabled",
             native_indexer="enabled",
             native_q8_vup="enabled",
+            q_a_dense_cache="enabled",
             native_q4_qa="enabled",
             native_q4_qb="enabled",
         )
@@ -620,6 +624,13 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             profile["glm_dsa_native_q8_vup_fallback_reasons"],
             {"unsupported_heads:1": 1},
         )
+        self.assertEqual(profile["glm_dsa_q_a_dense_cache"], "enabled")
+        self.assertEqual(profile["glm_dsa_q_a_dense_cache_hits"], 8)
+        self.assertEqual(profile["glm_dsa_q_a_dense_cache_builds"], 2)
+        self.assertEqual(
+            profile["glm_dsa_q_a_dense_cache_fallback_reasons"],
+            {"disabled": 1},
+        )
         self.assertEqual(profile["glm_dsa_native_q4_qa"], "enabled")
         self.assertTrue(profile["glm_dsa_native_q4_qa_available"])
         self.assertEqual(profile["glm_dsa_native_q4_qa_source"], "q4-qa-test")
@@ -664,6 +675,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "native_indexer_fallback_reasons": {},
                 "native_q8_vup_hits": 0,
                 "native_q8_vup_fallback_reasons": {},
+                "q_a_dense_cache_hits": 0,
+                "q_a_dense_cache_builds": 0,
+                "q_a_dense_cache_fallback_reasons": {},
                 "native_q4_qa_hits": 0,
                 "native_q4_qa_fallback_reasons": {},
                 "native_q4_qb_hits": 0,
@@ -720,6 +734,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             native_sparse_prefill="enabled",
             native_indexer="enabled",
             native_q8_vup="enabled",
+            q_a_dense_cache="default",
             native_q4_qa="default",
             native_q4_qb="default",
             mode="single",

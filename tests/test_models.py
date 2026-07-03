@@ -942,7 +942,10 @@ class TestModels(unittest.TestCase):
 
         from mlx_lm.models import glm_moe_dsa
 
-        env_keys = [glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV]
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+            glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+        ]
         saved_env = {key: os.environ.get(key) for key in env_keys}
         native_state = (
             glm_moe_dsa._NATIVE_Q4_QA_LOOKUP_DONE,
@@ -951,6 +954,7 @@ class TestModels(unittest.TestCase):
             glm_moe_dsa._NATIVE_Q4_QA_IMPORT_ERROR,
         )
         try:
+            os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "0"
             os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "1"
             projection = nn.QuantizedLinear(
                 input_dims=6144,
@@ -987,6 +991,7 @@ class TestModels(unittest.TestCase):
             fake_attention = type("FakeAttention", (), {})()
             fake_attention.q_a_proj = projection
             fake_attention.q_lora_rank = 2048
+            fake_attention._q_a_dense_cache_project = lambda x: None
             fake_attention._native_q4_qa_decision = (
                 lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_qa_decision(
                     fake_attention,
@@ -1013,6 +1018,74 @@ class TestModels(unittest.TestCase):
                 glm_moe_dsa._NATIVE_Q4_QA_SOURCE,
                 glm_moe_dsa._NATIVE_Q4_QA_IMPORT_ERROR,
             ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_q_a_dense_cache_projection_matches_fallback(self):
+        import mlx.nn as nn
+
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "1"
+            projection = nn.QuantizedLinear(
+                input_dims=6144,
+                output_dims=2048,
+                bias=False,
+                group_size=64,
+                bits=4,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.q_a_proj = projection
+            fake_attention.q_lora_rank = 2048
+            fake_attention._q_a_dense_cache = None
+            fake_attention._q_a_dense_cache_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            fake_attention._q_a_dense_cache_key = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_key(
+                    fake_attention,
+                    x,
+                )
+            )
+            fake_attention._q_a_dense_weight = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_weight(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 2, 6144), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            first = glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_project(
+                fake_attention,
+                x,
+            )
+            second = glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_project(
+                fake_attention,
+                x,
+            )
+            expected = projection(x)
+            mx.eval(first, second, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["q_a_dense_cache_hits"], 2)
+            self.assertEqual(profile["q_a_dense_cache_builds"], 1)
+            self.assertTrue(mx.allclose(first, expected, rtol=1e-3, atol=1e-3))
+            self.assertTrue(mx.allclose(second, expected, rtol=1e-3, atol=1e-3))
+        finally:
             self._restore_env(saved_env)
 
     def test_glm_moe_dsa_quantized_fast_prefill_dequantizes_selected_kv(self):

@@ -247,8 +247,22 @@ than recommended serving settings. On the tested 8K cold prefill,
 29.7s q_a projection, 0.18s q_a RMSNorm, and 2.1s q_b projection. The current
 q4 native probes did not improve end-to-end TTFT in that run.
 
+For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
+dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
+matrices on first use and reuse them for later prefill calls in the same model
+process. This route is disabled by default because it adds roughly 1.5-2GB of
+resident memory across the full model and is only useful if warmed q_a
+projection time improves enough to justify that footprint. On the tested 8K
+repeat run, warmed dense-cache prefill was 51.46s versus 51.51s with the route
+disabled, while peak memory increased by about 1.96GB.
+
 Benchmark rows report:
 
+- `glm_dsa_q_a_dense_cache`
+- `glm_dsa_q_a_dense_cache_env`
+- `glm_dsa_q_a_dense_cache_hits`
+- `glm_dsa_q_a_dense_cache_builds`
+- `glm_dsa_q_a_dense_cache_fallback_reasons`
 - `glm_dsa_native_q4_qa`
 - `glm_dsa_native_q4_qa_available`
 - `glm_dsa_native_q4_qa_source`
@@ -286,6 +300,12 @@ satisfied. Current fallback reasons include:
 - native sparse MLA over int8 KV can additionally report
   `batched_quantized_kv_cache`, `quantized_kv_context_exceeds_limit`,
   `unsupported_kv_bits:*`, and `unsupported_kv_group_size:*`.
+- q_a dense-cache fallback reasons include `disabled`,
+  `unquantized_q_a_proj`, `unsupported_bits:*`, `unsupported_group_size:*`,
+  `unsupported_mode:*`, `missing_biases`, `unsupported_input_dim:*`,
+  `unsupported_q_lora_rank:*`, `unsupported_weight_dtype:*`,
+  `unsupported_dtype:*`, `mixed_dtype`, shape guard failures, and
+  `runtime_error:*`.
 
 These reasons are available from
 `mlx_lm.models.glm_moe_dsa.get_glm_dsa_prefill_profile()` and are also emitted
@@ -300,6 +320,8 @@ but reports:
 
 - `glm_dsa_q_projection_seconds`
 - `glm_dsa_q_a_projection_seconds`
+- `glm_dsa_q_a_dense_cache_dequantization_seconds`
+- `glm_dsa_q_a_dense_projection_seconds`
 - `glm_dsa_native_q4_qa_projection_seconds`
 - `glm_dsa_q_a_layernorm_seconds`
 - `glm_dsa_q_b_projection_seconds`

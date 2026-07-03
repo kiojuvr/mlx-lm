@@ -399,6 +399,11 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "1"
     elif native_q8_vup == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "0"
+    q_a_dense_cache = getattr(args, "q_a_dense_cache", "default")
+    if q_a_dense_cache == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "1"
+    elif q_a_dense_cache == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "0"
     native_q4_qa = getattr(args, "native_q4_qa", "default")
     if native_q4_qa == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "1"
@@ -528,6 +533,16 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_native_q8_vup_hits": profile["native_q8_vup_hits"],
         "glm_dsa_native_q8_vup_fallback_reasons": profile[
             "native_q8_vup_fallback_reasons"
+        ],
+        "glm_dsa_q_a_dense_cache": getattr(args, "q_a_dense_cache", "default"),
+        "glm_dsa_q_a_dense_cache_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+            "default-off",
+        ),
+        "glm_dsa_q_a_dense_cache_hits": profile["q_a_dense_cache_hits"],
+        "glm_dsa_q_a_dense_cache_builds": profile["q_a_dense_cache_builds"],
+        "glm_dsa_q_a_dense_cache_fallback_reasons": profile[
+            "q_a_dense_cache_fallback_reasons"
         ],
         "glm_dsa_native_q4_qa": getattr(args, "native_q4_qa", "default"),
         "glm_dsa_native_q4_qa_env": os.environ.get(
@@ -1636,6 +1651,11 @@ def print_table(rows, output_format):
         "glm_dsa_native_q8_vup_import_error",
         "glm_dsa_native_q8_vup_hits",
         "glm_dsa_native_q8_vup_fallback_reasons",
+        "glm_dsa_q_a_dense_cache",
+        "glm_dsa_q_a_dense_cache_env",
+        "glm_dsa_q_a_dense_cache_hits",
+        "glm_dsa_q_a_dense_cache_builds",
+        "glm_dsa_q_a_dense_cache_fallback_reasons",
         "glm_dsa_native_q4_qa",
         "glm_dsa_native_q4_qa_env",
         "glm_dsa_native_q4_qa_available",
@@ -1694,6 +1714,8 @@ def print_table(rows, output_format):
         "native_q8_vup_benchmark_error",
         "glm_dsa_q_projection_seconds",
         "glm_dsa_q_a_projection_seconds",
+        "glm_dsa_q_a_dense_cache_dequantization_seconds",
+        "glm_dsa_q_a_dense_projection_seconds",
         "glm_dsa_native_q4_qa_projection_seconds",
         "glm_dsa_q_a_layernorm_seconds",
         "glm_dsa_q_b_projection_seconds",
@@ -2421,6 +2443,18 @@ def main():
             "Control the opt-in native q4 q_b projection for GLM-5.2 M3 "
             "attention. The default leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB "
             "unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--q-a-dense-cache",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in dense q_a projection cache for GLM-5.2 M3 "
+            "attention. It dequantizes q_a_proj weights once per layer and "
+            "reuses the dense weight for later prefill calls. The default "
+            "leaves MLX_LM_GLM_DSA_Q_A_DENSE_CACHE unchanged; unset means "
+            "disabled."
         ),
     )
     parser.add_argument(

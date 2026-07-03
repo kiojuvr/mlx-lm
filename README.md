@@ -289,6 +289,14 @@ the tested 8K cold prefill, q projection split into about 29.7s q_a projection,
 0.18s q_a RMSNorm, and 2.1s q_b projection; the q4 native probes did not reduce
 end-to-end TTFT.
 
+There is also an opt-in q_a dense-cache probe:
+`MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It
+dequantizes each q4 `q_a_proj` weight to a dense fp16/bf16 matrix on first use
+and reuses it for later prefill calls. This trades roughly 1.5-2GB of extra
+resident memory for a warmed q_a projection path, so it is a measurement knob
+rather than a recommended server setting. On the tested 8K repeat run, the
+warmed path was effectively unchanged versus dense-cache disabled.
+
 **Bottleneck hypothesis**
 The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.
 
