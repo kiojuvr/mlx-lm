@@ -273,14 +273,22 @@ vendored native kernels:
 
 ```sh
 --native-q4-qa enabled \
+--native-q4-qa-tile bk64 \
 --native-q4-qb enabled
 ```
 
 These routes are disabled by default and are currently profiling probes rather
 than recommended serving settings. On the tested 8K cold prefill,
 `--prefill-profile` showed q projection dominated by q_a projection: about
-29.7s q_a projection, 0.18s q_a RMSNorm, and 2.1s q_b projection. The current
-q4 native probes did not improve end-to-end TTFT in that run.
+29.7s q_a projection, 0.18s q_a RMSNorm, and 2.1s q_b projection. Earlier q4
+native probes did not improve end-to-end TTFT in that run.
+
+`--native-q4-qa-tile default|bk32|bk64|bn64|bm64` selects the q_a native q4
+tile; default/unset currently maps to `bk64`. The same-build 8K comparison
+measured `bk64` at about 52.99s TTFT and 26.41s q_a projection versus about
+53.26s TTFT and 26.58s q_a projection with the q_a native q4 route disabled.
+`bn64` was best in a short 2K sweep but regressed at 8K to about 53.41s TTFT and
+26.71s q_a projection.
 
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
@@ -299,8 +307,11 @@ Benchmark rows report:
 - `glm_dsa_q_a_dense_cache_builds`
 - `glm_dsa_q_a_dense_cache_fallback_reasons`
 - `glm_dsa_native_q4_qa`
+- `glm_dsa_native_q4_qa_env`
 - `glm_dsa_native_q4_qa_available`
 - `glm_dsa_native_q4_qa_source`
+- `glm_dsa_native_q4_qa_tile_env`
+- `glm_dsa_native_q4_qa_tile`
 - `glm_dsa_native_q4_qa_hits`
 - `glm_dsa_native_q4_qa_fallback_reasons`
 - `glm_dsa_native_q4_qb`

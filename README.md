@@ -312,8 +312,18 @@ The vendored native q4 q projection probes are also opt-in:
 `MLX_LM_GLM_DSA_NATIVE_Q4_QB=1` / `--native-q4-qb enabled`. They are useful for
 isolated profiling but are not part of the recommended server command yet. On
 the tested 8K cold prefill, q projection split into about 29.7s q_a projection,
-0.18s q_a RMSNorm, and 2.1s q_b projection; the q4 native probes did not reduce
-end-to-end TTFT.
+0.18s q_a RMSNorm, and 2.1s q_b projection; earlier q4 native probes did not
+reduce end-to-end TTFT.
+
+The q_a probe can also select a tile with
+`MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE=bk32|bk64|bn64|bm64` or
+`--native-q4-qa-tile`; unset/default uses `bk64`. This is still an experimental
+measurement knob. On the same 8K
+benchmark build, native q4 q_a with `bk64` measured about 52.99s TTFT and
+26.41s q_a projection versus about 53.26s TTFT and 26.58s q_a projection with
+the native q4 q_a route disabled. The 2K run favored `bn64`, but the 8K run
+regressed to about 53.41s TTFT and 26.71s q_a projection, so `bn64` is not a
+long-context default.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

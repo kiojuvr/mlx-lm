@@ -45,6 +45,35 @@ std::string glm_type_name(Dtype dtype) {
   throw std::invalid_argument(msg.str());
 }
 
+struct Q4QaTileConfig {
+  int bm;
+  int bk;
+  int bn;
+};
+
+Q4QaTileConfig q4_qa_tile_config() {
+  const char* value = std::getenv("MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE");
+  const std::string tile =
+      (value == nullptr || value[0] == '\0') ? "bk64" : value;
+  if (tile == "default" || tile == "bk64" || tile == "b32k64n32") {
+    return {32, 64, 32};
+  }
+  if (tile == "bk32" || tile == "b32k32n32") {
+    return {32, 32, 32};
+  }
+  if (tile == "bn64" || tile == "b32k64n64") {
+    return {32, 64, 64};
+  }
+  if (tile == "bm64" || tile == "b64k64n32") {
+    return {64, 64, 32};
+  }
+
+  std::ostringstream msg;
+  msg << "Unsupported MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE value: " << tile
+      << ". Expected default, bk32, bk64, bn64, or bm64.";
+  throw std::invalid_argument(msg.str());
+}
+
 class GlmDsaQ8VupFlatPrimitive : public Primitive {
  public:
   explicit GlmDsaQ8VupFlatPrimitive(Stream stream) : Primitive(stream) {}
@@ -350,9 +379,8 @@ class GlmDsaQ4QaProjFlatPrimitive : public Primitive {
 
     constexpr int group_size = 64;
     constexpr int bits = 4;
-    constexpr int bm = 32;
-    constexpr int bn = 32;
     constexpr int N = 2048;
+    const auto tile = q4_qa_tile_config();
 
     const int B = x.shape(0);
     const int M = x.shape(1);
@@ -361,13 +389,18 @@ class GlmDsaQ4QaProjFlatPrimitive : public Primitive {
     std::string kname;
     concatenate(
         kname,
-        "affine_qmm_t_flat_",
+        "affine_qmm_t_flat_tiled_",
         glm_type_name(x.dtype()),
         "_gs_",
         group_size,
         "_b_",
         bits,
-        "_alN_true");
+        "_alN_true_bm_",
+        tile.bm,
+        "_bk_",
+        tile.bk,
+        "_bn_",
+        tile.bn);
 
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
     auto kernel = d.get_kernel(kname, lib);
@@ -382,7 +415,8 @@ class GlmDsaQ4QaProjFlatPrimitive : public Primitive {
     compute_encoder.set_bytes(N, 6);
     compute_encoder.set_bytes(M, 7);
 
-    MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+    MTL::Size grid_dims(
+        (N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm, B);
     MTL::Size group_dims(32, 2, 2);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }

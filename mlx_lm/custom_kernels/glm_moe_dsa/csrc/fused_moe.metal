@@ -21,6 +21,20 @@
       bits,                                                                    \
       aligned)
 
+#define instantiate_quantized_flat_tiled(                                       \
+    name, type, group_size, bits, aligned, bm, bk, bn)                          \
+  instantiate_kernel(                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned          \
+      "_bm_" #bm "_bk_" #bk "_bn_" #bn,                                        \
+      name,                                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      aligned,                                                                 \
+      bm,                                                                      \
+      bk,                                                                      \
+      bn)
+
 #define instantiate_quantized_head_broadcast(                                  \
     name, type, group_size, bits, aligned)                                      \
   instantiate_kernel(                                                          \
@@ -69,6 +83,78 @@ instantiate_quantized_head_broadcast(
     true);
 instantiate_quantized_flat(affine_qmm_t_flat, float16_t, 64, 4, true);
 instantiate_quantized_flat(affine_qmm_t_flat, bfloat16_t, 64, 4, true);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    32,
+    32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    32,
+    32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    64);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    64);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    float16_t,
+    64,
+    4,
+    true,
+    64,
+    64,
+    32);
+instantiate_quantized_flat_tiled(
+    affine_qmm_t_flat_tiled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    64,
+    64,
+    32);
 
 instantiate_moe_weighted_sum_tiled(float16_t, float, 8, 256);
 instantiate_moe_weighted_sum_tiled(bfloat16_t, float, 8, 256);

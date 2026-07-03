@@ -459,6 +459,14 @@ def extract_checkpoint_summary(messages):
     return summary
 
 
+def effective_native_q4_qa_tile() -> str:
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_TILE_ENV, "default")
+    tile = value.strip().lower()
+    if tile in ("", "default"):
+        return "bk64"
+    return tile
+
+
 def configure_glm_dsa_fast_prefill(args):
     if args.fast_prefill == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
@@ -514,6 +522,9 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "1"
     elif native_q4_qa == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "0"
+    native_q4_qa_tile = getattr(args, "native_q4_qa_tile", "default")
+    if native_q4_qa_tile != "default":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_TILE_ENV] = native_q4_qa_tile
     native_q4_qb = getattr(args, "native_q4_qb", "default")
     if native_q4_qb == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
@@ -669,6 +680,11 @@ def collect_glm_dsa_profile(args):
             glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
             "default-off",
         ),
+        "glm_dsa_native_q4_qa_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_native_q4_qa_tile": effective_native_q4_qa_tile(),
         "glm_dsa_native_q4_qa_available": native_q4_qa_status["available"],
         "glm_dsa_native_q4_qa_source": native_q4_qa_status["source"],
         "glm_dsa_native_q4_qa_import_error": native_q4_qa_status["import_error"],
@@ -1794,6 +1810,8 @@ def print_table(rows, output_format):
         "glm_dsa_q_a_dense_cache_fallback_reasons",
         "glm_dsa_native_q4_qa",
         "glm_dsa_native_q4_qa_env",
+        "glm_dsa_native_q4_qa_tile_env",
+        "glm_dsa_native_q4_qa_tile",
         "glm_dsa_native_q4_qa_available",
         "glm_dsa_native_q4_qa_source",
         "glm_dsa_native_q4_qa_import_error",
@@ -2612,6 +2630,16 @@ def main():
             "Control the opt-in native q4 q_a projection for GLM-5.2 M3 "
             "attention. The default leaves MLX_LM_GLM_DSA_NATIVE_Q4_QA "
             "unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qa-tile",
+        choices=("default", "bk32", "bk64", "bn64", "bm64"),
+        default="default",
+        help=(
+            "Select the opt-in native q4 q_a projection tile. The default "
+            "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE unchanged; unset means "
+            "bk64."
         ),
     )
     parser.add_argument(

@@ -1757,6 +1757,54 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
+    const int BM,
+    const int BK,
+    const int BN>
+[[kernel]] void affine_qmm_t_flat_tiled(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  const int b = tid.z;
+  const device T* x_batch = x + size_t(b) * M * K;
+  device T* y_batch = y + size_t(b) * M * N;
+
+  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+      w,
+      scales,
+      biases,
+      x_batch,
+      y_batch,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      K,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
     const bool batched,
     const int BM = 32,
     const int BK = 32,
