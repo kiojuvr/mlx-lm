@@ -113,7 +113,7 @@ but only activates for the fixed M3 GLM shape currently supported by the
 vendored kernel:
 64 heads, latent dim 512, RoPE dim 64, top-k 2048, unquantized `GlmMlaKVCache`,
 and an effective context at or above
-`MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 8192). Quantized
+`MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 6144). Quantized
 GLM MLA KV cache remains on the existing selected-KV sparse path unless the
 explicit quantized-KV native sparse option below is enabled.
 
@@ -121,9 +121,12 @@ The benchmark exposes `--native-sparse-prefill enabled|disabled|default` and
 `--native-sparse-prefill-min-context`. It also reports native availability,
 symbol source, import error, hit count, and fallback reasons so a run can
 distinguish "native extension missing" from "shape or cache guard rejected".
-On the tested M3 Ultra setup, the default handoff was moved from 11264 to 8192:
-the 16K profile improved from about 117s to about 111s, while forcing 4096 made
-the 8K profile slower.
+On the tested M3 Ultra setup, the default handoff was moved from 11264 to 6144.
+The first sweep moved it to 8192, improving the 16K profile from about 117s to
+about 111s while forcing 4096 made the 8K profile slower. The later chunk-route
+sweep favored 6144 over 8192: 8K prefill-stop improved from about 55.85s to
+53.72s, and 16K prefill-stop improved from about 110.28s to 109.90s. Delaying
+the handoff to 10240 regressed the 16K run to about 112.15s.
 
 For latency experiments with `--kv-bits 8`, the native sparse MLA route can be
 enabled over int8 GLM MLA KV cache with:
