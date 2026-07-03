@@ -82,7 +82,8 @@ DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS = 30_000
 DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS = 32
 DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS = 2048
 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS = 10_000
-DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT = 4
+DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT = 0
+DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS = 65_536
 
 
 def get_system_fingerprint():
@@ -789,10 +790,16 @@ class ResponseGenerator:
         stats = {
             "enabled": limit > 0,
             "limit": limit,
+            "max_tokens": _prompt_checkpoint_policy_int(
+                self.cli_args,
+                "checkpoint_shutdown_max_tokens",
+                DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
+            ),
             "candidates": 0,
             "attempted": 0,
             "saved": 0,
             "skipped": 0,
+            "skipped_too_large": 0,
         }
         if limit <= 0:
             _prompt_checkpoint_debug("shutdown flush skipped disabled")
@@ -834,6 +841,15 @@ class ResponseGenerator:
             if store_length <= 0:
                 stats["skipped"] += 1
                 continue
+            if stats["max_tokens"] > 0 and store_length > stats["max_tokens"]:
+                stats["skipped"] += 1
+                stats["skipped_too_large"] += 1
+                _prompt_checkpoint_debug(
+                    "shutdown flush skipped too large "
+                    f"store_length={store_length} "
+                    f"max_tokens={stats['max_tokens']}"
+                )
+                continue
             checkpoint_name = os.path.basename(
                 prompt_checkpoint_file(tokens[:store_length])
             )
@@ -857,6 +873,8 @@ class ResponseGenerator:
             f"attempted={stats['attempted']} "
             f"saved={stats['saved']} "
             f"skipped={stats['skipped']} "
+            f"skipped_too_large={stats['skipped_too_large']} "
+            f"max_tokens={stats['max_tokens']} "
             f"limit={limit}"
         )
         return stats
@@ -3860,6 +3878,17 @@ def setup_arg_parser():
             "Maximum number of RAM prompt-cache entries to persist as continued "
             "checkpoints during server shutdown. Use 0 to disable "
             f"(default: {DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-shutdown-max-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
+        help=(
+            "Maximum continued prompt checkpoint token length to save during "
+            "server shutdown when --checkpoint-shutdown-save-limit is enabled. "
+            "Use 0 to disable this cap "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS})."
         ),
     )
     parser.add_argument(

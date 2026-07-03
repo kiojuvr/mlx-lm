@@ -35,6 +35,7 @@ from mlx_lm.server import (
     DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
     LRUPromptCache,
     RenderedPromptCheckpoint,
@@ -108,6 +109,9 @@ class DummyModelProvider:
                 ),
                 "checkpoint_shutdown_save_limit": (
                     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT
+                ),
+                "checkpoint_shutdown_max_tokens": (
+                    DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS
                 ),
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
@@ -265,6 +269,9 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
             "checkpoint_max_age_seconds": DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
             "checkpoint_shutdown_save_limit": (
                 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT
+            ),
+            "checkpoint_shutdown_max_tokens": (
+                DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS
             ),
         }
         values.update(overrides)
@@ -610,6 +617,43 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["prefix_tokens"], list(range(8)))
         self.assertIsNot(captured["cache"], current_cache)
 
+    def test_shutdown_flush_skips_checkpoints_above_token_cap(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(
+            checkpoint_min_tokens=1,
+            checkpoint_boundary_trim_tokens=0,
+            checkpoint_boundary_align_tokens=4,
+            checkpoint_continued_interval_tokens=5,
+            checkpoint_shutdown_save_limit=1,
+            checkpoint_shutdown_max_tokens=4,
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+        )
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            tokenizer=types.SimpleNamespace(decode=lambda tokens, **kwargs: ""),
+            draft_model=None,
+            model_key=("model", None, None),
+            cli_args=cli_args,
+        )
+        generator.prompt_cache = LRUPromptCache(max_size=10)
+        generator.prompt_cache.insert_cache(
+            generator.model_provider.model_key,
+            list(range(12)),
+            [MockCache("current-cache")],
+        )
+
+        with mock.patch("mlx_lm.server.save_prompt_checkpoint") as save:
+            stats = generator.flush_shutdown_prompt_checkpoints()
+
+        save.assert_not_called()
+        self.assertEqual(stats["candidates"], 1)
+        self.assertEqual(stats["attempted"], 0)
+        self.assertEqual(stats["saved"], 0)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["skipped_too_large"], 1)
+
     def test_stop_and_join_logs_shutdown_start(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator._stop = False
@@ -884,6 +928,10 @@ class TestServerCLI(unittest.TestCase):
             args.checkpoint_shutdown_save_limit,
             DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
         )
+        self.assertEqual(
+            args.checkpoint_shutdown_max_tokens,
+            DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
+        )
         self.assertEqual(args.loop_guard_ngram_size, 64)
         self.assertEqual(args.loop_guard_repeats, 3)
         self.assertEqual(args.loop_guard_min_tokens, 256)
@@ -983,6 +1031,8 @@ class TestServerCLI(unittest.TestCase):
                 "disabled",
                 "--checkpoint-shutdown-save-limit",
                 "2",
+                "--checkpoint-shutdown-max-tokens",
+                "32768",
             ]
         )
 
@@ -994,6 +1044,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.checkpoint_max_age_seconds, 3600)
         self.assertEqual(args.checkpoint_save_exact, "disabled")
         self.assertEqual(args.checkpoint_shutdown_save_limit, 2)
+        self.assertEqual(args.checkpoint_shutdown_max_tokens, 32768)
 
     def test_setup_arg_parser_no_save_exact_checkpoint_alias(self):
         args = setup_arg_parser().parse_args(["--no-save-exact-checkpoint"])
