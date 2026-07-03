@@ -490,6 +490,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
         )
         old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q4_qa_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status
+        old_q4_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status
 
         def fake_profile():
             return {
@@ -504,6 +506,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 },
                 "native_q8_vup_hits": 4,
                 "native_q8_vup_fallback_reasons": {"unsupported_heads:1": 1},
+                "native_q4_qa_hits": 7,
+                "native_q4_qa_fallback_reasons": {"missing_symbol": 1},
+                "native_q4_qb_hits": 6,
+                "native_q4_qb_fallback_reasons": {"disabled": 1},
             }
 
         def fake_status():
@@ -534,12 +540,30 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "import_error": None,
             }
 
+        def fake_q4_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q4-test",
+                "import_error": None,
+            }
+
+        def fake_q4_qa_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q4-qa-test",
+                "import_error": None,
+            }
+
         args = Namespace(
             prefill_profile=False,
             fast_prefill="enabled",
             native_sparse_prefill="enabled",
             native_indexer="enabled",
             native_q8_vup="enabled",
+            native_q4_qa="enabled",
+            native_q4_qb="enabled",
         )
         benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = fake_profile
         benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = fake_status
@@ -547,6 +571,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             fake_indexer_status
         )
         benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = fake_q4_qa_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = fake_q4_status
         try:
             profile = benchmark.collect_glm_dsa_profile(args)
         finally:
@@ -556,6 +582,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 old_indexer_status
             )
             benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = (
+                old_q4_qa_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = old_q4_status
 
         self.assertEqual(profile["glm_dsa_native_sparse_prefill"], "enabled")
         self.assertTrue(profile["glm_dsa_native_sparse_prefill_available"])
@@ -590,6 +620,22 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             profile["glm_dsa_native_q8_vup_fallback_reasons"],
             {"unsupported_heads:1": 1},
         )
+        self.assertEqual(profile["glm_dsa_native_q4_qa"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_q4_qa_available"])
+        self.assertEqual(profile["glm_dsa_native_q4_qa_source"], "q4-qa-test")
+        self.assertEqual(profile["glm_dsa_native_q4_qa_hits"], 7)
+        self.assertEqual(
+            profile["glm_dsa_native_q4_qa_fallback_reasons"],
+            {"missing_symbol": 1},
+        )
+        self.assertEqual(profile["glm_dsa_native_q4_qb"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_q4_qb_available"])
+        self.assertEqual(profile["glm_dsa_native_q4_qb_source"], "q4-test")
+        self.assertEqual(profile["glm_dsa_native_q4_qb_hits"], 6)
+        self.assertEqual(
+            profile["glm_dsa_native_q4_qb_fallback_reasons"],
+            {"disabled": 1},
+        )
 
     def test_collect_profile_reports_quantized_native_route_blocker(self):
         old_profile = benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile
@@ -598,6 +644,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
         )
         old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q4_qa_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status
+        old_q4_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status
         env_key = benchmark.glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
         quantized_env_key = (
             benchmark.glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
@@ -616,6 +664,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "native_indexer_fallback_reasons": {},
                 "native_q8_vup_hits": 0,
                 "native_q8_vup_fallback_reasons": {},
+                "native_q4_qa_hits": 0,
+                "native_q4_qa_fallback_reasons": {},
+                "native_q4_qb_hits": 0,
+                "native_q4_qb_fallback_reasons": {},
             }
 
         def fake_status():
@@ -646,12 +698,30 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "import_error": None,
             }
 
+        def fake_q4_status():
+            return {
+                "enabled": False,
+                "available": True,
+                "source": "q4-test",
+                "import_error": None,
+            }
+
+        def fake_q4_qa_status():
+            return {
+                "enabled": False,
+                "available": True,
+                "source": "q4-qa-test",
+                "import_error": None,
+            }
+
         args = Namespace(
             prefill_profile=False,
             fast_prefill="enabled",
             native_sparse_prefill="enabled",
             native_indexer="enabled",
             native_q8_vup="enabled",
+            native_q4_qa="default",
+            native_q4_qb="default",
             mode="single",
             batch_size=1,
             kv_bits=8,
@@ -663,6 +733,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             fake_indexer_status
         )
         benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = fake_q4_qa_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = fake_q4_status
         os.environ.pop(env_key, None)
         os.environ.pop(quantized_env_key, None)
         try:
@@ -674,6 +746,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 old_indexer_status
             )
             benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = (
+                old_q4_qa_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = old_q4_status
             if old_env is None:
                 os.environ.pop(env_key, None)
             else:

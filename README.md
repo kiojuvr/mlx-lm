@@ -15,8 +15,8 @@ This branch is not intended as an upstream `mlx-lm` PR. Several changes intentio
 - Server-side support for `--kv-bits`, `--kv-group-size`, and `--quantized-kv-start`.
 - Local GLM-5.2 runtime cache layout designed for one-command invalidation.
 - Vendored GLM MoE DSA native custom kernels for optional native DSA indexer
-  score/top-k and sparse MLA prefill. These are built from this repository and
-  no longer require a runtime oMLX checkout.
+  score/top-k, sparse MLA prefill, and experimental q projection probes. These
+  are built from this repository and no longer require a runtime oMLX checkout.
 
 ### Native custom-kernel build
 
@@ -280,6 +280,14 @@ It is opt-in via `MLX_LM_GLM_DSA_NATIVE_Q8_VUP=1` or `--native-q8-vup enabled`
 because the model-free microbench can be slower than MLX `quantized_matmul` on
 some lengths. Benchmark rows report `glm_dsa_native_q8_vup_hits` and
 `glm_dsa_native_q8_vup_fallback_reasons`.
+
+The vendored native q4 q projection probes are also opt-in:
+`MLX_LM_GLM_DSA_NATIVE_Q4_QA=1` / `--native-q4-qa enabled` and
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB=1` / `--native-q4-qb enabled`. They are useful for
+isolated profiling but are not part of the recommended server command yet. On
+the tested 8K cold prefill, q projection split into about 29.7s q_a projection,
+0.18s q_a RMSNorm, and 2.1s q_b projection; the q4 native probes did not reduce
+end-to-end TTFT.
 
 **Bottleneck hypothesis**
 The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.

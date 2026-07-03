@@ -29,6 +29,8 @@ NATIVE_SYMBOLS = (
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
     "glm_dsa_q8_vup_flat",
+    "glm_dsa_q4_qa_proj_flat",
+    "glm_dsa_q4_qb_proj_flat",
     "glm_moe_weighted_sum",
 )
 
@@ -218,6 +220,56 @@ def glm_dsa_q8_vup_flat(
             **_native_stream_kwargs(stream),
         )
     return mx.fast.glm_dsa_q8_vup_flat(
+        x,
+        weight,
+        scales,
+        biases,
+        stream=stream or mx.gpu,
+    )
+
+
+def glm_dsa_q4_qb_proj_flat(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "glm_dsa_q4_qb_proj_flat"):
+        return _ext.glm_dsa_q4_qb_proj_flat(
+            x,
+            weight,
+            scales,
+            biases,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.glm_dsa_q4_qb_proj_flat(
+        x,
+        weight,
+        scales,
+        biases,
+        stream=stream or mx.gpu,
+    )
+
+
+def glm_dsa_q4_qa_proj_flat(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "glm_dsa_q4_qa_proj_flat"):
+        return _ext.glm_dsa_q4_qa_proj_flat(
+            x,
+            weight,
+            scales,
+            biases,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.glm_dsa_q4_qa_proj_flat(
         x,
         weight,
         scales,

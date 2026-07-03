@@ -399,6 +399,16 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "1"
     elif native_q8_vup == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "0"
+    native_q4_qa = getattr(args, "native_q4_qa", "default")
+    if native_q4_qa == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "1"
+    elif native_q4_qa == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "0"
+    native_q4_qb = getattr(args, "native_q4_qb", "default")
+    if native_q4_qb == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
+    elif native_q4_qb == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "0"
     if args.fast_prefill_query_chunk is not None:
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
@@ -431,6 +441,8 @@ def collect_glm_dsa_profile(args):
     native_status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
     native_indexer_status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
     native_q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
+    native_q4_qa_status = glm_moe_dsa.get_glm_dsa_native_q4_qa_status()
+    native_q4_qb_status = glm_moe_dsa.get_glm_dsa_native_q4_qb_status()
     stage_values = {}
     for stage, values in profile["stages"].items():
         key = f"glm_dsa_{stage}_seconds"
@@ -516,6 +528,30 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_native_q8_vup_hits": profile["native_q8_vup_hits"],
         "glm_dsa_native_q8_vup_fallback_reasons": profile[
             "native_q8_vup_fallback_reasons"
+        ],
+        "glm_dsa_native_q4_qa": getattr(args, "native_q4_qa", "default"),
+        "glm_dsa_native_q4_qa_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q4_qa_available": native_q4_qa_status["available"],
+        "glm_dsa_native_q4_qa_source": native_q4_qa_status["source"],
+        "glm_dsa_native_q4_qa_import_error": native_q4_qa_status["import_error"],
+        "glm_dsa_native_q4_qa_hits": profile["native_q4_qa_hits"],
+        "glm_dsa_native_q4_qa_fallback_reasons": profile[
+            "native_q4_qa_fallback_reasons"
+        ],
+        "glm_dsa_native_q4_qb": getattr(args, "native_q4_qb", "default"),
+        "glm_dsa_native_q4_qb_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q4_qb_available": native_q4_qb_status["available"],
+        "glm_dsa_native_q4_qb_source": native_q4_qb_status["source"],
+        "glm_dsa_native_q4_qb_import_error": native_q4_qb_status["import_error"],
+        "glm_dsa_native_q4_qb_hits": profile["native_q4_qb_hits"],
+        "glm_dsa_native_q4_qb_fallback_reasons": profile[
+            "native_q4_qb_fallback_reasons"
         ],
         **native_sparse_prefill_route_diagnostics(args, profile, native_status),
         "glm_dsa_native_q8_vup": getattr(args, "native_q8_vup", "default"),
@@ -1600,6 +1636,20 @@ def print_table(rows, output_format):
         "glm_dsa_native_q8_vup_import_error",
         "glm_dsa_native_q8_vup_hits",
         "glm_dsa_native_q8_vup_fallback_reasons",
+        "glm_dsa_native_q4_qa",
+        "glm_dsa_native_q4_qa_env",
+        "glm_dsa_native_q4_qa_available",
+        "glm_dsa_native_q4_qa_source",
+        "glm_dsa_native_q4_qa_import_error",
+        "glm_dsa_native_q4_qa_hits",
+        "glm_dsa_native_q4_qa_fallback_reasons",
+        "glm_dsa_native_q4_qb",
+        "glm_dsa_native_q4_qb_env",
+        "glm_dsa_native_q4_qb_available",
+        "glm_dsa_native_q4_qb_source",
+        "glm_dsa_native_q4_qb_import_error",
+        "glm_dsa_native_q4_qb_hits",
+        "glm_dsa_native_q4_qb_fallback_reasons",
         "native_smoke_available",
         "native_smoke_source",
         "native_smoke_import_error",
@@ -1643,6 +1693,11 @@ def print_table(rows, output_format):
         "native_q8_vup_speedup_mean",
         "native_q8_vup_benchmark_error",
         "glm_dsa_q_projection_seconds",
+        "glm_dsa_q_a_projection_seconds",
+        "glm_dsa_native_q4_qa_projection_seconds",
+        "glm_dsa_q_a_layernorm_seconds",
+        "glm_dsa_q_b_projection_seconds",
+        "glm_dsa_native_q4_qb_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
         "glm_dsa_native_indexer_scores_seconds",
@@ -2356,6 +2411,26 @@ def main():
             "Control the optional native q8 V-up projection for quantized GLM "
             "DSA unembed_out weights. The default leaves "
             "MLX_LM_GLM_DSA_NATIVE_Q8_VUP unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qb",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native q4 q_b projection for GLM-5.2 M3 "
+            "attention. The default leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB "
+            "unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qa",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native q4 q_a projection for GLM-5.2 M3 "
+            "attention. The default leaves MLX_LM_GLM_DSA_NATIVE_Q4_QA "
+            "unchanged; unset means disabled."
         ),
     )
     parser.add_argument(

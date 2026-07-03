@@ -232,6 +232,34 @@ Benchmark rows report:
 Use `--native-q8-vup enabled|disabled|default` to force or disable this route
 for comparison runs. With the default environment, it remains disabled.
 
+The q4 q projection probes are independent from sparse MLA and q8 V-up. They
+route the fixed GLM-5.2 M3 affine q4 `q_a_proj` and `q_b_proj` calls through
+vendored native kernels:
+
+```sh
+--native-q4-qa enabled \
+--native-q4-qb enabled
+```
+
+These routes are disabled by default and are currently profiling probes rather
+than recommended serving settings. On the tested 8K cold prefill,
+`--prefill-profile` showed q projection dominated by q_a projection: about
+29.7s q_a projection, 0.18s q_a RMSNorm, and 2.1s q_b projection. The current
+q4 native probes did not improve end-to-end TTFT in that run.
+
+Benchmark rows report:
+
+- `glm_dsa_native_q4_qa`
+- `glm_dsa_native_q4_qa_available`
+- `glm_dsa_native_q4_qa_source`
+- `glm_dsa_native_q4_qa_hits`
+- `glm_dsa_native_q4_qa_fallback_reasons`
+- `glm_dsa_native_q4_qb`
+- `glm_dsa_native_q4_qb_available`
+- `glm_dsa_native_q4_qb_source`
+- `glm_dsa_native_q4_qb_hits`
+- `glm_dsa_native_q4_qb_fallback_reasons`
+
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:
 
@@ -271,6 +299,11 @@ Use `--prefill-profile` to force synchronized stage timings. This adds overhead
 but reports:
 
 - `glm_dsa_q_projection_seconds`
+- `glm_dsa_q_a_projection_seconds`
+- `glm_dsa_native_q4_qa_projection_seconds`
+- `glm_dsa_q_a_layernorm_seconds`
+- `glm_dsa_q_b_projection_seconds`
+- `glm_dsa_native_q4_qb_projection_seconds`
 - `glm_dsa_kv_cache_update_seconds`
 - `glm_dsa_dsa_indexer_topk_seconds`
 - `glm_dsa_native_indexer_scores_seconds`

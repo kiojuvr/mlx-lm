@@ -12,6 +12,25 @@
       aligned,                                                                 \
       true)
 
+#define instantiate_quantized_flat(name, type, group_size, bits, aligned)       \
+  instantiate_kernel(                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned,         \
+      name,                                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      aligned)
+
+#define instantiate_quantized_head_broadcast(                                  \
+    name, type, group_size, bits, aligned)                                      \
+  instantiate_kernel(                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned,         \
+      name,                                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      aligned)
+
 #define instantiate_moe_weighted_sum_tiled(type, score_type, topk, threads)    \
   instantiate_kernel(                                                          \
       "moe_weighted_sum_tiled_" #type "_score_" #score_type "_topk_" #topk     \
@@ -29,6 +48,20 @@ instantiate_quantized_head_flat(
     64,
     8,
     true);
+instantiate_quantized_head_broadcast(
+    affine_qmm_t_head_broadcast,
+    float16_t,
+    64,
+    4,
+    true);
+instantiate_quantized_head_broadcast(
+    affine_qmm_t_head_broadcast,
+    bfloat16_t,
+    64,
+    4,
+    true);
+instantiate_quantized_flat(affine_qmm_t_flat, float16_t, 64, 4, true);
+instantiate_quantized_flat(affine_qmm_t_flat, bfloat16_t, 64, 4, true);
 
 instantiate_moe_weighted_sum_tiled(float16_t, float, 8, 256);
 instantiate_moe_weighted_sum_tiled(bfloat16_t, float, 8, 256);

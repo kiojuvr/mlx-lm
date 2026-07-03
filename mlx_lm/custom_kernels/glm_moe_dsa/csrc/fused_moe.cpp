@@ -165,6 +165,235 @@ class GlmDsaQ8VupFlatPrimitive : public Primitive {
 
 };
 
+class GlmDsaQ4QaProjFlatPrimitive : public Primitive {
+ public:
+  explicit GlmDsaQ4QaProjFlatPrimitive(Stream stream) : Primitive(stream) {}
+
+  static bool unsupported(
+      const array& x,
+      const array& weight,
+      const array& scales,
+      const array& biases,
+      Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    if (x.dtype() != float16 && x.dtype() != bfloat16) {
+      return true;
+    }
+    if (weight.dtype() != uint32 || scales.dtype() != x.dtype() ||
+        biases.dtype() != x.dtype()) {
+      return true;
+    }
+    if (x.ndim() != 3 || weight.ndim() != 2 || scales.ndim() != 2 ||
+        biases.ndim() != 2) {
+      return true;
+    }
+    if (!row_contiguous(x) || !row_contiguous(weight) ||
+        !row_contiguous(scales) || !row_contiguous(biases)) {
+      return true;
+    }
+
+    constexpr int N = 2048;
+    constexpr int K = 6144;
+    constexpr int bits = 4;
+    constexpr int group_size = 64;
+    constexpr int pack_factor = 32 / bits;
+    if (x.shape(2) != K || weight.shape(0) != N ||
+        weight.shape(1) * pack_factor != K || scales.shape(0) != N ||
+        biases.shape(0) != N || scales.shape(1) != K / group_size ||
+        biases.shape(1) != K / group_size) {
+      return true;
+    }
+    return false;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("GlmDsaQ4QaProjFlatPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scales = inputs[2];
+    const auto& biases = inputs[3];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int group_size = 64;
+    constexpr int bits = 4;
+    constexpr int bm = 32;
+    constexpr int bn = 32;
+    constexpr int N = 2048;
+
+    const int B = x.shape(0);
+    const int M = x.shape(1);
+    const int K = x.shape(2);
+
+    std::string kname;
+    concatenate(
+        kname,
+        "affine_qmm_t_flat_",
+        glm_type_name(x.dtype()),
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        "_alN_true");
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(kname, lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(weight, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_input_array(biases, 2);
+    compute_encoder.set_input_array(x, 3);
+    compute_encoder.set_output_array(out, 4);
+    compute_encoder.set_bytes(K, 5);
+    compute_encoder.set_bytes(N, 6);
+    compute_encoder.set_bytes(M, 7);
+
+    MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
+    MTL::Size group_dims(32, 2, 2);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(GlmDsaQ4QaProjFlatPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& /* other */) const override {
+    return true;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+
+};
+
+class GlmDsaQ4QbProjFlatPrimitive : public Primitive {
+ public:
+  explicit GlmDsaQ4QbProjFlatPrimitive(Stream stream) : Primitive(stream) {}
+
+  static bool unsupported(
+      const array& x,
+      const array& weight,
+      const array& scales,
+      const array& biases,
+      Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    if (x.dtype() != float16 && x.dtype() != bfloat16) {
+      return true;
+    }
+    if (weight.dtype() != uint32 || scales.dtype() != x.dtype() ||
+        biases.dtype() != x.dtype()) {
+      return true;
+    }
+    if (x.ndim() != 3 || weight.ndim() != 2 || scales.ndim() != 2 ||
+        biases.ndim() != 2) {
+      return true;
+    }
+    if (!row_contiguous(x) || !row_contiguous(weight) ||
+        !row_contiguous(scales) || !row_contiguous(biases)) {
+      return true;
+    }
+
+    constexpr int H = 64;
+    constexpr int N = 256;
+    constexpr int K = 2048;
+    constexpr int bits = 4;
+    constexpr int group_size = 64;
+    constexpr int pack_factor = 32 / bits;
+    if (x.shape(2) != K || weight.shape(0) != H * N ||
+        weight.shape(1) * pack_factor != K || scales.shape(0) != H * N ||
+        biases.shape(0) != H * N || scales.shape(1) != K / group_size ||
+        biases.shape(1) != K / group_size) {
+      return true;
+    }
+    return false;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("GlmDsaQ4QbProjFlatPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scales = inputs[2];
+    const auto& biases = inputs[3];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int group_size = 64;
+    constexpr int bits = 4;
+    constexpr int bm = 32;
+    constexpr int bn = 32;
+    constexpr int H = 64;
+    constexpr int N = 256;
+
+    const int B = x.shape(0);
+    const int M = x.shape(1);
+    const int K = x.shape(2);
+
+    std::string kname;
+    concatenate(
+        kname,
+        "affine_qmm_t_head_broadcast_",
+        glm_type_name(x.dtype()),
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        "_alN_true");
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(kname, lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(weight, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_input_array(biases, 2);
+    compute_encoder.set_input_array(x, 3);
+    compute_encoder.set_output_array(out, 4);
+    compute_encoder.set_bytes(K, 5);
+    compute_encoder.set_bytes(N, 6);
+    compute_encoder.set_bytes(M, 7);
+    compute_encoder.set_bytes(H, 8);
+
+    MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B * H);
+    MTL::Size group_dims(32, 2, 2);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(GlmDsaQ4QbProjFlatPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& /* other */) const override {
+    return true;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+
+};
+
 class GlmMoeWeightedSumPrimitive : public Primitive {
  public:
   explicit GlmMoeWeightedSumPrimitive(Stream stream) : Primitive(stream) {}
@@ -340,6 +569,137 @@ array glm_dsa_q8_vup_flat(
       std::move(out_shape),
       x.dtype(),
       std::make_shared<GlmDsaQ8VupFlatPrimitive>(stream),
+      std::move(inputs));
+}
+
+array glm_dsa_q4_qa_proj_flat(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s /* = {} */) {
+  if (x.ndim() != 3 || weight.ndim() != 2 || scales.ndim() != 2 ||
+      biases.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qa_proj_flat] expected x rank 3 and "
+        << "quantized weights rank 2, got " << x.shape() << ", "
+        << weight.shape() << ", " << scales.shape() << ", " << biases.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  const int B = x.shape(0);
+  const int L = x.shape(1);
+  constexpr int bits = 4;
+  constexpr int group_size = 64;
+  constexpr int pack_factor = 32 / bits;
+  const int N = weight.shape(0);
+  const int K = weight.shape(1) * pack_factor;
+  if (N != 2048 || x.shape(2) != K || K != 6144 ||
+      scales.shape(0) != N || biases.shape(0) != N ||
+      scales.shape(1) != K / group_size ||
+      biases.shape(1) != K / group_size) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qa_proj_flat] incompatible shapes: "
+        << x.shape() << ", " << weight.shape() << ", " << scales.shape()
+        << ", " << biases.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != float16 && x.dtype() != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qa_proj_flat] expected float16 or "
+        << "bfloat16 input, got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (weight.dtype() != uint32 || scales.dtype() != x.dtype() ||
+      biases.dtype() != x.dtype()) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qa_proj_flat] expected uint32 "
+        << "weight and scale/bias dtype " << x.dtype() << ", got "
+        << weight.dtype() << ", " << scales.dtype() << ", " << biases.dtype()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {x, weight, scales, biases};
+  if (GlmDsaQ4QaProjFlatPrimitive::unsupported(
+          x, weight, scales, biases, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.glm_dsa_q4_qa_proj_flat] unsupported M3 GLM shape.");
+  }
+
+  Shape out_shape{B, L, N};
+  return array(
+      std::move(out_shape),
+      x.dtype(),
+      std::make_shared<GlmDsaQ4QaProjFlatPrimitive>(stream),
+      std::move(inputs));
+}
+
+array glm_dsa_q4_qb_proj_flat(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s /* = {} */) {
+  if (x.ndim() != 3 || weight.ndim() != 2 || scales.ndim() != 2 ||
+      biases.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_flat] expected x rank 3 and "
+        << "quantized weights rank 2, got " << x.shape() << ", "
+        << weight.shape() << ", " << scales.shape() << ", " << biases.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  const int B = x.shape(0);
+  const int L = x.shape(1);
+  constexpr int H = 64;
+  constexpr int N = 256;
+  constexpr int bits = 4;
+  constexpr int group_size = 64;
+  constexpr int pack_factor = 32 / bits;
+  const int K = weight.shape(1) * pack_factor;
+  if (weight.shape(0) != H * N || x.shape(2) != K ||
+      scales.shape(0) != H * N || biases.shape(0) != H * N ||
+      scales.shape(1) != K / group_size ||
+      biases.shape(1) != K / group_size) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_flat] incompatible shapes: "
+        << x.shape() << ", " << weight.shape() << ", " << scales.shape()
+        << ", " << biases.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != float16 && x.dtype() != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_flat] expected float16 or "
+        << "bfloat16 input, got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (weight.dtype() != uint32 || scales.dtype() != x.dtype() ||
+      biases.dtype() != x.dtype()) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_flat] expected uint32 "
+        << "weight and scale/bias dtype " << x.dtype() << ", got "
+        << weight.dtype() << ", " << scales.dtype() << ", " << biases.dtype()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {x, weight, scales, biases};
+  if (GlmDsaQ4QbProjFlatPrimitive::unsupported(
+          x, weight, scales, biases, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.glm_dsa_q4_qb_proj_flat] unsupported M3 GLM shape.");
+  }
+
+  Shape out_shape{B, L, H * N};
+  return array(
+      std::move(out_shape),
+      x.dtype(),
+      std::make_shared<GlmDsaQ4QbProjFlatPrimitive>(stream),
       std::move(inputs));
 }
 

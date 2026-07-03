@@ -46,10 +46,17 @@ GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV = (
 )
 GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
+GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
+GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 
 _PROFILE_STAGES = (
     "q_projection",
+    "q_a_projection",
+    "native_q4_qa_projection",
+    "q_a_layernorm",
+    "q_b_projection",
+    "native_q4_qb_projection",
     "kv_cache_update",
     "dsa_indexer_topk",
     "native_indexer_scores",
@@ -79,6 +86,14 @@ _NATIVE_Q8_VUP_LOOKUP_DONE = False
 _NATIVE_Q8_VUP_KERNEL = None
 _NATIVE_Q8_VUP_SOURCE = None
 _NATIVE_Q8_VUP_IMPORT_ERROR = None
+_NATIVE_Q4_QA_LOOKUP_DONE = False
+_NATIVE_Q4_QA_KERNEL = None
+_NATIVE_Q4_QA_SOURCE = None
+_NATIVE_Q4_QA_IMPORT_ERROR = None
+_NATIVE_Q4_QB_LOOKUP_DONE = False
+_NATIVE_Q4_QB_KERNEL = None
+_NATIVE_Q4_QB_SOURCE = None
+_NATIVE_Q4_QB_IMPORT_ERROR = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -106,6 +121,14 @@ def _native_indexer_enabled() -> bool:
 
 def _native_q8_vup_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_Q8_VUP_ENV, False)
+
+
+def _native_q4_qa_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_QA_ENV, False)
+
+
+def _native_q4_qb_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_QB_ENV, False)
 
 
 def _prefill_profile_enabled() -> bool:
@@ -192,6 +215,10 @@ def _new_profile():
         "native_indexer_fallback_reasons": Counter(),
         "native_q8_vup_hits": 0,
         "native_q8_vup_fallback_reasons": Counter(),
+        "native_q4_qa_hits": 0,
+        "native_q4_qa_fallback_reasons": Counter(),
+        "native_q4_qb_hits": 0,
+        "native_q4_qb_fallback_reasons": Counter(),
     }
 
 
@@ -224,6 +251,14 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         "native_q8_vup_hits": _GLM_DSA_PREFILL_PROFILE["native_q8_vup_hits"],
         "native_q8_vup_fallback_reasons": dict(
             _GLM_DSA_PREFILL_PROFILE["native_q8_vup_fallback_reasons"]
+        ),
+        "native_q4_qa_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qa_hits"],
+        "native_q4_qa_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_qa_fallback_reasons"]
+        ),
+        "native_q4_qb_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qb_hits"],
+        "native_q4_qb_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_qb_fallback_reasons"]
         ),
     }
     if reset:
@@ -303,6 +338,40 @@ def _record_native_q8_vup_decision(used: bool, reason: str):
             )
         else:
             _LOGGER.info("GLM DSA native q8 V-up fallback: %s", reason)
+
+
+def _record_native_q4_qb_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qb_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qb_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 q_b projection enabled: source=%s",
+                _NATIVE_Q4_QB_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 q_b fallback: %s", reason)
+
+
+def _record_native_q4_qa_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qa_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qa_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 q_a projection enabled: source=%s",
+                _NATIVE_Q4_QA_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 q_a fallback: %s", reason)
 
 
 def _native_sparse_mla_kernel():
@@ -389,6 +458,92 @@ def _native_q8_vup_kernel():
         _NATIVE_Q8_VUP_SOURCE = "mlx.core.fast"
 
     return _NATIVE_Q8_VUP_KERNEL
+
+
+def _native_q4_qb_kernel():
+    global _NATIVE_Q4_QB_LOOKUP_DONE
+    global _NATIVE_Q4_QB_KERNEL
+    global _NATIVE_Q4_QB_SOURCE
+    global _NATIVE_Q4_QB_IMPORT_ERROR
+    if _NATIVE_Q4_QB_LOOKUP_DONE:
+        return _NATIVE_Q4_QB_KERNEL
+
+    _NATIVE_Q4_QB_LOOKUP_DONE = True
+    _NATIVE_Q4_QB_KERNEL = None
+    _NATIVE_Q4_QB_SOURCE = None
+    _NATIVE_Q4_QB_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qb_proj_flat")
+                and hasattr(fast, "glm_dsa_q4_qb_proj_flat")
+            ):
+                _NATIVE_Q4_QB_KERNEL = fast.glm_dsa_q4_qb_proj_flat
+                _NATIVE_Q4_QB_SOURCE = module_name
+                return _NATIVE_Q4_QB_KERNEL
+            if _NATIVE_Q4_QB_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QB_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QB_IMPORT_ERROR is None:
+                _NATIVE_Q4_QB_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_qb_proj_flat"):
+        _NATIVE_Q4_QB_KERNEL = mx.fast.glm_dsa_q4_qb_proj_flat
+        _NATIVE_Q4_QB_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_QB_KERNEL
+
+
+def _native_q4_qa_kernel():
+    global _NATIVE_Q4_QA_LOOKUP_DONE
+    global _NATIVE_Q4_QA_KERNEL
+    global _NATIVE_Q4_QA_SOURCE
+    global _NATIVE_Q4_QA_IMPORT_ERROR
+    if _NATIVE_Q4_QA_LOOKUP_DONE:
+        return _NATIVE_Q4_QA_KERNEL
+
+    _NATIVE_Q4_QA_LOOKUP_DONE = True
+    _NATIVE_Q4_QA_KERNEL = None
+    _NATIVE_Q4_QA_SOURCE = None
+    _NATIVE_Q4_QA_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qa_proj_flat")
+                and hasattr(fast, "glm_dsa_q4_qa_proj_flat")
+            ):
+                _NATIVE_Q4_QA_KERNEL = fast.glm_dsa_q4_qa_proj_flat
+                _NATIVE_Q4_QA_SOURCE = module_name
+                return _NATIVE_Q4_QA_KERNEL
+            if _NATIVE_Q4_QA_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QA_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QA_IMPORT_ERROR is None:
+                _NATIVE_Q4_QA_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_qa_proj_flat"):
+        _NATIVE_Q4_QA_KERNEL = mx.fast.glm_dsa_q4_qa_proj_flat
+        _NATIVE_Q4_QA_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_QA_KERNEL
 
 
 def _native_indexer_fast_module():
@@ -551,6 +706,34 @@ def get_glm_dsa_native_q8_vup_status():
         "import_error": (
             repr(_NATIVE_Q8_VUP_IMPORT_ERROR)
             if _NATIVE_Q8_VUP_IMPORT_ERROR is not None
+            else None
+        ),
+    }
+
+
+def get_glm_dsa_native_q4_qb_status():
+    kernel = _native_q4_qb_kernel()
+    return {
+        "enabled": _native_q4_qb_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q4_QB_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q4_QB_IMPORT_ERROR)
+            if _NATIVE_Q4_QB_IMPORT_ERROR is not None
+            else None
+        ),
+    }
+
+
+def get_glm_dsa_native_q4_qa_status():
+    kernel = _native_q4_qa_kernel()
+    return {
+        "enabled": _native_q4_qa_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q4_QA_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q4_QA_IMPORT_ERROR)
+            if _NATIVE_Q4_QA_IMPORT_ERROR is not None
             else None
         ),
     }
@@ -1151,6 +1334,142 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "weight_group_shape"
         return True, "native_q8_vup"
 
+    def _native_q4_qa_decision(self, x: mx.array):
+        if not _native_q4_qa_enabled():
+            return False, "disabled"
+        if _native_q4_qa_kernel() is None:
+            return False, "missing_symbol"
+        if not hasattr(self.q_a_proj, "bits"):
+            return False, "unquantized_q_a_proj"
+        if self.q_a_proj.bits != 4:
+            return False, f"unsupported_bits:{self.q_a_proj.bits}"
+        if self.q_a_proj.group_size != 64:
+            return False, f"unsupported_group_size:{self.q_a_proj.group_size}"
+        if self.q_a_proj.mode != "affine":
+            return False, f"unsupported_mode:{self.q_a_proj.mode}"
+        weight = self.q_a_proj["weight"]
+        scales = self.q_a_proj["scales"]
+        biases = self.q_a_proj.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 3:
+            return False, "input_rank"
+        if x.shape[-1] != 6144:
+            return False, f"unsupported_input_dim:{x.shape[-1]}"
+        if self.q_lora_rank != 2048:
+            return False, f"unsupported_q_lora_rank:{self.q_lora_rank}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{x.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 2 or len(scales.shape) != 2 or len(biases.shape) != 2:
+            return False, "weight_rank"
+        if weight.shape[0] != self.q_lora_rank:
+            return False, "weight_output_dim"
+        if scales.shape[0] != weight.shape[0] or biases.shape[0] != weight.shape[0]:
+            return False, "scale_output_dim"
+        if weight.shape[1] * 8 != x.shape[-1]:
+            return False, "weight_input_dim"
+        if scales.shape[1] != x.shape[-1] // 64:
+            return False, "scale_group_shape"
+        if biases.shape[1] != x.shape[-1] // 64:
+            return False, "bias_group_shape"
+        return True, "native_q4_qa"
+
+    def _q_a_project(self, x: mx.array):
+        use_native, reason = self._native_q4_qa_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_qa_kernel()
+                output = _profile_stage(
+                    "native_q4_qa_projection",
+                    lambda: kernel(
+                        x,
+                        self.q_a_proj["weight"],
+                        self.q_a_proj["scales"],
+                        self.q_a_proj["biases"],
+                    ),
+                )
+                _record_native_q4_qa_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if hasattr(self.q_a_proj, "bits"):
+            _record_native_q4_qa_decision(False, reason)
+        return self.q_a_proj(x)
+
+    def _native_q4_qb_decision(self, x: mx.array):
+        if not _native_q4_qb_enabled():
+            return False, "disabled"
+        if _native_q4_qb_kernel() is None:
+            return False, "missing_symbol"
+        if not hasattr(self.q_b_proj, "bits"):
+            return False, "unquantized_q_b_proj"
+        if self.q_b_proj.bits != 4:
+            return False, f"unsupported_bits:{self.q_b_proj.bits}"
+        if self.q_b_proj.group_size != 64:
+            return False, f"unsupported_group_size:{self.q_b_proj.group_size}"
+        if self.q_b_proj.mode != "affine":
+            return False, f"unsupported_mode:{self.q_b_proj.mode}"
+        weight = self.q_b_proj["weight"]
+        scales = self.q_b_proj["scales"]
+        biases = self.q_b_proj.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 3:
+            return False, "input_rank"
+        if x.shape[-1] != 2048:
+            return False, f"unsupported_input_dim:{x.shape[-1]}"
+        if self.num_heads != 64:
+            return False, f"unsupported_heads:{self.num_heads}"
+        if self.q_head_dim != 256:
+            return False, f"unsupported_q_head_dim:{self.q_head_dim}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{x.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 2 or len(scales.shape) != 2 or len(biases.shape) != 2:
+            return False, "weight_rank"
+        if weight.shape[0] != self.num_heads * self.q_head_dim:
+            return False, "weight_output_dim"
+        if scales.shape[0] != weight.shape[0] or biases.shape[0] != weight.shape[0]:
+            return False, "scale_output_dim"
+        if weight.shape[1] * 8 != x.shape[-1]:
+            return False, "weight_input_dim"
+        if scales.shape[1] != x.shape[-1] // 64:
+            return False, "scale_group_shape"
+        if biases.shape[1] != x.shape[-1] // 64:
+            return False, "bias_group_shape"
+        return True, "native_q4_qb"
+
+    def _q_b_project(self, x: mx.array):
+        use_native, reason = self._native_q4_qb_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_qb_kernel()
+                output = _profile_stage(
+                    "native_q4_qb_projection",
+                    lambda: kernel(
+                        x,
+                        self.q_b_proj["weight"],
+                        self.q_b_proj["scales"],
+                        self.q_b_proj["biases"],
+                    ),
+                )
+                _record_native_q4_qb_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if hasattr(self.q_b_proj, "bits"):
+            _record_native_q4_qb_decision(False, reason)
+        return self.q_b_proj(x)
+
     def _unembed_out_project(self, x: mx.array):
         use_native, reason = self._native_q8_vup_decision(x)
         if use_native:
@@ -1362,8 +1681,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         total_start = time.perf_counter() if profile_total else None
 
         def project_q():
-            qr = self.q_a_layernorm(self.q_a_proj(x))
-            q = self.q_b_proj(qr)
+            q_a = _profile_stage("q_a_projection", lambda: self._q_a_project(x))
+            qr = _profile_stage("q_a_layernorm", lambda: self.q_a_layernorm(q_a))
+            q = _profile_stage("q_b_projection", lambda: self._q_b_project(qr))
             q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(
                 0, 2, 1, 3
             )
