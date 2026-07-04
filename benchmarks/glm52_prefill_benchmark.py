@@ -554,6 +554,13 @@ def configure_glm_dsa_fast_prefill(args):
     native_q4_qb_tile = getattr(args, "native_q4_qb_tile", "default")
     if native_q4_qb_tile != "default":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV] = native_q4_qb_tile
+    native_q4_qb_head_layout = getattr(
+        args, "native_q4_qb_head_layout", "default"
+    )
+    if native_q4_qb_head_layout == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV] = "1"
+    elif native_q4_qb_head_layout == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV] = "0"
     if args.fast_prefill_query_chunk is not None:
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
@@ -744,6 +751,22 @@ def collect_glm_dsa_profile(args):
             "default",
         ),
         "glm_dsa_native_q4_qb_tile": effective_native_q4_qb_tile(),
+        "glm_dsa_native_q4_qb_head_layout": getattr(
+            args, "native_q4_qb_head_layout", "default"
+        ),
+        "glm_dsa_native_q4_qb_head_layout_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q4_qb_head_layout_available": native_q4_qb_status.get(
+            "head_layout_available", False
+        ),
+        "glm_dsa_native_q4_qb_head_layout_source": native_q4_qb_status.get(
+            "head_layout_source"
+        ),
+        "glm_dsa_native_q4_qb_head_layout_import_error": native_q4_qb_status.get(
+            "head_layout_import_error"
+        ),
         "glm_dsa_native_q4_qb_available": native_q4_qb_status["available"],
         "glm_dsa_native_q4_qb_source": native_q4_qb_status["source"],
         "glm_dsa_native_q4_qb_import_error": native_q4_qb_status["import_error"],
@@ -1878,6 +1901,11 @@ def print_table(rows, output_format):
         "glm_dsa_native_q4_qb_env",
         "glm_dsa_native_q4_qb_tile_env",
         "glm_dsa_native_q4_qb_tile",
+        "glm_dsa_native_q4_qb_head_layout",
+        "glm_dsa_native_q4_qb_head_layout_env",
+        "glm_dsa_native_q4_qb_head_layout_available",
+        "glm_dsa_native_q4_qb_head_layout_source",
+        "glm_dsa_native_q4_qb_head_layout_import_error",
         "glm_dsa_native_q4_qb_available",
         "glm_dsa_native_q4_qb_source",
         "glm_dsa_native_q4_qb_import_error",
@@ -1933,6 +1961,7 @@ def print_table(rows, output_format):
         "glm_dsa_q_a_layernorm_seconds",
         "glm_dsa_q_b_projection_seconds",
         "glm_dsa_native_q4_qb_projection_seconds",
+        "glm_dsa_native_q4_qb_head_layout_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
         "glm_dsa_native_indexer_scores_seconds",
@@ -2706,6 +2735,18 @@ def main():
             "Select the opt-in native q4 q_b projection tile. The default "
             "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE unchanged; unset means "
             "bm64."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qb-head-layout",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native q4 q_b projection variant that writes "
+            "directly to [B,H,L,D] layout for q_projection experiments. This "
+            "requires native q4 q_b to be enabled. The default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT unchanged; unset means "
+            "disabled."
         ),
     )
     parser.add_argument(

@@ -2131,6 +2131,132 @@ template <
 
 template <
     typename T,
+    int group_size,
+    int bits,
+    const bool aligned_N,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32>
+[[kernel]] void affine_qmm_t_head_broadcast_heads(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const constant int& H [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)lid;
+
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  const int K_eff = ceildiv(K, BK) * BK;
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const int h = tid.z % uint(H);
+  const int b = tid.z / uint(H);
+
+  const device T* x_batch = x + size_t(b) * M * K;
+  const device uint8_t* wl =
+      (const device uint8_t*)w + (size_t(h) * N + y_col) * K_w;
+  const device T* scales_h = scales + (size_t(h) * N + y_col) * K_g;
+  const device T* biases_h = biases + (size_t(h) * N + y_col) * K_g;
+  device T* y_head = y + (size_t(b) * H + h) * M * N;
+
+  x_batch += y_row * static_cast<int64_t>(K);
+  y_head += y_row * static_cast<int64_t>(N) + y_col;
+
+  const short num_els = min(BM, M - y_row);
+  const short num_outs = min(BN, N - y_col);
+
+  loader_x_t loader_x(x_batch, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales_h, biases_h, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  if (num_els < BM) {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  } else {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (num_els < BM || num_outs < BN) {
+    mma_op.store_result_safe(y_head, N, short2(num_outs, num_els));
+  } else {
+    mma_op.store_result(y_head, N);
+  }
+}
+
+template <
+    typename T,
     const int group_size,
     const int bits,
     const bool aligned_N,

@@ -353,6 +353,13 @@ The q_b probe has a matching tile selector through
 `bm16`, `bn16`, `bn64`, `bm64`, `bm16bn64`, `bm64bn64`, and `bk64bn64`. The
 standalone `benchmarks/glm52_q4_qb_tile_microbench.py` measured only a small
 tile-level margin, with `bm64` best on the 2048/8192 synthetic sweeps.
+For q_projection layout experiments, `MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT=1`
+/ `--native-q4-qb-head-layout enabled` can be combined with native q4 q_b to
+use an alternate native q_b kernel that writes `[B,H,L,D]` directly and skips the
+Python reshape/transpose after q_b. The standalone q_b microbench shows the
+alternate kernel's arithmetic time is roughly comparable to the flat q_b kernel;
+use full prefill profiles to judge whether the graph-layout change helps end to
+end.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

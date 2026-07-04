@@ -53,6 +53,9 @@ GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
 GLM_DSA_NATIVE_Q4_QA_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE"
 GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
 GLM_DSA_NATIVE_Q4_QB_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE"
+GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT"
+)
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
 
@@ -65,6 +68,7 @@ _PROFILE_STAGES = (
     "q_a_layernorm",
     "q_b_projection",
     "native_q4_qb_projection",
+    "native_q4_qb_head_layout_projection",
     "kv_cache_update",
     "dsa_indexer_topk",
     "native_indexer_scores",
@@ -107,6 +111,10 @@ _NATIVE_Q4_QB_LOOKUP_DONE = False
 _NATIVE_Q4_QB_KERNEL = None
 _NATIVE_Q4_QB_SOURCE = None
 _NATIVE_Q4_QB_IMPORT_ERROR = None
+_NATIVE_Q4_QB_HEADS_LOOKUP_DONE = False
+_NATIVE_Q4_QB_HEADS_KERNEL = None
+_NATIVE_Q4_QB_HEADS_SOURCE = None
+_NATIVE_Q4_QB_HEADS_IMPORT_ERROR = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -150,6 +158,10 @@ def _native_q4_qa_enabled() -> bool:
 
 def _native_q4_qb_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_Q4_QB_ENV, False)
+
+
+def _native_q4_qb_head_layout_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV, False)
 
 
 def _prefill_profile_enabled() -> bool:
@@ -628,6 +640,49 @@ def _native_q4_qb_kernel():
     return _NATIVE_Q4_QB_KERNEL
 
 
+def _native_q4_qb_heads_kernel():
+    global _NATIVE_Q4_QB_HEADS_LOOKUP_DONE
+    global _NATIVE_Q4_QB_HEADS_KERNEL
+    global _NATIVE_Q4_QB_HEADS_SOURCE
+    global _NATIVE_Q4_QB_HEADS_IMPORT_ERROR
+    if _NATIVE_Q4_QB_HEADS_LOOKUP_DONE:
+        return _NATIVE_Q4_QB_HEADS_KERNEL
+
+    _NATIVE_Q4_QB_HEADS_LOOKUP_DONE = True
+    _NATIVE_Q4_QB_HEADS_KERNEL = None
+    _NATIVE_Q4_QB_HEADS_SOURCE = None
+    _NATIVE_Q4_QB_HEADS_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qb_proj_heads")
+                and hasattr(fast, "glm_dsa_q4_qb_proj_heads")
+            ):
+                _NATIVE_Q4_QB_HEADS_KERNEL = fast.glm_dsa_q4_qb_proj_heads
+                _NATIVE_Q4_QB_HEADS_SOURCE = module_name
+                return _NATIVE_Q4_QB_HEADS_KERNEL
+            if _NATIVE_Q4_QB_HEADS_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QB_HEADS_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QB_HEADS_IMPORT_ERROR is None:
+                _NATIVE_Q4_QB_HEADS_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_qb_proj_heads"):
+        _NATIVE_Q4_QB_HEADS_KERNEL = mx.fast.glm_dsa_q4_qb_proj_heads
+        _NATIVE_Q4_QB_HEADS_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_QB_HEADS_KERNEL
+
+
 def _native_q4_qa_kernel():
     global _NATIVE_Q4_QA_LOOKUP_DONE
     global _NATIVE_Q4_QA_KERNEL
@@ -852,6 +907,7 @@ def get_glm_dsa_native_q4_vup_status():
 
 def get_glm_dsa_native_q4_qb_status():
     kernel = _native_q4_qb_kernel()
+    heads_kernel = _native_q4_qb_heads_kernel()
     return {
         "enabled": _native_q4_qb_enabled(),
         "available": kernel is not None,
@@ -859,6 +915,14 @@ def get_glm_dsa_native_q4_qb_status():
         "import_error": (
             repr(_NATIVE_Q4_QB_IMPORT_ERROR)
             if _NATIVE_Q4_QB_IMPORT_ERROR is not None
+            else None
+        ),
+        "head_layout_enabled": _native_q4_qb_head_layout_enabled(),
+        "head_layout_available": heads_kernel is not None,
+        "head_layout_source": _NATIVE_Q4_QB_HEADS_SOURCE,
+        "head_layout_import_error": (
+            repr(_NATIVE_Q4_QB_HEADS_IMPORT_ERROR)
+            if _NATIVE_Q4_QB_HEADS_IMPORT_ERROR is not None
             else None
         ),
     }
@@ -1756,6 +1820,43 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             _record_native_q4_qb_decision(False, reason)
         return self.q_b_proj(x)
 
+    def _native_q4_qb_head_layout_decision(self, x: mx.array):
+        if not _native_q4_qb_head_layout_enabled():
+            return False, "head_layout_disabled"
+        use_native, reason = self._native_q4_qb_decision(x)
+        if not use_native:
+            return False, reason
+        if _native_q4_qb_heads_kernel() is None:
+            return False, "missing_head_layout_symbol"
+        return True, "native_q4_qb_head_layout"
+
+    def _q_b_project_heads(self, x: mx.array):
+        use_native, reason = self._native_q4_qb_head_layout_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_qb_heads_kernel()
+                output = _profile_stage(
+                    "native_q4_qb_head_layout_projection",
+                    lambda: kernel(
+                        x,
+                        self.q_b_proj["weight"],
+                        self.q_b_proj["scales"],
+                        self.q_b_proj["biases"],
+                    ),
+                    inputs=x,
+                )
+                _record_native_q4_qb_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if (
+            _native_q4_qb_head_layout_enabled()
+            and hasattr(self.q_b_proj, "bits")
+        ):
+            _record_native_q4_qb_decision(False, reason)
+        return None
+
     def _unembed_out_project(self, x: mx.array):
         use_native, reason = self._native_q4_vup_decision(x)
         if use_native:
@@ -2019,13 +2120,19 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 lambda: self.q_a_layernorm(q_a),
                 inputs=q_a,
             )
+            def project_q_b():
+                q_heads = self._q_b_project_heads(qr)
+                if q_heads is not None:
+                    return q_heads
+                q_flat = self._q_b_project(qr)
+                return q_flat.reshape(
+                    B, L, self.num_heads, self.q_head_dim
+                ).transpose(0, 2, 1, 3)
+
             q = _profile_stage(
                 "q_b_projection",
-                lambda: self._q_b_project(qr),
+                project_q_b,
                 inputs=qr,
-            )
-            q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(
-                0, 2, 1, 3
             )
             q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
             return qr, q_nope, q_pe

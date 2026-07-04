@@ -36,6 +36,13 @@ mx::array glm_dsa_q4_qb_proj_flat(
     const mx::array& biases,
     mx::StreamOrDevice s = {});
 
+mx::array glm_dsa_q4_qb_proj_heads(
+    const mx::array& x,
+    const mx::array& weight,
+    const mx::array& scales,
+    const mx::array& biases,
+    mx::StreamOrDevice s = {});
+
 mx::array glm_moe_weighted_sum(
     const mx::array& x_sorted,
     const mx::array& inv_order,

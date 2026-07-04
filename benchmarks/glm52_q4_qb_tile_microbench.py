@@ -19,7 +19,10 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from mlx_lm.custom_kernels.glm_moe_dsa.fast import glm_dsa_q4_qb_proj_flat
+from mlx_lm.custom_kernels.glm_moe_dsa.fast import (
+    glm_dsa_q4_qb_proj_flat,
+    glm_dsa_q4_qb_proj_heads,
+)
 
 
 DEFAULT_TILES = (
@@ -61,6 +64,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Also benchmark mx.quantized_matmul as the baseline.",
+    )
+    parser.add_argument(
+        "--include-head-layout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also benchmark the native q_b kernel that outputs [B,H,L,D].",
     )
     parser.add_argument("--json-output", type=Path)
     return parser.parse_args()
@@ -157,6 +166,13 @@ def main() -> None:
     )
     reference = smoke_x @ dense_weight.T
     synchronize(reference)
+    reference_heads = reference.reshape(
+        reference.shape[0],
+        reference.shape[1],
+        HEADS,
+        HEAD_DIM,
+    ).transpose(0, 2, 1, 3)
+    synchronize(reference_heads)
 
     rows: list[dict[str, Any]] = []
     if args.include_mlx:
@@ -211,6 +227,24 @@ def main() -> None:
                 **diff_stats(smoke, reference),
             }
         )
+        if args.include_head_layout:
+            smoke_heads = glm_dsa_q4_qb_proj_heads(
+                smoke_x, weight, scales, biases
+            )
+            synchronize(smoke_heads)
+            head_times = seconds_for(
+                lambda: glm_dsa_q4_qb_proj_heads(x, weight, scales, biases),
+                warmup_runs=args.warmup_runs,
+                runs=args.runs,
+            )
+            rows.append(
+                {
+                    "name": "native_q4_qb_heads",
+                    "tile": tile,
+                    **summarize_times(head_times),
+                    **diff_stats(smoke_heads, reference_heads),
+                }
+            )
 
     metadata = {
         "q_len": args.q_len,
@@ -224,6 +258,7 @@ def main() -> None:
         "runs": args.runs,
         "warmup_runs": args.warmup_runs,
         "smoke_len": min(args.smoke_len, args.q_len),
+        "include_head_layout": args.include_head_layout,
         "seed": args.seed,
     }
     result = {"metadata": metadata, "results": rows}

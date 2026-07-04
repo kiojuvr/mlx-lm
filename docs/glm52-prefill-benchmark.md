@@ -329,6 +329,16 @@ On the tested synthetic 8192 run, `bm64` measured about 0.02203s best /
 template. The margin is small, but `bm64` is the better long-query default for
 the opt-in native q4 q_b route.
 
+For q_projection structure experiments, `MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT=1`
+or `--native-q4-qb-head-layout enabled` can be combined with native q4 q_b to
+route q_b through an alternate native kernel that writes `[B,H,L,D]` directly.
+This skips the Python `reshape(...).transpose(0, 2, 1, 3)` after q_b and lets
+full prefill profiles measure whether head-major q_b output helps downstream
+q_nope/q_pe use. In the standalone q_b microbench, the direct-head kernel was
+about equal to the flat kernel at 2048 and 8192 synthetic lengths, so this knob
+should be evaluated as a graph-layout PoC rather than a raw q_b arithmetic
+speedup.
+
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
 matrices on first use and reuse them for later prefill calls in the same model
@@ -358,6 +368,11 @@ Benchmark rows report:
 - `glm_dsa_native_q4_qb_source`
 - `glm_dsa_native_q4_qb_tile_env`
 - `glm_dsa_native_q4_qb_tile`
+- `glm_dsa_native_q4_qb_head_layout`
+- `glm_dsa_native_q4_qb_head_layout_env`
+- `glm_dsa_native_q4_qb_head_layout_available`
+- `glm_dsa_native_q4_qb_head_layout_source`
+- `glm_dsa_native_q4_qb_head_layout_import_error`
 - `glm_dsa_native_q4_qb_hits`
 - `glm_dsa_native_q4_qb_fallback_reasons`
 
@@ -454,6 +469,7 @@ Benchmark rows report:
 - `glm_dsa_q_a_layernorm_seconds`
 - `glm_dsa_q_b_projection_seconds`
 - `glm_dsa_native_q4_qb_projection_seconds`
+- `glm_dsa_native_q4_qb_head_layout_projection_seconds`
 - `glm_dsa_kv_cache_update_seconds`
 - `glm_dsa_dsa_indexer_topk_seconds`
 - `glm_dsa_native_indexer_scores_seconds`

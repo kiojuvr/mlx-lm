@@ -92,6 +92,14 @@ NB_MODULE(_ext, m) {
       "biases"_a,
       "stream"_a = nb::none());
   m.def(
+      "glm_dsa_q4_qb_proj_heads",
+      &omlx::glm_kernels::glm_dsa_q4_qb_proj_heads,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "biases"_a,
+      "stream"_a = nb::none());
+  m.def(
       "glm_moe_weighted_sum",
       &omlx::glm_kernels::glm_moe_weighted_sum,
       "x_sorted"_a,
