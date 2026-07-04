@@ -364,7 +364,14 @@ kernel-structure improvement over `scaled`, but the materialized baseline is
 still ahead, so this remains a probe rather than a recommended setting. Use
 `--native-q4-qb-from-q-a-kernel-sweep disabled,scaled,wscaled,auto` to compare
 the alternatives in one model load; `disabled` is the materialized-`qr`
-baseline.
+baseline. An 8K forward/reverse sweep confirmed that `wscaled` remains better
+than `scaled` inside q_projection: mean q_projection was about 2.91s for
+`wscaled`, 2.98s for `scaled`, and 2.83s for the materialized baseline. The
+q_b-from-q_a projection sub-stage improved from about 1.53s to 1.45s with
+`wscaled`. Total prefill moved by roughly 2.7s depending on candidate order, so
+read total/TTFT from this sweep as warm-state sensitive and use the q_projection
+columns for attribution. Native sparse MLA attention was about 16.85s at 8K,
+which makes attention-side work the next larger target.
 
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16

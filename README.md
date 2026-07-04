@@ -385,7 +385,14 @@ but the materialized baseline is still ahead, so this remains a probe rather
 than a recommended setting. For practical comparisons, the benchmark can sweep
 the alternatives in one model load with
 `--native-q4-qb-from-q-a-kernel-sweep disabled,scaled,wscaled,auto`; `disabled`
-is the materialized-`qr` baseline.
+is the materialized-`qr` baseline. An 8K forward/reverse sweep confirmed that
+`wscaled` remains better than `scaled` inside q_projection, with mean
+q_projection about 2.91s versus 2.98s and q_b-from-q_a projection about 1.45s
+versus 1.53s. The materialized baseline still had lower q_projection at about
+2.83s, and total prefill moved by roughly 2.7s depending on candidate order, so
+use the sweep mainly for q_projection attribution. At 8K, native sparse MLA
+attention was around 16.85s, making attention-side work the next larger
+available target.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It
