@@ -475,6 +475,16 @@ def effective_native_q4_qb_tile() -> str:
     return tile
 
 
+def effective_native_q4_qb_scaled_tile() -> str:
+    value = os.environ.get(
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SCALED_TILE_ENV, "default"
+    )
+    tile = value.strip().lower()
+    if tile in ("", "default"):
+        return "bn64"
+    return tile
+
+
 def effective_sparse_mla_tile() -> str:
     value = os.environ.get(glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV, "default")
     tile = value.strip().lower()
@@ -559,6 +569,13 @@ def configure_glm_dsa_fast_prefill(args):
     native_q4_qb_tile = getattr(args, "native_q4_qb_tile", "default")
     if native_q4_qb_tile != "default":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV] = native_q4_qb_tile
+    native_q4_qb_scaled_tile = getattr(
+        args, "native_q4_qb_scaled_tile", "default"
+    )
+    if native_q4_qb_scaled_tile != "default":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SCALED_TILE_ENV
+        ] = native_q4_qb_scaled_tile
     native_q4_qb_head_layout = getattr(
         args, "native_q4_qb_head_layout", "default"
     )
@@ -786,6 +803,11 @@ def collect_glm_dsa_profile(args):
             "default",
         ),
         "glm_dsa_native_q4_qb_tile": effective_native_q4_qb_tile(),
+        "glm_dsa_native_q4_qb_scaled_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SCALED_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_native_q4_qb_scaled_tile": effective_native_q4_qb_scaled_tile(),
         "glm_dsa_native_q4_qb_head_layout": getattr(
             args, "native_q4_qb_head_layout", "default"
         ),
@@ -1968,6 +1990,8 @@ def print_table(rows, output_format):
         "glm_dsa_native_q4_qb_env",
         "glm_dsa_native_q4_qb_tile_env",
         "glm_dsa_native_q4_qb_tile",
+        "glm_dsa_native_q4_qb_scaled_tile_env",
+        "glm_dsa_native_q4_qb_scaled_tile",
         "glm_dsa_native_q4_qb_head_layout",
         "glm_dsa_native_q4_qb_head_layout_env",
         "glm_dsa_native_q4_qb_head_layout_available",
@@ -2813,6 +2837,27 @@ def main():
             "Select the opt-in native q4 q_b projection tile. The default "
             "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE unchanged; unset means "
             "bm64."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qb-scaled-tile",
+        choices=(
+            "default",
+            "bk32",
+            "bk64",
+            "bm16",
+            "bn16",
+            "bn64",
+            "bm64",
+            "bm16bn64",
+            "bm64bn64",
+            "bk64bn64",
+        ),
+        default="default",
+        help=(
+            "Select the q_b-from-q_a scaled native q4 q_b tile. The default "
+            "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB_SCALED_TILE unchanged; unset "
+            "means bn64."
         ),
     )
     parser.add_argument(

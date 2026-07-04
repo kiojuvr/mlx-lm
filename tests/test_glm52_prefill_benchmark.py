@@ -87,6 +87,23 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(benchmark.format_output_cell({"decode": 156}), '{"decode":156}')
         self.assertEqual(benchmark.format_output_cell(None), "")
 
+    def test_effective_native_q4_qb_scaled_tile_defaults_to_bn64(self):
+        env_key = benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SCALED_TILE_ENV
+        old_env = os.environ.get(env_key)
+        try:
+            os.environ.pop(env_key, None)
+            self.assertEqual(benchmark.effective_native_q4_qb_scaled_tile(), "bn64")
+            os.environ[env_key] = "bm64bn64"
+            self.assertEqual(
+                benchmark.effective_native_q4_qb_scaled_tile(),
+                "bm64bn64",
+            )
+        finally:
+            if old_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_env
+
     def test_main_rejects_empty_model_argument(self):
         old_argv = sys.argv
         sys.argv = [

@@ -20,8 +20,10 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_lm.custom_kernels.glm_moe_dsa.fast import (
+    glm_dsa_q_a_rms_scale,
     glm_dsa_q4_qb_proj_flat,
     glm_dsa_q4_qb_proj_heads,
+    glm_dsa_q4_qb_proj_scaled_heads,
 )
 
 
@@ -53,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--smoke-len", type=int, default=17)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument(
         "--tiles",
         nargs="+",
@@ -70,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Also benchmark the native q_b kernel that outputs [B,H,L,D].",
+    )
+    parser.add_argument(
+        "--include-scaled-heads",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Also benchmark the q_b-from-q_a scaled head-layout kernel and "
+            "its q_a RMS scale input."
+        ),
     )
     parser.add_argument("--json-output", type=Path)
     return parser.parse_args()
@@ -153,9 +165,15 @@ def main() -> None:
             size=(OUTPUT_DIM, INPUT_DIM // GROUP_SIZE),
         ).astype(np.float16)
     )
-    mx.eval(x, weight, scales, biases)
+    norm_weight = mx.array(
+        rng.normal(1.0, 0.02, size=(INPUT_DIM,)).astype(np.float16)
+    )
+    mx.eval(x, weight, scales, biases, norm_weight)
 
     smoke_x = x[:, : min(args.smoke_len, args.q_len), :]
+    smoke_row_scales = glm_dsa_q_a_rms_scale(smoke_x, args.eps)
+    row_scales = glm_dsa_q_a_rms_scale(x, args.eps)
+    synchronize(row_scales)
     dense_weight = mx.dequantize(
         weight,
         scales=scales,
@@ -173,8 +191,34 @@ def main() -> None:
         HEAD_DIM,
     ).transpose(0, 2, 1, 3)
     synchronize(reference_heads)
+    scaled_smoke_x = smoke_x * norm_weight * smoke_row_scales[..., None]
+    reference_scaled = scaled_smoke_x @ dense_weight.T
+    synchronize(reference_scaled)
+    reference_scaled_heads = reference_scaled.reshape(
+        reference_scaled.shape[0],
+        reference_scaled.shape[1],
+        HEADS,
+        HEAD_DIM,
+    ).transpose(0, 2, 1, 3)
+    synchronize(reference_scaled_heads)
 
     rows: list[dict[str, Any]] = []
+    if args.include_scaled_heads:
+        times = seconds_for(
+            lambda: glm_dsa_q_a_rms_scale(x, args.eps),
+            warmup_runs=args.warmup_runs,
+            runs=args.runs,
+        )
+        rows.append(
+            {
+                "name": "native_q_a_rms_scale",
+                "tile": "",
+                **summarize_times(times),
+                "max_abs_diff": 0.0,
+                "mean_abs_diff": 0.0,
+            }
+        )
+
     if args.include_mlx:
         mlx_smoke = mx.quantized_matmul(
             smoke_x,
@@ -212,6 +256,7 @@ def main() -> None:
 
     for tile in args.tiles:
         os.environ["MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE"] = tile
+        os.environ["MLX_LM_GLM_DSA_NATIVE_Q4_QB_SCALED_TILE"] = tile
         smoke = glm_dsa_q4_qb_proj_flat(smoke_x, weight, scales, biases)
         synchronize(smoke)
         times = seconds_for(
@@ -245,6 +290,36 @@ def main() -> None:
                     **diff_stats(smoke_heads, reference_heads),
                 }
             )
+        if args.include_scaled_heads:
+            smoke_scaled_heads = glm_dsa_q4_qb_proj_scaled_heads(
+                smoke_x,
+                norm_weight,
+                smoke_row_scales,
+                weight,
+                scales,
+                biases,
+            )
+            synchronize(smoke_scaled_heads)
+            scaled_head_times = seconds_for(
+                lambda: glm_dsa_q4_qb_proj_scaled_heads(
+                    x,
+                    norm_weight,
+                    row_scales,
+                    weight,
+                    scales,
+                    biases,
+                ),
+                warmup_runs=args.warmup_runs,
+                runs=args.runs,
+            )
+            rows.append(
+                {
+                    "name": "native_q4_qb_scaled_heads",
+                    "tile": tile,
+                    **summarize_times(scaled_head_times),
+                    **diff_stats(smoke_scaled_heads, reference_scaled_heads),
+                }
+            )
 
     metadata = {
         "q_len": args.q_len,
@@ -259,6 +334,8 @@ def main() -> None:
         "warmup_runs": args.warmup_runs,
         "smoke_len": min(args.smoke_len, args.q_len),
         "include_head_layout": args.include_head_layout,
+        "include_scaled_heads": args.include_scaled_heads,
+        "eps": args.eps,
         "seed": args.seed,
     }
     result = {"metadata": metadata, "results": rows}

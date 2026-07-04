@@ -132,6 +132,46 @@ Q4QbTileConfig q4_qb_tile_config() {
   throw std::invalid_argument(msg.str());
 }
 
+Q4QbTileConfig q4_qb_scaled_tile_config() {
+  const char* value =
+      std::getenv("MLX_LM_GLM_DSA_NATIVE_Q4_QB_SCALED_TILE");
+  const std::string tile =
+      (value == nullptr || value[0] == '\0') ? "bn64" : value;
+  if (tile == "default" || tile == "bn64" || tile == "b32k32n64") {
+    return {32, 32, 64};
+  }
+  if (tile == "bm64" || tile == "b64k32n32") {
+    return {64, 32, 32};
+  }
+  if (tile == "bk32" || tile == "b32k32n32") {
+    return {32, 32, 32};
+  }
+  if (tile == "bk64" || tile == "b32k64n32") {
+    return {32, 64, 32};
+  }
+  if (tile == "bm16" || tile == "b16k32n32") {
+    return {16, 32, 32};
+  }
+  if (tile == "bn16" || tile == "b32k32n16") {
+    return {32, 32, 16};
+  }
+  if (tile == "bm16bn64" || tile == "b16k32n64") {
+    return {16, 32, 64};
+  }
+  if (tile == "bm64bn64" || tile == "b64k32n64") {
+    return {64, 32, 64};
+  }
+  if (tile == "bk64bn64" || tile == "b32k64n64") {
+    return {32, 64, 64};
+  }
+
+  std::ostringstream msg;
+  msg << "Unsupported MLX_LM_GLM_DSA_NATIVE_Q4_QB_SCALED_TILE value: " << tile
+      << ". Expected default, bn64, bm64, bk32, bk64, bm16, bn16, "
+      << "bm16bn64, bm64bn64, or bk64bn64.";
+  throw std::invalid_argument(msg.str());
+}
+
 class GlmDsaQ8VupFlatPrimitive : public Primitive {
  public:
   explicit GlmDsaQ8VupFlatPrimitive(Stream stream) : Primitive(stream) {}
@@ -1525,7 +1565,7 @@ array glm_dsa_q4_qb_proj_scaled_heads(
       std::move(out_shape),
       x.dtype(),
       std::make_shared<GlmDsaQ4QbProjScaledHeadsPrimitive>(
-          stream, q4_qb_tile_config()),
+          stream, q4_qb_scaled_tile_config()),
       std::move(inputs));
 }
 

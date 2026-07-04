@@ -352,7 +352,11 @@ The q_b probe has a matching tile selector through
 `bm64` for the opt-in native q4 q_b path. Available tiles are `bk32`, `bk64`,
 `bm16`, `bn16`, `bn64`, `bm64`, `bm16bn64`, `bm64bn64`, and `bk64bn64`. The
 standalone `benchmarks/glm52_q4_qb_tile_microbench.py` measured only a small
-tile-level margin, with `bm64` best on the 2048/8192 synthetic sweeps.
+tile-level margin, with `bm64` best on the 2048/8192 synthetic sweeps. The
+q_b-from-q_a scaled kernel has a separate selector,
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_SCALED_TILE` or
+`--native-q4-qb-scaled-tile`; unset/default uses `bn64`, which was best for the
+scaled-heads path on the tested 2048/8192 synthetic sweeps.
 For q_projection layout experiments, `MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT=1`
 / `--native-q4-qb-head-layout enabled` can be combined with native q4 q_b to
 use an alternate native q_b kernel that writes `[B,H,L,D]` directly and skips the
@@ -367,9 +371,13 @@ RMS scale and feeding q_a plus that scale directly into a scaled native q4 q_b
 kernel. Initial 2K profiling confirmed the route works and reduces standalone
 q_a layernorm work to the full-indexer layers. A loader-aware scaled-q_b update
 removes the earlier extra threadgroup barrier and improved the 2K shared-layer
-route from about 1.24s to about 1.09s q_projection, but the same-build baseline
-that materializes `qr` still measured about 0.97s q_projection and lower TTFT.
-Treat this as a kernel-structure probe, not a recommended setting.
+route from about 1.24s to about 1.09s q_projection; the separate `bn64`
+scaled-heads tile then brought the measured route to about 1.03s q_projection.
+The same-build baseline that materializes `qr` still measured about 0.97s
+q_projection and lower TTFT.
+The scaled-heads tile is now tunable separately from regular q_b so this route
+can use `bn64` without moving the regular q_b default away from `bm64`. Treat
+this as a kernel-structure probe, not a recommended setting.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

@@ -314,7 +314,7 @@ The native q4 q_b probe has the same style of selector:
 `MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE` or `--native-q4-qb-tile`. Unset/default maps
 to `bm64`; available tiles are `bk32`, `bk64`, `bm16`, `bn16`, `bn64`, `bm64`,
 `bm16bn64`, `bm64bn64`, and `bk64bn64`. Use the standalone q_b tile microbench
-for low-memory sweeps:
+for low-memory sweeps, including the q_b-from-q_a scaled-heads path:
 
 ```sh
 python benchmarks/glm52_q4_qb_tile_microbench.py \
@@ -327,7 +327,11 @@ python benchmarks/glm52_q4_qb_tile_microbench.py \
 On the tested synthetic 8192 run, `bm64` measured about 0.02203s best /
 0.02236s mean versus about 0.02245s / 0.02285s for the previous `bk32`
 template. The margin is small, but `bm64` is the better long-query default for
-the opt-in native q4 q_b route.
+the opt-in native q4 q_b route. The scaled-heads path now has an independent
+selector, `MLX_LM_GLM_DSA_NATIVE_Q4_QB_SCALED_TILE` or
+`--native-q4-qb-scaled-tile`, with unset/default mapped to `bn64`; on the same
+synthetic 8192 sweep, `bn64` measured about 0.02410s best / 0.02440s mean for
+scaled heads versus about 0.02589s / 0.02686s for `bm64`.
 
 For q_projection structure experiments, `MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT=1`
 or `--native-q4-qb-head-layout enabled` can be combined with native q4 q_b to
@@ -348,9 +352,11 @@ the route hits shared layers and reduces q_a layernorm work to the full-indexer
 layers. A loader-aware scaled-q_b update now applies q_a RMS scaling to the
 loaded tile values without the earlier extra threadgroup barrier. On the 2K
 same-build check, the shared-layer route improved from about 1.24s to about
-1.09s q_projection, but the materialized-`qr` baseline still measured about
-0.97s q_projection and lower TTFT, so this remains a kernel-structure probe
-rather than a recommended setting.
+1.09s q_projection; the separate `bn64` scaled-heads tile then measured about
+1.03s q_projection. The materialized-`qr` baseline still measured about 0.97s
+q_projection and lower TTFT. The scaled-heads tile can now default to `bn64`
+independently from regular q_b's `bm64`, so this remains a kernel-structure
+probe rather than a recommended setting.
 
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
