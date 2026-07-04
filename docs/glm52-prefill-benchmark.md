@@ -361,7 +361,10 @@ In the latest same-build 2K check, the materialized-`qr` baseline measured about
 0.975s q_projection and 13.49s total prefill, `scaled` measured about 1.006s and
 13.69s, and `wscaled` measured about 0.991s and 13.58s. `wscaled` is a modest
 kernel-structure improvement over `scaled`, but the materialized baseline is
-still ahead, so this remains a probe rather than a recommended setting.
+still ahead, so this remains a probe rather than a recommended setting. Use
+`--native-q4-qb-from-q-a-kernel-sweep disabled,scaled,wscaled,auto` to compare
+the alternatives in one model load; `disabled` is the materialized-`qr`
+baseline.
 
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
@@ -425,6 +428,8 @@ Benchmark rows report:
 - `glm_dsa_native_q4_qb_fallback_reasons`
 - `glm_dsa_native_q4_qb_from_q_a_hits`
 - `glm_dsa_native_q4_qb_from_q_a_fallback_reasons`
+- `from_q_a_kernel_sweep_name`
+- `from_q_a_kernel_sweep_candidate_index`
 
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:

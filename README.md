@@ -382,7 +382,10 @@ check, the materialized-`qr` baseline measured about 0.975s q_projection and
 13.49s total prefill, `scaled` measured about 1.006s and 13.69s, and `wscaled`
 measured about 0.991s and 13.58s. `wscaled` is a useful kernel-structure step,
 but the materialized baseline is still ahead, so this remains a probe rather
-than a recommended setting.
+than a recommended setting. For practical comparisons, the benchmark can sweep
+the alternatives in one model load with
+`--native-q4-qb-from-q-a-kernel-sweep disabled,scaled,wscaled,auto`; `disabled`
+is the materialized-`qr` baseline.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

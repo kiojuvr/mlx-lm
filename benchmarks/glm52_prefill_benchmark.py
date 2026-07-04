@@ -68,6 +68,22 @@ def parse_lengths(value):
     return [int(v.strip()) for v in value.split(",") if v.strip()]
 
 
+def parse_from_q_a_kernel_sweep(value):
+    allowed = {"disabled", "scaled", "wscaled", "auto"}
+    candidates = [v.strip().lower() for v in value.split(",") if v.strip()]
+    if not candidates:
+        raise argparse.ArgumentTypeError(
+            "from_q_a kernel sweep must include at least one candidate"
+        )
+    invalid = [candidate for candidate in candidates if candidate not in allowed]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            "unsupported from_q_a kernel sweep candidate(s): "
+            f"{','.join(invalid)}; expected disabled, scaled, wscaled, or auto"
+        )
+    return candidates
+
+
 def parse_policy_candidates(value):
     candidates = []
     for raw in value.split(","):
@@ -1871,6 +1887,8 @@ def print_table(rows, output_format):
         "prefill_sweep_candidate_index",
         "prefill_sweep_use_checkpoints",
         "prefill_sweep_fast_prefill_min_context",
+        "from_q_a_kernel_sweep_name",
+        "from_q_a_kernel_sweep_candidate_index",
         "batch_size",
         "prefill_batch_size",
         "completion_batch_size",
@@ -2511,6 +2529,83 @@ def run_prefill_sweep(model, tokenizer, args):
         args.checkpoint_save_exact = old_checkpoint_save_exact
 
 
+def run_with_from_q_a_kernel_sweep(
+    runner,
+    model,
+    tokenizer,
+    text,
+    args,
+    case_name,
+):
+    candidates = getattr(args, "native_q4_qb_from_q_a_kernel_sweep", None)
+    if not candidates:
+        return [runner(model, tokenizer, text, args, case_name)]
+
+    rows = []
+    old_from_q_a_arg = args.native_q4_qb_from_q_a
+    old_kernel_arg = args.native_q4_qb_from_q_a_kernel
+    old_from_q_a_env = os.environ.get(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV)
+    old_kernel_env = os.environ.get(
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV
+    )
+    try:
+        for candidate_index, candidate in enumerate(candidates):
+            if candidate == "disabled":
+                args.native_q4_qb_from_q_a = "disabled"
+                args.native_q4_qb_from_q_a_kernel = "default"
+                os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV] = "0"
+                if old_kernel_env is None:
+                    os.environ.pop(
+                        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
+                        None,
+                    )
+                else:
+                    os.environ[
+                        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV
+                    ] = old_kernel_env
+            else:
+                args.native_q4_qb_from_q_a = "enabled"
+                args.native_q4_qb_from_q_a_kernel = candidate
+                os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV] = "1"
+                os.environ[
+                    glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV
+                ] = candidate
+
+            row = runner(
+                model,
+                tokenizer,
+                text,
+                args,
+                f"{case_name}-fromqa-{candidate}",
+            )
+            row.update(
+                {
+                    "from_q_a_kernel_sweep_name": candidate,
+                    "from_q_a_kernel_sweep_candidate_index": candidate_index,
+                }
+            )
+            rows.append(row)
+        return rows
+    finally:
+        args.native_q4_qb_from_q_a = old_from_q_a_arg
+        args.native_q4_qb_from_q_a_kernel = old_kernel_arg
+        if old_from_q_a_env is None:
+            os.environ.pop(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV, None)
+        else:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV] = (
+                old_from_q_a_env
+            )
+        if old_kernel_env is None:
+            os.environ.pop(
+                glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
+                None,
+            )
+        else:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV] = (
+                old_kernel_env
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2921,6 +3016,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--native-q4-qb-from-q-a-kernel-sweep",
+        type=parse_from_q_a_kernel_sweep,
+        help=(
+            "Comma-separated single-mode sweep over q_b-from-q_a kernels. "
+            "Candidates are disabled, scaled, wscaled, and auto. The disabled "
+            "candidate measures the materialized-qr baseline."
+        ),
+    )
+    parser.add_argument(
         "--q-a-dense-cache",
         choices=("default", "enabled", "disabled"),
         default="default",
@@ -3057,6 +3161,8 @@ def main():
         and args.prefill_stop_after_tokens <= 0
     ):
         parser.error("--prefill-stop-after-tokens must be positive when set.")
+    if args.native_q4_qb_from_q_a_kernel_sweep and args.mode != "single":
+        parser.error("--native-q4-qb-from-q-a-kernel-sweep requires --mode single")
     if args.mode == "native-smoke":
         if args.native_smoke_q_len <= 1:
             parser.error("--native-smoke-q-len must be greater than 1.")
@@ -3117,8 +3223,15 @@ def main():
                 text = args.prompt_file.read_text()
                 args.target_tokens = None
                 for run in range(args.repeat_runs):
-                    rows.append(
-                        runner(model, tokenizer, text, args, f"file-run-{run + 1}")
+                    rows.extend(
+                        run_with_from_q_a_kernel_sweep(
+                            runner,
+                            model,
+                            tokenizer,
+                            text,
+                            args,
+                            f"file-run-{run + 1}",
+                        )
                     )
             elif args.mode == "queued":
                 for run in range(args.repeat_runs):
@@ -3130,8 +3243,9 @@ def main():
                     args.target_tokens = length
                     text = build_prompt_text(tokenizer, length)
                     for run in range(args.repeat_runs):
-                        rows.append(
-                            runner(
+                        rows.extend(
+                            run_with_from_q_a_kernel_sweep(
+                                runner,
                                 model,
                                 tokenizer,
                                 text,
@@ -3156,8 +3270,9 @@ def main():
                             text += CODING_SNIPPET.format(i=snippet_id)
                             snippet_id = f"{snippet_id}-next"
                         for run in range(args.repeat_runs):
-                            rows.append(
-                                runner(
+                            rows.extend(
+                                run_with_from_q_a_kernel_sweep(
+                                    runner,
                                     model,
                                     tokenizer,
                                     text,

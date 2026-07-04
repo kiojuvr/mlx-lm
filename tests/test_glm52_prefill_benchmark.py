@@ -420,6 +420,72 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(restored_env, "999")
         self.assertEqual(rows[0]["prefill_sweep_fast_prefill_min_context"], 98_304)
 
+    def test_from_q_a_kernel_sweep_switches_env_and_restores(self):
+        from_q_a_env = benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV
+        kernel_env = benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV
+        saved_from_q_a_env = os.environ.get(from_q_a_env)
+        saved_kernel_env = os.environ.get(kernel_env)
+        args = Namespace(
+            native_q4_qb_from_q_a="default",
+            native_q4_qb_from_q_a_kernel="default",
+            native_q4_qb_from_q_a_kernel_sweep=["disabled", "scaled", "wscaled"],
+        )
+        calls = []
+
+        def fake_runner(_model, _tokenizer, _text, call_args, case_name):
+            calls.append(
+                {
+                    "case": case_name,
+                    "arg": call_args.native_q4_qb_from_q_a,
+                    "kernel_arg": call_args.native_q4_qb_from_q_a_kernel,
+                    "env": os.environ.get(from_q_a_env),
+                    "kernel_env": os.environ.get(kernel_env),
+                }
+            )
+            return {"case": case_name}
+
+        try:
+            os.environ[from_q_a_env] = "old-enabled"
+            os.environ[kernel_env] = "old-kernel"
+            rows = benchmark.run_with_from_q_a_kernel_sweep(
+                fake_runner,
+                None,
+                None,
+                "prompt",
+                args,
+                "case",
+            )
+            restored_from_q_a_env = os.environ.get(from_q_a_env)
+            restored_kernel_env = os.environ.get(kernel_env)
+        finally:
+            if saved_from_q_a_env is None:
+                os.environ.pop(from_q_a_env, None)
+            else:
+                os.environ[from_q_a_env] = saved_from_q_a_env
+            if saved_kernel_env is None:
+                os.environ.pop(kernel_env, None)
+            else:
+                os.environ[kernel_env] = saved_kernel_env
+
+        self.assertEqual([row["from_q_a_kernel_sweep_name"] for row in rows], [
+            "disabled",
+            "scaled",
+            "wscaled",
+        ])
+        self.assertEqual([call["case"] for call in calls], [
+            "case-fromqa-disabled",
+            "case-fromqa-scaled",
+            "case-fromqa-wscaled",
+        ])
+        self.assertEqual(calls[0]["env"], "0")
+        self.assertEqual(calls[0]["kernel_env"], "old-kernel")
+        self.assertEqual(calls[1]["env"], "1")
+        self.assertEqual(calls[1]["kernel_env"], "scaled")
+        self.assertEqual(calls[2]["env"], "1")
+        self.assertEqual(calls[2]["kernel_env"], "wscaled")
+        self.assertEqual(restored_from_q_a_env, "old-enabled")
+        self.assertEqual(restored_kernel_env, "old-kernel")
+
     def test_prefill_sweep_writes_partial_json_output(self):
         old_build_prompt_text = benchmark.build_prompt_text
         old_run_once = benchmark.run_once
