@@ -457,20 +457,6 @@ before pruning starts.
 
 See `docs/glm52-prefill-benchmark.md` for the GLM-5.2 prefill benchmark command, measured fields, and current batching notes. The benchmark script lives at `benchmarks/glm52_prefill_benchmark.py`. Use `--mode single` with `--max-tokens 1` for TTFT / checkpoint measurements, and `--mode queued --max-tokens 8` or similar to expose admission wait time under serving load.
 
-### Smoke test result
-
-A short smoke test with `avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw` on Mac Studio M3 Ultra 512GB completed successfully with:
-
-    --kv-bits 8 --kv-group-size 64 --quantized-kv-start 4096
-
-Observed short-prompt result:
-
-    Prompt: 19 tokens, ~6.9 tokens/sec
-    Generation: 32 tokens, ~21 tokens/sec
-    Peak memory: ~329 GB
-
-Short prompts do not meaningfully demonstrate long-context KV memory savings or prompt checkpoint benefit. Use longer prompts to evaluate those paths.
-
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
