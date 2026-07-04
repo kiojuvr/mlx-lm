@@ -339,6 +339,17 @@ about equal to the flat kernel at 2048 and 8192 synthetic lengths, so this knob
 should be evaluated as a graph-layout PoC rather than a raw q_b arithmetic
 speedup.
 
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A=1` or
+`--native-q4-qb-from-q-a enabled` is a shared-layer q_projection structure PoC.
+Shared-indexer layers do not need to return `qr` to the DSA indexer, so this
+route computes a compact q_a RMS scale and feeds q_a plus that scale directly
+into a scaled native q4 q_b kernel. Initial 2K full-model profiling confirmed
+the route hits shared layers and reduces q_a layernorm work to the full-indexer
+layers, but q_projection regressed because the current safe scaled-q_b kernel
+adds an extra threadgroup barrier while scaling loaded q_a tiles. The next useful
+step is a loader-aware scaled q_b path that applies q_a RMS scaling during load
+without an additional barrier.
+
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
 matrices on first use and reuse them for later prefill calls in the same model
@@ -387,8 +398,16 @@ Benchmark rows report:
 - `glm_dsa_native_q4_qb_head_layout_available`
 - `glm_dsa_native_q4_qb_head_layout_source`
 - `glm_dsa_native_q4_qb_head_layout_import_error`
+- `glm_dsa_native_q4_qb_from_q_a`
+- `glm_dsa_native_q4_qb_from_q_a_env`
+- `glm_dsa_native_q4_qb_from_q_a_available`
+- `glm_dsa_native_q4_qb_from_q_a_rms_scale_source`
+- `glm_dsa_native_q4_qb_from_q_a_scaled_heads_source`
+- `glm_dsa_native_q4_qb_from_q_a_import_error`
 - `glm_dsa_native_q4_qb_hits`
 - `glm_dsa_native_q4_qb_fallback_reasons`
+- `glm_dsa_native_q4_qb_from_q_a_hits`
+- `glm_dsa_native_q4_qb_from_q_a_fallback_reasons`
 
 The path falls back to the previous implementation when any safeguard is not
 satisfied. Current fallback reasons include:
@@ -485,6 +504,8 @@ Benchmark rows report:
 - `glm_dsa_q_b_projection_seconds`
 - `glm_dsa_native_q4_qb_projection_seconds`
 - `glm_dsa_native_q4_qb_head_layout_projection_seconds`
+- `glm_dsa_native_q_a_rms_scale_seconds`
+- `glm_dsa_native_q4_qb_from_q_a_projection_seconds`
 - `glm_dsa_kv_cache_update_seconds`
 - `glm_dsa_dsa_indexer_topk_seconds`
 - `glm_dsa_native_indexer_scores_seconds`

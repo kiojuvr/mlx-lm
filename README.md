@@ -360,6 +360,15 @@ Python reshape/transpose after q_b. The standalone q_b microbench shows the
 alternate kernel's arithmetic time is roughly comparable to the flat q_b kernel;
 use full prefill profiles to judge whether the graph-layout change helps end to
 end.
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A=1` /
+`--native-q4-qb-from-q-a enabled` is a deeper shared-layer q_projection PoC. It
+skips materializing `qr` on shared-indexer layers by computing a compact q_a
+RMS scale and feeding q_a plus that scale directly into a scaled native q4 q_b
+kernel. Initial 2K profiling confirmed the route works and reduces standalone
+q_a layernorm work to the full-indexer layers, but the scaled q_b kernel is
+slower than materializing `qr` because the current safe implementation adds an
+extra barrier while scaling loaded q_a tiles. Treat this as a loader-structure
+probe, not a recommended setting.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

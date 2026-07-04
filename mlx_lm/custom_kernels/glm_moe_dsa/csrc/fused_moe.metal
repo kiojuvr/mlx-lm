@@ -83,6 +83,30 @@
       bk,                                                                      \
       bn)
 
+#define instantiate_quantized_head_broadcast_heads_scaled(                     \
+    name, type, group_size, bits, aligned)                                      \
+  instantiate_kernel(                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned,         \
+      name,                                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      aligned)
+
+#define instantiate_quantized_head_broadcast_heads_scaled_tiled(               \
+    name, type, group_size, bits, aligned, bm, bk, bn)                          \
+  instantiate_kernel(                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned          \
+      "_bm_" #bm "_bk_" #bk "_bn_" #bn,                                        \
+      name,                                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      aligned,                                                                 \
+      bm,                                                                      \
+      bk,                                                                      \
+      bn)
+
 #define instantiate_moe_weighted_sum_tiled(type, score_type, topk, threads)    \
   instantiate_kernel(                                                          \
       "moe_weighted_sum_tiled_" #type "_score_" #score_type "_topk_" #topk     \
@@ -97,6 +121,14 @@
   instantiate_kernel(                                                          \
       "glm_rms_norm_2048_" #type "_t_" #threads,                               \
       glm_rms_norm_2048,                                                       \
+      type,                                                                    \
+      2048,                                                                    \
+      threads)
+
+#define instantiate_glm_rms_norm_inv_scale_2048(type, threads)                 \
+  instantiate_kernel(                                                          \
+      "glm_rms_norm_inv_scale_2048_" #type "_t_" #threads,                     \
+      glm_rms_norm_inv_scale_2048,                                             \
       type,                                                                    \
       2048,                                                                    \
       threads)
@@ -427,6 +459,162 @@ instantiate_quantized_head_broadcast_heads_tiled(
     32,
     64,
     64);
+instantiate_quantized_head_broadcast_heads_scaled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true);
+instantiate_quantized_head_broadcast_heads_scaled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    64,
+    32,
+    32);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    64,
+    32,
+    32);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    32);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    32);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    16,
+    32,
+    32);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    16,
+    32,
+    32);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    32,
+    16);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    32,
+    16);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    32,
+    64);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    32,
+    64);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    16,
+    32,
+    64);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    16,
+    32,
+    64);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    64,
+    32,
+    64);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    64,
+    32,
+    64);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    float16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    64);
+instantiate_quantized_head_broadcast_heads_scaled_tiled(
+    affine_qmm_t_head_broadcast_heads_scaled,
+    bfloat16_t,
+    64,
+    4,
+    true,
+    32,
+    64,
+    64);
 instantiate_quantized_flat(affine_qmm_t_flat, float16_t, 64, 4, true);
 instantiate_quantized_flat(affine_qmm_t_flat, bfloat16_t, 64, 4, true);
 instantiate_quantized_flat_tiled(
@@ -576,6 +764,8 @@ instantiate_quantized_flat_tiled(
 
 instantiate_glm_rms_norm_2048(float16_t, 256);
 instantiate_glm_rms_norm_2048(bfloat16_t, 256);
+instantiate_glm_rms_norm_inv_scale_2048(float16_t, 256);
+instantiate_glm_rms_norm_inv_scale_2048(bfloat16_t, 256);
 
 instantiate_moe_weighted_sum_tiled(float16_t, float, 8, 256);
 instantiate_moe_weighted_sum_tiled(bfloat16_t, float, 8, 256);

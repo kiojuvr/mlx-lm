@@ -2002,6 +2002,27 @@ template <
   }
 }
 
+template <typename T, const int BM, const int BK, const int BK_padded>
+METAL_FUNC void apply_rmsnorm_scale_to_x_block(
+    threadgroup T* Xs,
+    const device T* norm_weight,
+    const device T* row_scales,
+    const int row_offset,
+    const int k_offset,
+    const short valid_rows,
+    const uint lid) {
+  for (int idx = int(lid); idx < BM * BK; idx += 128) {
+    const int row = idx / BK;
+    const int col = idx - row * BK;
+    if (row < valid_rows) {
+      const int local = row * BK_padded + col;
+      const float scale =
+          float(norm_weight[k_offset + col]) * float(row_scales[row_offset + row]);
+      Xs[local] = T(float(Xs[local]) * scale);
+    }
+  }
+}
+
 template <
     typename T,
     int group_size,
@@ -2255,6 +2276,145 @@ template <
   }
 }
 
+template <
+    typename T,
+    int group_size,
+    int bits,
+    const bool aligned_N,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32>
+[[kernel]] void affine_qmm_t_head_broadcast_heads_scaled(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device T* norm_weight [[buffer(4)]],
+    const device T* row_scales [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant int& M [[buffer(9)]],
+    const constant int& H [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  const int K_eff = ceildiv(K, BK) * BK;
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const int h = tid.z % uint(H);
+  const int b = tid.z / uint(H);
+
+  const device T* x_batch = x + size_t(b) * M * K;
+  const device T* row_scales_batch = row_scales + size_t(b) * M;
+  const device uint8_t* wl =
+      (const device uint8_t*)w + (size_t(h) * N + y_col) * K_w;
+  const device T* scales_h = scales + (size_t(h) * N + y_col) * K_g;
+  const device T* biases_h = biases + (size_t(h) * N + y_col) * K_g;
+  device T* y_head = y + (size_t(b) * H + h) * M * N;
+
+  x_batch += y_row * static_cast<int64_t>(K);
+  y_head += y_row * static_cast<int64_t>(N) + y_col;
+
+  const short num_els = min(BM, M - y_row);
+  const short num_outs = min(BN, N - y_col);
+
+  loader_x_t loader_x(x_batch, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales_h, biases_h, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  if (num_els < BM) {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
+            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
+            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  } else {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
+            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
+            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (num_els < BM || num_outs < BN) {
+    mma_op.store_result_safe(y_head, N, short2(num_outs, num_els));
+  } else {
+    mma_op.store_result(y_head, N);
+  }
+}
+
 template <typename T, const int D = 2048, const int THREADS = 256>
 [[kernel]] void glm_rms_norm_2048(
     const device T* x [[buffer(0)]],
@@ -2298,6 +2458,44 @@ template <typename T, const int D = 2048, const int THREADS = 256>
   for (int col = int(lid); col < D; col += THREADS) {
     const float value = float(x[row_base + col]) * float(weight[col]) * scale;
     y[row_base + col] = T(value);
+  }
+}
+
+template <typename T, const int D = 2048, const int THREADS = 256>
+[[kernel]] void glm_rms_norm_inv_scale_2048(
+    const device T* x [[buffer(0)]],
+    device T* y [[buffer(1)]],
+    const constant float& eps [[buffer(2)]],
+    const constant int& rows [[buffer(3)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const int row = int(tid.x);
+  if (row >= rows) {
+    return;
+  }
+
+  constexpr int SIMDS = THREADS / SIMD_SIZE;
+  threadgroup float sums[SIMDS];
+  const int row_base = row * D;
+  float sum = 0.0f;
+  for (int col = int(lid); col < D; col += THREADS) {
+    const float value = float(x[row_base + col]);
+    sum += value * value;
+  }
+  sum = simd_sum(sum);
+  if (simd_lid == 0) {
+    sums[simd_gid] = sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float total = lid < SIMDS ? sums[lid] : 0.0f;
+  if (simd_gid == 0) {
+    total = simd_sum(total);
+    if (simd_lid == 0) {
+      y[row] = T(rsqrt(total / float(D) + eps));
+    }
   }
 }
 

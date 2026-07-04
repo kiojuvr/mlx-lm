@@ -57,6 +57,7 @@ GLM_DSA_NATIVE_Q4_QB_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE"
 GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV = (
     "MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT"
 )
+GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
 
@@ -71,6 +72,8 @@ _PROFILE_STAGES = (
     "q_b_projection",
     "native_q4_qb_projection",
     "native_q4_qb_head_layout_projection",
+    "native_q_a_rms_scale",
+    "native_q4_qb_from_q_a_projection",
     "kv_cache_update",
     "dsa_indexer_topk",
     "native_indexer_scores",
@@ -121,6 +124,14 @@ _NATIVE_Q4_QB_HEADS_LOOKUP_DONE = False
 _NATIVE_Q4_QB_HEADS_KERNEL = None
 _NATIVE_Q4_QB_HEADS_SOURCE = None
 _NATIVE_Q4_QB_HEADS_IMPORT_ERROR = None
+_NATIVE_Q_A_RMS_SCALE_LOOKUP_DONE = False
+_NATIVE_Q_A_RMS_SCALE_KERNEL = None
+_NATIVE_Q_A_RMS_SCALE_SOURCE = None
+_NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR = None
+_NATIVE_Q4_QB_SCALED_HEADS_LOOKUP_DONE = False
+_NATIVE_Q4_QB_SCALED_HEADS_KERNEL = None
+_NATIVE_Q4_QB_SCALED_HEADS_SOURCE = None
+_NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -172,6 +183,10 @@ def _native_q4_qb_enabled() -> bool:
 
 def _native_q4_qb_head_layout_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV, False)
+
+
+def _native_q4_qb_from_q_a_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV, False)
 
 
 def _prefill_profile_enabled() -> bool:
@@ -273,6 +288,8 @@ def _new_profile():
         "native_q4_qa_fallback_reasons": Counter(),
         "native_q4_qb_hits": 0,
         "native_q4_qb_fallback_reasons": Counter(),
+        "native_q4_qb_from_q_a_hits": 0,
+        "native_q4_qb_from_q_a_fallback_reasons": Counter(),
     }
 
 
@@ -330,6 +347,12 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         "native_q4_qb_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qb_hits"],
         "native_q4_qb_fallback_reasons": dict(
             _GLM_DSA_PREFILL_PROFILE["native_q4_qb_fallback_reasons"]
+        ),
+        "native_q4_qb_from_q_a_hits": _GLM_DSA_PREFILL_PROFILE[
+            "native_q4_qb_from_q_a_hits"
+        ],
+        "native_q4_qb_from_q_a_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_qb_from_q_a_fallback_reasons"]
         ),
     }
     if reset:
@@ -443,6 +466,25 @@ def _record_native_q4_qb_decision(used: bool, reason: str):
             )
         else:
             _LOGGER.info("GLM DSA native q4 q_b fallback: %s", reason)
+
+
+def _record_native_q4_qb_from_q_a_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qb_from_q_a_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE[
+            "native_q4_qb_from_q_a_fallback_reasons"
+        ][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 q_b from q_a enabled: source=%s",
+                _NATIVE_Q4_QB_SCALED_HEADS_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 q_b from q_a fallback: %s", reason)
 
 
 def _record_q_a_dense_cache_decision(
@@ -759,6 +801,86 @@ def _native_q4_qb_heads_kernel():
     return _NATIVE_Q4_QB_HEADS_KERNEL
 
 
+def _native_q_a_rms_scale_kernel():
+    global _NATIVE_Q_A_RMS_SCALE_LOOKUP_DONE
+    global _NATIVE_Q_A_RMS_SCALE_KERNEL
+    global _NATIVE_Q_A_RMS_SCALE_SOURCE
+    global _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR
+    if _NATIVE_Q_A_RMS_SCALE_LOOKUP_DONE:
+        return _NATIVE_Q_A_RMS_SCALE_KERNEL
+
+    _NATIVE_Q_A_RMS_SCALE_LOOKUP_DONE = True
+    _NATIVE_Q_A_RMS_SCALE_KERNEL = None
+    _NATIVE_Q_A_RMS_SCALE_SOURCE = None
+    _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q_a_rms_scale")
+                and hasattr(fast, "glm_dsa_q_a_rms_scale")
+            ):
+                _NATIVE_Q_A_RMS_SCALE_KERNEL = fast.glm_dsa_q_a_rms_scale
+                _NATIVE_Q_A_RMS_SCALE_SOURCE = module_name
+                return _NATIVE_Q_A_RMS_SCALE_KERNEL
+            if _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR is None:
+                _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR = exc
+
+    return _NATIVE_Q_A_RMS_SCALE_KERNEL
+
+
+def _native_q4_qb_scaled_heads_kernel():
+    global _NATIVE_Q4_QB_SCALED_HEADS_LOOKUP_DONE
+    global _NATIVE_Q4_QB_SCALED_HEADS_KERNEL
+    global _NATIVE_Q4_QB_SCALED_HEADS_SOURCE
+    global _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR
+    if _NATIVE_Q4_QB_SCALED_HEADS_LOOKUP_DONE:
+        return _NATIVE_Q4_QB_SCALED_HEADS_KERNEL
+
+    _NATIVE_Q4_QB_SCALED_HEADS_LOOKUP_DONE = True
+    _NATIVE_Q4_QB_SCALED_HEADS_KERNEL = None
+    _NATIVE_Q4_QB_SCALED_HEADS_SOURCE = None
+    _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qb_proj_scaled_heads")
+                and hasattr(fast, "glm_dsa_q4_qb_proj_scaled_heads")
+            ):
+                _NATIVE_Q4_QB_SCALED_HEADS_KERNEL = (
+                    fast.glm_dsa_q4_qb_proj_scaled_heads
+                )
+                _NATIVE_Q4_QB_SCALED_HEADS_SOURCE = module_name
+                return _NATIVE_Q4_QB_SCALED_HEADS_KERNEL
+            if _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR is None:
+                _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR = exc
+
+    return _NATIVE_Q4_QB_SCALED_HEADS_KERNEL
+
+
 def _native_q4_qa_kernel():
     global _NATIVE_Q4_QA_LOOKUP_DONE
     global _NATIVE_Q4_QA_KERNEL
@@ -984,6 +1106,8 @@ def get_glm_dsa_native_q4_vup_status():
 def get_glm_dsa_native_q4_qb_status():
     kernel = _native_q4_qb_kernel()
     heads_kernel = _native_q4_qb_heads_kernel()
+    rms_scale_kernel = _native_q_a_rms_scale_kernel()
+    scaled_heads_kernel = _native_q4_qb_scaled_heads_kernel()
     return {
         "enabled": _native_q4_qb_enabled(),
         "available": kernel is not None,
@@ -999,6 +1123,23 @@ def get_glm_dsa_native_q4_qb_status():
         "head_layout_import_error": (
             repr(_NATIVE_Q4_QB_HEADS_IMPORT_ERROR)
             if _NATIVE_Q4_QB_HEADS_IMPORT_ERROR is not None
+            else None
+        ),
+        "from_q_a_enabled": _native_q4_qb_from_q_a_enabled(),
+        "from_q_a_available": (
+            rms_scale_kernel is not None and scaled_heads_kernel is not None
+        ),
+        "from_q_a_rms_scale_source": _NATIVE_Q_A_RMS_SCALE_SOURCE,
+        "from_q_a_scaled_heads_source": _NATIVE_Q4_QB_SCALED_HEADS_SOURCE,
+        "from_q_a_import_error": (
+            repr(
+                _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR
+                or _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR
+            )
+            if (
+                _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR is not None
+                or _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR is not None
+            )
             else None
         ),
     }
@@ -1989,6 +2130,63 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             _record_native_q4_qb_decision(False, reason)
         return None
 
+    def _native_q4_qb_from_q_a_decision(self, x: mx.array):
+        if not _native_q4_qb_from_q_a_enabled():
+            return False, "disabled"
+        if not getattr(self, "skip_topk", False):
+            return False, "full_indexer_requires_qr"
+        if _native_q_a_rms_scale_kernel() is None:
+            return False, "missing_rms_scale_symbol"
+        if _native_q4_qb_scaled_heads_kernel() is None:
+            return False, "missing_scaled_qb_symbol"
+        use_native_qb, reason = self._native_q4_qb_decision(x)
+        if not use_native_qb:
+            return False, reason
+        norm_weight = self.q_a_layernorm["weight"]
+        if norm_weight.dtype != x.dtype:
+            return False, "mixed_norm_dtype"
+        if len(norm_weight.shape) != 1 or norm_weight.shape[0] != x.shape[-1]:
+            return False, "norm_weight_shape"
+        return True, "native_q4_qb_from_q_a"
+
+    def _q_b_project_from_q_a(self, x: mx.array):
+        use_native, reason = self._native_q4_qb_from_q_a_decision(x)
+        if use_native:
+            try:
+                scale_kernel = _native_q_a_rms_scale_kernel()
+                q_b_kernel = _native_q4_qb_scaled_heads_kernel()
+                row_scales = _profile_stage(
+                    "native_q_a_rms_scale",
+                    lambda: scale_kernel(
+                        x,
+                        float(self.q_a_layernorm.eps),
+                    ),
+                    inputs=x,
+                )
+                output = _profile_stage(
+                    "native_q4_qb_from_q_a_projection",
+                    lambda: q_b_kernel(
+                        x,
+                        self.q_a_layernorm["weight"],
+                        row_scales,
+                        self.q_b_proj["weight"],
+                        self.q_b_proj["scales"],
+                        self.q_b_proj["biases"],
+                    ),
+                    inputs=(x, row_scales),
+                )
+                _record_native_q4_qb_from_q_a_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if (
+            _native_q4_qb_from_q_a_enabled()
+            and hasattr(self.q_b_proj, "bits")
+        ):
+            _record_native_q4_qb_from_q_a_decision(False, reason)
+        return None
+
     def _unembed_out_project(self, x: mx.array):
         use_native, reason = self._native_q4_vup_decision(x)
         if use_native:
@@ -2247,12 +2445,21 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 lambda: self._q_a_project(x),
                 inputs=x,
             )
-            qr = _profile_stage(
-                "q_a_layernorm",
-                lambda: self._q_a_layernorm(q_a),
-                inputs=q_a,
-            )
+            qr = None
+            q = None
+            if getattr(self, "skip_topk", False):
+                q = self._q_b_project_from_q_a(q_a)
+
+            if q is None:
+                qr = _profile_stage(
+                    "q_a_layernorm",
+                    lambda: self._q_a_layernorm(q_a),
+                    inputs=q_a,
+                )
+
             def project_q_b():
+                if q is not None:
+                    return q
                 q_heads = self._q_b_project_heads(qr)
                 if q_heads is not None:
                     return q_heads

@@ -34,6 +34,8 @@ NATIVE_SYMBOLS = (
     "glm_dsa_q4_qb_proj_flat",
     "glm_dsa_q4_qb_proj_heads",
     "glm_dsa_q_a_rms_norm",
+    "glm_dsa_q_a_rms_scale",
+    "glm_dsa_q4_qb_proj_scaled_heads",
     "glm_moe_weighted_sum",
 )
 
@@ -350,6 +352,55 @@ def glm_dsa_q_a_rms_norm(
         weight,
         eps,
         stream=stream or mx.gpu,
+    )
+
+
+def glm_dsa_q_a_rms_scale(
+    x: mx.array,
+    eps: float,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "glm_dsa_q_a_rms_scale"):
+        return _ext.glm_dsa_q_a_rms_scale(
+            x,
+            eps,
+            **_native_stream_kwargs(stream),
+        )
+    scale = mx.rsqrt(mx.mean(mx.square(x).astype(mx.float32), axis=-1) + eps)
+    return scale.astype(x.dtype)
+
+
+def glm_dsa_q4_qb_proj_scaled_heads(
+    x: mx.array,
+    norm_weight: mx.array,
+    row_scales: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "glm_dsa_q4_qb_proj_scaled_heads"):
+        return _ext.glm_dsa_q4_qb_proj_scaled_heads(
+            x,
+            norm_weight,
+            row_scales,
+            weight,
+            scales,
+            biases,
+            **_native_stream_kwargs(stream),
+        )
+    normalized = x * norm_weight * row_scales[..., None]
+    flat = glm_dsa_q4_qb_proj_flat(
+        normalized,
+        weight,
+        scales,
+        biases,
+        stream=stream,
+    )
+    return flat.reshape(flat.shape[0], flat.shape[1], 64, 256).transpose(
+        0, 2, 1, 3
     )
 
 

@@ -722,6 +722,132 @@ class GlmDsaQ4QbProjHeadsPrimitive : public Primitive {
   Q4QbTileConfig tile_;
 };
 
+class GlmDsaQ4QbProjScaledHeadsPrimitive : public Primitive {
+ public:
+  GlmDsaQ4QbProjScaledHeadsPrimitive(Stream stream, Q4QbTileConfig tile)
+      : Primitive(stream), tile_(tile) {}
+
+  static bool unsupported(
+      const array& x,
+      const array& norm_weight,
+      const array& row_scales,
+      const array& weight,
+      const array& scales,
+      const array& biases,
+      Stream s) {
+    if (GlmDsaQ4QbProjFlatPrimitive::unsupported(
+            x, weight, scales, biases, s)) {
+      return true;
+    }
+    if (norm_weight.dtype() != x.dtype() || row_scales.dtype() != x.dtype()) {
+      return true;
+    }
+    if (norm_weight.ndim() != 1 || row_scales.ndim() != 2) {
+      return true;
+    }
+    constexpr int K = 2048;
+    if (norm_weight.shape(0) != K || row_scales.shape(0) != x.shape(0) ||
+        row_scales.shape(1) != x.shape(1)) {
+      return true;
+    }
+    if (!row_contiguous(norm_weight) || !row_contiguous(row_scales)) {
+      return true;
+    }
+    return false;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error(
+        "GlmDsaQ4QbProjScaledHeadsPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& x = inputs[0];
+    const auto& norm_weight = inputs[1];
+    const auto& row_scales = inputs[2];
+    const auto& weight = inputs[3];
+    const auto& scales = inputs[4];
+    const auto& biases = inputs[5];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int group_size = 64;
+    constexpr int bits = 4;
+    constexpr int H = 64;
+    constexpr int N = 256;
+    const auto& tile = tile_;
+
+    const int B = x.shape(0);
+    const int M = x.shape(1);
+    const int K = x.shape(2);
+
+    std::string kname;
+    concatenate(
+        kname,
+        "affine_qmm_t_head_broadcast_heads_scaled_",
+        glm_type_name(x.dtype()),
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        "_alN_true");
+    if (!(tile.bm == 32 && tile.bk == 32 && tile.bn == 32)) {
+      concatenate(
+          kname,
+          "_bm_",
+          tile.bm,
+          "_bk_",
+          tile.bk,
+          "_bn_",
+          tile.bn);
+    }
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(kname, lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(weight, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_input_array(biases, 2);
+    compute_encoder.set_input_array(x, 3);
+    compute_encoder.set_input_array(norm_weight, 4);
+    compute_encoder.set_input_array(row_scales, 5);
+    compute_encoder.set_output_array(out, 6);
+    compute_encoder.set_bytes(K, 7);
+    compute_encoder.set_bytes(N, 8);
+    compute_encoder.set_bytes(M, 9);
+    compute_encoder.set_bytes(H, 10);
+
+    MTL::Size grid_dims(
+        (N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm, B * H);
+    MTL::Size group_dims(32, 2, 2);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(GlmDsaQ4QbProjScaledHeadsPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const GlmDsaQ4QbProjScaledHeadsPrimitive&>(other);
+    return tile_.bm == rhs.tile_.bm && tile_.bk == rhs.tile_.bk &&
+        tile_.bn == rhs.tile_.bn;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, tile_.bm, tile_.bk, tile_.bn);
+  }
+
+ private:
+  Q4QbTileConfig tile_;
+};
+
 class GlmDsaQaRmsNormPrimitive : public Primitive {
  public:
   GlmDsaQaRmsNormPrimitive(Stream stream, float eps)
@@ -799,6 +925,81 @@ class GlmDsaQaRmsNormPrimitive : public Primitive {
   DEFINE_INPUT_OUTPUT_SHAPE()
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const GlmDsaQaRmsNormPrimitive&>(other);
+    return eps_ == rhs.eps_;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, eps_);
+  }
+
+ private:
+  float eps_;
+};
+
+class GlmDsaQaRmsScalePrimitive : public Primitive {
+ public:
+  GlmDsaQaRmsScalePrimitive(Stream stream, float eps)
+      : Primitive(stream), eps_(eps) {}
+
+  static bool unsupported(const array& x, Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    if (x.dtype() != float16 && x.dtype() != bfloat16) {
+      return true;
+    }
+    if (x.ndim() != 3 || !row_contiguous(x)) {
+      return true;
+    }
+    constexpr int D = 2048;
+    return x.shape(2) != D;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("GlmDsaQaRmsScalePrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+    const auto& x = inputs[0];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int D = 2048;
+    constexpr int threads = 256;
+    const int rows = x.size() / D;
+
+    std::string kname;
+    concatenate(
+        kname,
+        "glm_rms_norm_inv_scale_2048_",
+        glm_type_name(x.dtype()),
+        "_t_",
+        threads);
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(kname, lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
+    compute_encoder.set_output_array(out, 1);
+    compute_encoder.set_bytes(eps_, 2);
+    compute_encoder.set_bytes(rows, 3);
+
+    MTL::Size grid_dims(rows, 1, 1);
+    MTL::Size group_dims(threads, 1, 1);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(GlmDsaQaRmsScalePrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const GlmDsaQaRmsScalePrimitive&>(other);
     return eps_ == rhs.eps_;
   }
   auto state() const {
@@ -1251,6 +1452,83 @@ array glm_dsa_q4_qb_proj_heads(
       std::move(inputs));
 }
 
+array glm_dsa_q4_qb_proj_scaled_heads(
+    const array& x,
+    const array& norm_weight,
+    const array& row_scales,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s /* = {} */) {
+  if (x.ndim() != 3 || norm_weight.ndim() != 1 || row_scales.ndim() != 2 ||
+      weight.ndim() != 2 || scales.ndim() != 2 || biases.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_scaled_heads] expected x rank "
+        << "3, norm_weight rank 1, row_scales rank 2, and quantized weights "
+        << "rank 2, got " << x.shape() << ", " << norm_weight.shape() << ", "
+        << row_scales.shape() << ", " << weight.shape() << ", "
+        << scales.shape() << ", " << biases.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  const int B = x.shape(0);
+  const int L = x.shape(1);
+  constexpr int H = 64;
+  constexpr int N = 256;
+  constexpr int K = 2048;
+  constexpr int bits = 4;
+  constexpr int group_size = 64;
+  constexpr int pack_factor = 32 / bits;
+  if (x.shape(2) != K || norm_weight.shape(0) != K ||
+      row_scales.shape(0) != B || row_scales.shape(1) != L ||
+      weight.shape(0) != H * N || weight.shape(1) * pack_factor != K ||
+      scales.shape(0) != H * N || biases.shape(0) != H * N ||
+      scales.shape(1) != K / group_size ||
+      biases.shape(1) != K / group_size) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_scaled_heads] incompatible "
+        << "shapes: " << x.shape() << ", " << norm_weight.shape() << ", "
+        << row_scales.shape() << ", " << weight.shape() << ", "
+        << scales.shape() << ", " << biases.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != float16 && x.dtype() != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_scaled_heads] expected "
+        << "float16 or bfloat16 input, got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (norm_weight.dtype() != x.dtype() || row_scales.dtype() != x.dtype() ||
+      weight.dtype() != uint32 || scales.dtype() != x.dtype() ||
+      biases.dtype() != x.dtype()) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_scaled_heads] expected "
+        << "q_a/norm/scale/bias dtype " << x.dtype() << " and uint32 weight, "
+        << "got " << norm_weight.dtype() << ", " << row_scales.dtype()
+        << ", " << weight.dtype() << ", " << scales.dtype() << ", "
+        << biases.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {
+      x, norm_weight, row_scales, weight, scales, biases};
+  if (GlmDsaQ4QbProjScaledHeadsPrimitive::unsupported(
+          x, norm_weight, row_scales, weight, scales, biases, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.glm_dsa_q4_qb_proj_scaled_heads] unsupported M3 "
+        "GLM shape.");
+  }
+
+  Shape out_shape{B, H, L, N};
+  return array(
+      std::move(out_shape),
+      x.dtype(),
+      std::make_shared<GlmDsaQ4QbProjScaledHeadsPrimitive>(
+          stream, q4_qb_tile_config()),
+      std::move(inputs));
+}
+
 array glm_dsa_q_a_rms_norm(
     const array& x,
     const array& weight,
@@ -1295,6 +1573,45 @@ array glm_dsa_q_a_rms_norm(
       x.shape(),
       x.dtype(),
       std::make_shared<GlmDsaQaRmsNormPrimitive>(stream, eps),
+      std::move(inputs));
+}
+
+array glm_dsa_q_a_rms_scale(
+    const array& x,
+    float eps,
+    StreamOrDevice s /* = {} */) {
+  if (x.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q_a_rms_scale] expected x rank 3, got "
+        << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  constexpr int D = 2048;
+  if (x.shape(2) != D) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q_a_rms_scale] incompatible shape: "
+        << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != float16 && x.dtype() != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q_a_rms_scale] expected float16 or "
+        << "bfloat16 input, got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {x};
+  if (GlmDsaQaRmsScalePrimitive::unsupported(x, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.glm_dsa_q_a_rms_scale] unsupported M3 GLM shape.");
+  }
+
+  Shape out_shape{x.shape(0), x.shape(1)};
+  return array(
+      std::move(out_shape),
+      x.dtype(),
+      std::make_shared<GlmDsaQaRmsScalePrimitive>(stream, eps),
       std::move(inputs));
 }
 

@@ -107,6 +107,22 @@ NB_MODULE(_ext, m) {
       "eps"_a,
       "stream"_a = nb::none());
   m.def(
+      "glm_dsa_q_a_rms_scale",
+      &omlx::glm_kernels::glm_dsa_q_a_rms_scale,
+      "x"_a,
+      "eps"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "glm_dsa_q4_qb_proj_scaled_heads",
+      &omlx::glm_kernels::glm_dsa_q4_qb_proj_scaled_heads,
+      "x"_a,
+      "norm_weight"_a,
+      "row_scales"_a,
+      "weight"_a,
+      "scales"_a,
+      "biases"_a,
+      "stream"_a = nb::none());
+  m.def(
       "glm_moe_weighted_sum",
       &omlx::glm_kernels::glm_moe_weighted_sum,
       "x_sorted"_a,
