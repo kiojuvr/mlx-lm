@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+from mlx.nn.layers.distributed import sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import (
@@ -21,6 +22,7 @@ from .cache import (
 from .deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
+    DeepseekV32MoE,
     DeepseekV32Model,
 )
 from .deepseek_v32 import Model as DSV32Model
@@ -66,6 +68,7 @@ GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV = (
 )
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
+GLM_DSA_EXPERT_PROFILE_ENV = "MLX_LM_GLM_DSA_EXPERT_PROFILE"
 
 _PROFILE_STAGES = (
     "q_projection",
@@ -101,6 +104,8 @@ _DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT = 6144
 _FAST_PREFILL_LARGE_TOPK_WARNING = 1024
 _LOGGER = logging.getLogger(__name__)
 _GLM_DSA_PREFILL_PROFILE = None
+_GLM_DSA_EXPERT_PROFILE = None
+_EXPERT_PROFILE_CACHE_CAPS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 _WARNED_FAST_PREFILL_LARGE_TOPK = False
 _NATIVE_SPARSE_MLA_LOOKUP_DONE = False
 _NATIVE_SPARSE_MLA_KERNEL = None
@@ -217,6 +222,10 @@ def _prefill_profile_enabled() -> bool:
 
 def _prefill_profile_isolate_enabled() -> bool:
     return _env_flag(GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV, False)
+
+
+def _expert_profile_enabled() -> bool:
+    return _env_flag(GLM_DSA_EXPERT_PROFILE_ENV, False)
 
 
 def _fast_prefill_debug_enabled() -> bool:
@@ -380,6 +389,299 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
     if reset:
         reset_glm_dsa_prefill_profile()
     return profile
+
+
+def _new_expert_layer_profile():
+    return {
+        "records": 0,
+        "selections": 0,
+        "weight_total": 0.0,
+        "hist": Counter(),
+        "weight_hist": Counter(),
+        "cache_hits": Counter(),
+        "cache_weight_hits": Counter(),
+        "cache_entries": {cap: [] for cap in _EXPERT_PROFILE_CACHE_CAPS},
+        "prev_selected": None,
+        "adjacent_pairs": 0,
+        "adjacent_overlap_sum": 0.0,
+        "adjacent_jaccard_sum": 0.0,
+    }
+
+
+def _new_expert_profile():
+    return {
+        "cache_ns": list(_EXPERT_PROFILE_CACHE_CAPS),
+        "layers": {},
+        "expert_count": 0,
+        "expert_used": 0,
+        "records": 0,
+        "selections": 0,
+        "weight_total": 0.0,
+        "errors": Counter(),
+    }
+
+
+def reset_glm_dsa_expert_profile():
+    global _GLM_DSA_EXPERT_PROFILE
+    _GLM_DSA_EXPERT_PROFILE = _new_expert_profile()
+
+
+def _expert_profile_cache_use(layer, cap: int, expert: int, weight: float):
+    entries = layer["cache_entries"][cap]
+    try:
+        found = entries.index(expert)
+    except ValueError:
+        found = -1
+
+    if found >= 0:
+        layer["cache_hits"][cap] += 1
+        layer["cache_weight_hits"][cap] += weight
+        entries.pop(found)
+        entries.insert(0, expert)
+        return
+
+    entries.insert(0, expert)
+    del entries[cap:]
+
+
+def _record_expert_profile_row(layer_idx: int, selected_row, weight_row):
+    global _GLM_DSA_EXPERT_PROFILE
+    if _GLM_DSA_EXPERT_PROFILE is None:
+        reset_glm_dsa_expert_profile()
+
+    selected = [int(value) for value in selected_row]
+    weights = [float(value) for value in weight_row]
+    row_len = min(len(selected), len(weights))
+    if row_len == 0:
+        return
+    selected = selected[:row_len]
+    weights = weights[:row_len]
+
+    profile = _GLM_DSA_EXPERT_PROFILE
+    profile["expert_used"] = max(profile["expert_used"], row_len)
+    layer = profile["layers"].setdefault(
+        int(layer_idx), _new_expert_layer_profile()
+    )
+    layer["records"] += 1
+    profile["records"] += 1
+
+    prev_selected = layer["prev_selected"]
+    if prev_selected is not None:
+        prev_set = set(prev_selected)
+        current_set = set(selected)
+        intersection = len(prev_set & current_set)
+        union = len(prev_set | current_set)
+        layer["adjacent_pairs"] += 1
+        layer["adjacent_overlap_sum"] += intersection / float(row_len)
+        if union:
+            layer["adjacent_jaccard_sum"] += intersection / float(union)
+    layer["prev_selected"] = selected
+
+    for expert, weight in zip(selected, weights):
+        if expert < 0:
+            continue
+        layer["hist"][expert] += 1
+        layer["weight_hist"][expert] += weight
+        layer["selections"] += 1
+        layer["weight_total"] += weight
+        profile["selections"] += 1
+        profile["weight_total"] += weight
+        for cap in _EXPERT_PROFILE_CACHE_CAPS:
+            _expert_profile_cache_use(layer, cap, expert, weight)
+
+
+def _iter_expert_rows(selected, weights):
+    if not isinstance(selected, list) or not isinstance(weights, list):
+        return
+    if not selected or not weights:
+        return
+    if not any(isinstance(value, list) for value in selected):
+        yield selected, weights
+        return
+    for selected_item, weight_item in zip(selected, weights):
+        yield from _iter_expert_rows(selected_item, weight_item)
+
+
+def _record_glm_dsa_expert_profile(
+    layer_idx: int,
+    inds: mx.array,
+    scores: mx.array,
+    expert_count: Optional[int] = None,
+):
+    global _GLM_DSA_EXPERT_PROFILE
+    if not _expert_profile_enabled():
+        return
+    if _GLM_DSA_EXPERT_PROFILE is None:
+        reset_glm_dsa_expert_profile()
+    try:
+        profile = _GLM_DSA_EXPERT_PROFILE
+        if expert_count is not None:
+            profile["expert_count"] = max(profile["expert_count"], int(expert_count))
+        mx.eval(inds, scores)
+        selected = inds.tolist()
+        weights = scores.tolist()
+        for selected_row, weight_row in _iter_expert_rows(selected, weights):
+            _record_expert_profile_row(layer_idx, selected_row, weight_row)
+    except Exception as exc:
+        _GLM_DSA_EXPERT_PROFILE["errors"][type(exc).__name__] += 1
+
+
+def _format_expert_layer_profile(layer_idx: int, layer):
+    selections = layer["selections"]
+    weight_total = layer["weight_total"]
+    top_experts = []
+    entries = sorted(
+        layer["hist"].items(),
+        key=lambda item: (-item[1], -layer["weight_hist"][item[0]], item[0]),
+    )
+    for expert, count in entries[:16]:
+        weight = layer["weight_hist"][expert]
+        top_experts.append(
+            {
+                "id": int(expert),
+                "count": int(count),
+                "pct": 100.0 * count / selections if selections else 0.0,
+                "weight": float(weight),
+                "weight_pct": (
+                    100.0 * weight / weight_total if weight_total else 0.0
+                ),
+            }
+        )
+
+    adjacent_pairs = layer["adjacent_pairs"]
+    return {
+        "layer": int(layer_idx),
+        "records": layer["records"],
+        "selections": selections,
+        "unique_experts": len(layer["hist"]),
+        "adjacent_pairs": adjacent_pairs,
+        "avg_adjacent_overlap": (
+            layer["adjacent_overlap_sum"] / adjacent_pairs
+            if adjacent_pairs
+            else 0.0
+        ),
+        "avg_adjacent_jaccard": (
+            layer["adjacent_jaccard_sum"] / adjacent_pairs
+            if adjacent_pairs
+            else 0.0
+        ),
+        "top_experts": top_experts,
+        "cache": [
+            {
+                "n": cap,
+                "hits": int(layer["cache_hits"][cap]),
+                "hit_rate": (
+                    layer["cache_hits"][cap] / selections if selections else 0.0
+                ),
+                "weighted_hit_rate": (
+                    layer["cache_weight_hits"][cap] / weight_total
+                    if weight_total
+                    else 0.0
+                ),
+            }
+            for cap in _EXPERT_PROFILE_CACHE_CAPS
+        ],
+    }
+
+
+def get_glm_dsa_expert_hotlist(max_entries: Optional[int] = None):
+    global _GLM_DSA_EXPERT_PROFILE
+    if _GLM_DSA_EXPERT_PROFILE is None:
+        reset_glm_dsa_expert_profile()
+    entries = []
+    for layer_idx, layer in _GLM_DSA_EXPERT_PROFILE["layers"].items():
+        for expert, count in layer["hist"].items():
+            entries.append(
+                {
+                    "layer": int(layer_idx),
+                    "expert": int(expert),
+                    "hits": int(count),
+                    "weight": float(layer["weight_hist"][expert]),
+                }
+            )
+    entries.sort(
+        key=lambda entry: (
+            -entry["hits"],
+            -entry["weight"],
+            entry["layer"],
+            entry["expert"],
+        )
+    )
+    if max_entries is not None:
+        entries = entries[: max(0, max_entries)]
+    return entries
+
+
+def format_glm_dsa_expert_hotlist(max_entries: Optional[int] = None) -> str:
+    if _GLM_DSA_EXPERT_PROFILE is None:
+        reset_glm_dsa_expert_profile()
+    profile = _GLM_DSA_EXPERT_PROFILE
+    hotlist = get_glm_dsa_expert_hotlist(max_entries=max_entries)
+    lines = [
+        "# mlx_lm GLM DSA expert hotlist v1",
+        "# source GLM DSA expert locality profile",
+        f"# layers {len(profile['layers'])}",
+        f"# experts {profile['expert_count']}",
+        f"# expert_used {profile['expert_used']}",
+        f"# layer_records {profile['records']}",
+        f"# selections {profile['selections']}",
+        "# columns: layer expert hits weight",
+    ]
+    lines.extend(
+        (
+            f"{entry['layer']} {entry['expert']} {entry['hits']} "
+            f"{entry['weight']:.17g}"
+        )
+        for entry in hotlist
+    )
+    return "\n".join(lines) + "\n"
+
+
+def get_glm_dsa_expert_profile(reset: bool = False):
+    global _GLM_DSA_EXPERT_PROFILE
+    if _GLM_DSA_EXPERT_PROFILE is None:
+        reset_glm_dsa_expert_profile()
+    profile = _GLM_DSA_EXPERT_PROFILE
+    total_selections = profile["selections"]
+    total_weight = profile["weight_total"]
+    cache_summary = []
+    for cap in _EXPERT_PROFILE_CACHE_CAPS:
+        hits = 0
+        weight_hits = 0.0
+        for layer in profile["layers"].values():
+            hits += layer["cache_hits"][cap]
+            weight_hits += layer["cache_weight_hits"][cap]
+        cache_summary.append(
+            {
+                "n": cap,
+                "hits": int(hits),
+                "selections": int(total_selections),
+                "hit_rate": hits / total_selections if total_selections else 0.0,
+                "weighted_hit_rate": (
+                    weight_hits / total_weight if total_weight else 0.0
+                ),
+            }
+        )
+    result = {
+        "enabled": _expert_profile_enabled(),
+        "cache_ns": list(_EXPERT_PROFILE_CACHE_CAPS),
+        "expert_count": int(profile["expert_count"]),
+        "expert_used": int(profile["expert_used"]),
+        "records": int(profile["records"]),
+        "selections": int(total_selections),
+        "weight_total": float(total_weight),
+        "errors": dict(profile["errors"]),
+        "cache_summary": cache_summary,
+        "hotlist_entries": len(get_glm_dsa_expert_hotlist()),
+        "hotlist_top16": get_glm_dsa_expert_hotlist(max_entries=16),
+        "layers_detail": [
+            _format_expert_layer_profile(layer_idx, layer)
+            for layer_idx, layer in sorted(profile["layers"].items())
+        ],
+    }
+    if reset:
+        reset_glm_dsa_expert_profile()
+    return result
 
 
 def _record_stage(stage: str, seconds: float):
@@ -2771,10 +3073,39 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         return output, topk_indices
 
 
+class GlmMoeDsaMoE(DeepseekV32MoE):
+    def __init__(self, config: ModelArgs, layer_idx: int):
+        super().__init__(config)
+        self.layer_idx = layer_idx
+
+    def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
+        inds, scores = self.gate(x)
+        _record_glm_dsa_expert_profile(
+            self.layer_idx,
+            inds,
+            scores,
+            expert_count=self.gate.n_routed_experts,
+        )
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        if self.config.n_shared_experts is not None:
+            y = y + self.shared_experts(x)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
+
+
 class GlmMoeDsaDecoderLayer(DeepseekV32DecoderLayer):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__(config, layer_idx)
         self.self_attn = GlmMoeDsaAttention(config, layer_idx)
+        if isinstance(self.mlp, DeepseekV32MoE):
+            self.mlp = GlmMoeDsaMoE(config, layer_idx)
 
     def __call__(
         self,

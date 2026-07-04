@@ -152,6 +152,18 @@ The recommended server command intentionally leaves `--temp` and `--top-p` unset
 
 Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that writes and reuses disk prompt checkpoints, including frontier checkpoints. Disable final exact checkpoints for this long-running server profile: 190K-token exact checkpoints are around 11GB each on the tested setup and can spend tens of seconds writing only to be pruned immediately. The measured cold-prefill sweep now favors `--prefill-step-size 8192`, `--prefill-max-qk-tokens 67108864`, and adaptive GLM DSA prefill disabled (`--glm-dsa-adaptive-prefill-step-size 0`). The QK cap shrinks only the chunks whose query-by-context product would get too large; the 8192-token first chunk crosses the native sparse handoff immediately, then later chunks shrink automatically as the cap requires. Keep `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` at its default/effective 131072 handoff for the Python selected-KV sparse path; lowering that handoff increased runtime and memory in the tested 128K runs. The vendored native DSA indexer route is enabled by default through `MLX_LM_GLM_DSA_NATIVE_INDEXER` and can replace the Python/MLX indexer score plus top-k path for supported GLM-5.2 M3 chunks at context 4096 and above. The vendored native sparse MLA route has its own lower handoff, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 6144). `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1` lets it consume int8 GLM MLA KV cache by temporarily dequantizing the full latent KV cache for the native kernel; the recommended `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144` has been profiled through 204800 tokens with all chunks on the native sparse route and no dense fallback. Keep larger values bounded until your target context length is profiled. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery or memory pressure appears on your real prompt distribution, retry with `--prefill-step-size 4096` first, then 2048 and 1024.
 
+`MLX_LM_GLM_DSA_EXPERT_PROFILE=1` enables an opt-in routed-expert locality
+profile inspired by ds4's GLM-5.2 selected-expert hotlist work. It synchronizes
+the GLM MoE router outputs, so use it only for measurement runs. The profile is
+available from `mlx_lm.models.glm_moe_dsa.get_glm_dsa_expert_profile()` and from
+`benchmarks/glm52_prefill_benchmark.py --expert-profile`; it reports per-layer
+top experts, adjacent-token overlap/Jaccard, and simulated LRU cache hit rates
+for cache sizes 1 through 256. Add `--expert-hotlist-output /path/{case}.hotlist`
+to write a ds4-style `layer expert hits weight` hotlist for later comparison
+with ds4's GLM-5.2 selected-expert profiles. Use
+`benchmarks/glm52_expert_hotlist_compare.py` to compare MLX and ds4 hotlists by
+top-N overlap, coverage, Jaccard, and cross-rank.
+
 For shorter mixed workloads where throughput matters more than per-request TTFT
 and disk frontier checkpoints are less important, continuous batching can still
 be useful:

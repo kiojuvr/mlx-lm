@@ -634,6 +634,10 @@ def configure_glm_dsa_fast_prefill(args):
         )
     if args.prefill_profile:
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ENV] = "1"
+    if getattr(args, "expert_profile", False) or getattr(
+        args, "expert_hotlist_output", None
+    ):
+        os.environ[glm_moe_dsa.GLM_DSA_EXPERT_PROFILE_ENV] = "1"
     prefill_profile_isolate = getattr(args, "prefill_profile_isolate", "default")
     if prefill_profile_isolate == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV] = "1"
@@ -643,10 +647,46 @@ def configure_glm_dsa_fast_prefill(args):
 
 def reset_glm_dsa_profile():
     glm_moe_dsa.reset_glm_dsa_prefill_profile()
+    glm_moe_dsa.reset_glm_dsa_expert_profile()
 
 
-def collect_glm_dsa_profile(args):
+def safe_output_case_name(case_name):
+    if not case_name:
+        return "run"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", case_name).strip("._") or "run"
+
+
+def expert_hotlist_output_path(args, case_name):
+    output = getattr(args, "expert_hotlist_output", None)
+    if output is None:
+        return None
+    safe_case = safe_output_case_name(case_name)
+    output_text = str(output)
+    if "{case}" in output_text:
+        return Path(output_text.replace("{case}", safe_case))
+    if output.exists() and output.is_dir():
+        return output / f"{safe_case}.hotlist"
+    return output
+
+
+def write_expert_hotlist_output(args, case_name):
+    path = expert_hotlist_output_path(args, case_name)
+    if path is None:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        glm_moe_dsa.format_glm_dsa_expert_hotlist(),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def collect_glm_dsa_profile(args, case_name=None):
     profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+    expert_profile = glm_moe_dsa.get_glm_dsa_expert_profile()
+    expert_hotlist_output = None
+    if expert_profile["enabled"] and getattr(args, "expert_hotlist_output", None):
+        expert_hotlist_output = write_expert_hotlist_output(args, case_name)
     native_status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
     native_indexer_status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
     native_q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
@@ -669,6 +709,19 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_prefill_profile_isolate_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV,
             "default-off",
+        ),
+        "glm_dsa_expert_profile": bool(expert_profile["enabled"]),
+        "glm_dsa_expert_profile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_EXPERT_PROFILE_ENV,
+            "default-off",
+        ),
+        "glm_dsa_expert_profile_records": expert_profile["records"],
+        "glm_dsa_expert_profile_selections": expert_profile["selections"],
+        "glm_dsa_expert_hotlist_entries": expert_profile["hotlist_entries"],
+        "glm_dsa_expert_hotlist_top16": expert_profile["hotlist_top16"],
+        "glm_dsa_expert_hotlist_output": expert_hotlist_output,
+        "glm_dsa_expert_profile_summary": (
+            expert_profile if expert_profile["enabled"] else None
         ),
         "glm_dsa_fast_prefill": args.fast_prefill,
         "glm_dsa_fast_prefill_env": os.environ.get(
@@ -1551,7 +1604,7 @@ def run_once(model, tokenizer, prompt, args, case_name):
         raise RuntimeError(f"{case_name}: generation produced no response")
 
     checkpoint = extract_checkpoint_summary(capture.messages)
-    glm_profile = collect_glm_dsa_profile(args)
+    glm_profile = collect_glm_dsa_profile(args, case_name)
     prompt_tps = (
         response.prompt_tps
         if response is not None
@@ -1715,7 +1768,7 @@ def run_batch_once(model, tokenizer, text, args, case_name):
         ),
         "active_batch_size_max": active_batch_size_max,
         **admission_stats,
-        **collect_glm_dsa_profile(args),
+        **collect_glm_dsa_profile(args, case_name),
     }
 
 
@@ -1839,7 +1892,7 @@ def run_queued_once(model, tokenizer, _text, args, case_name):
         "admission_wait_p95_seconds": percentile(wait_seconds, 95),
         "active_batch_size_max": max(active_sizes) if active_sizes else 0,
         **admission_stats,
-        **collect_glm_dsa_profile(args),
+        **collect_glm_dsa_profile(args, case_name),
     }
     result["admission_events"] = admission_events
     result["active_batch_size_samples"] = active_samples
@@ -1957,6 +2010,14 @@ def print_table(rows, output_format):
         "glm_dsa_prefill_profile",
         "glm_dsa_prefill_profile_isolate",
         "glm_dsa_prefill_profile_isolate_env",
+        "glm_dsa_expert_profile",
+        "glm_dsa_expert_profile_env",
+        "glm_dsa_expert_profile_records",
+        "glm_dsa_expert_profile_selections",
+        "glm_dsa_expert_hotlist_entries",
+        "glm_dsa_expert_hotlist_top16",
+        "glm_dsa_expert_hotlist_output",
+        "glm_dsa_expert_profile_summary",
         "glm_dsa_fast_prefill",
         "glm_dsa_fast_prefill_env",
         "glm_dsa_fast_prefill_query_chunk",
@@ -3128,6 +3189,23 @@ def main():
         help=(
             "Synchronize and report GLM DSA prefill stage timings. This adds "
             "profiling overhead and is intended for measurement runs."
+        ),
+    )
+    parser.add_argument(
+        "--expert-profile",
+        action="store_true",
+        help=(
+            "Synchronize and report GLM DSA routed-expert locality. This adds "
+            "profiling overhead and is intended for ds4-style hotlist analysis."
+        ),
+    )
+    parser.add_argument(
+        "--expert-hotlist-output",
+        type=Path,
+        help=(
+            "Optional ds4-style routed-expert hotlist output path for "
+            "--expert-profile. Include {case} in the path, or pass an existing "
+            "directory, to keep multiple benchmark cases separate."
         ),
     )
     parser.add_argument(

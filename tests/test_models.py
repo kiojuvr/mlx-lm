@@ -463,6 +463,49 @@ class TestModels(unittest.TestCase):
         finally:
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_expert_profile_records_routes(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        inputs = mx.array([[1, 2, 3]])
+        env_keys = [glm_moe_dsa.GLM_DSA_EXPERT_PROFILE_ENV]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_EXPERT_PROFILE_ENV] = "1"
+            glm_moe_dsa.reset_glm_dsa_expert_profile()
+            logits = model(inputs)
+            mx.eval(logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_expert_profile()
+            self.assertTrue(profile["enabled"])
+            self.assertEqual(profile["expert_count"], 4)
+            self.assertEqual(profile["expert_used"], 2)
+            self.assertEqual(profile["records"], 3)
+            self.assertEqual(profile["selections"], 6)
+            self.assertEqual(profile["errors"], {})
+            self.assertEqual(profile["hotlist_entries"], len(profile["hotlist_top16"]))
+            self.assertEqual(len(profile["layers_detail"]), 1)
+            layer = profile["layers_detail"][0]
+            self.assertEqual(layer["layer"], 1)
+            self.assertEqual(layer["records"], 3)
+            self.assertEqual(layer["selections"], 6)
+            self.assertLessEqual(layer["unique_experts"], 4)
+            self.assertEqual(layer["adjacent_pairs"], 2)
+            self.assertIn("top_experts", layer)
+            self.assertIn("cache", layer)
+
+            hotlist = glm_moe_dsa.get_glm_dsa_expert_hotlist()
+            self.assertEqual(sum(entry["hits"] for entry in hotlist), 6)
+            self.assertLessEqual(len(hotlist), 4)
+            self.assertEqual(hotlist, profile["hotlist_top16"])
+            hotlist_text = glm_moe_dsa.format_glm_dsa_expert_hotlist()
+            self.assertIn("# mlx_lm GLM DSA expert hotlist v1\n", hotlist_text)
+            self.assertIn("# columns: layer expert hits weight\n", hotlist_text)
+            self.assertIn("\n1 ", hotlist_text)
+        finally:
+            self._restore_env(saved_env)
+            glm_moe_dsa.reset_glm_dsa_expert_profile()
+
     def test_glm_moe_dsa_fast_prefill_matches_quantized_cache_fallback(self):
         from mlx_lm.models import glm_moe_dsa
 

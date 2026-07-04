@@ -518,11 +518,45 @@ Treat this as an experimental measurement knob until full-prompt profiles show
 a stable win on the target prompt length. Initial synthetic sweeps at
 512x8192/topk2048 and 2048x16384/topk2048 still favored the default `bk256`
 tile.
+
+For ds4-style routed-expert locality analysis, use `--expert-profile` or set
+`MLX_LM_GLM_DSA_EXPERT_PROFILE=1`. This forces synchronization of the GLM MoE
+router outputs and records the selected expert IDs plus route weights by layer.
+The summary includes top experts, adjacent-token overlap/Jaccard, and simulated
+LRU hit rates for cache sizes 1, 2, 4, 8, 16, 32, 64, 128, and 256. It is meant
+for measurement and hotlist design, not normal serving. Add
+`--expert-hotlist-output /path/glm52-{case}.hotlist` to write a ds4-style
+`layer expert hits weight` file for each benchmark case.
+
+Compare that output with ds4's generated GLM-5.2 hotlist using:
+
+```sh
+python benchmarks/glm52_expert_hotlist_compare.py \
+  --left /path/glm52-synthetic-8192.hotlist \
+  --right /Volumes/USB-SSD-2/ds4/ds4_streaming_hotlist_glm52.inc \
+  --left-label mlx \
+  --right-label ds4 \
+  --json-output /path/glm52-hotlist-compare.json
+```
+
+The comparison table reports top-N pair overlap, directional coverage, Jaccard,
+and mean cross-ranks. Treat it as a measurement aid: a low overlap does not by
+itself prove ds4's hotlist is wrong for MLX, but it tells us the real prompt
+distribution is different enough that a local hotlist should be preferred.
+
 Benchmark rows report:
 
 - `glm_dsa_prefill_profile`
 - `glm_dsa_prefill_profile_isolate`
 - `glm_dsa_prefill_profile_isolate_env`
+- `glm_dsa_expert_profile`
+- `glm_dsa_expert_profile_env`
+- `glm_dsa_expert_profile_records`
+- `glm_dsa_expert_profile_selections`
+- `glm_dsa_expert_hotlist_entries`
+- `glm_dsa_expert_hotlist_top16`
+- `glm_dsa_expert_hotlist_output`
+- `glm_dsa_expert_profile_summary`
 - `glm_dsa_q_projection_seconds`
 - `glm_dsa_q_a_projection_seconds`
 - `glm_dsa_q_a_dense_cache_dequantization_seconds`
