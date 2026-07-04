@@ -347,16 +347,21 @@ speedup.
 `--native-q4-qb-from-q-a enabled` is a shared-layer q_projection structure PoC.
 Shared-indexer layers do not need to return `qr` to the DSA indexer, so this
 route computes a compact q_a RMS scale and feeds q_a plus that scale directly
-into a scaled native q4 q_b kernel. Initial 2K full-model profiling confirmed
-the route hits shared layers and reduces q_a layernorm work to the full-indexer
-layers. A loader-aware scaled-q_b update now applies q_a RMS scaling to the
-loaded tile values without the earlier extra threadgroup barrier. On the 2K
-same-build check, the shared-layer route improved from about 1.24s to about
-1.09s q_projection; the separate `bn64` scaled-heads tile then measured about
-1.03s q_projection. The materialized-`qr` baseline still measured about 0.97s
-q_projection and lower TTFT. The scaled-heads tile can now default to `bn64`
-independently from regular q_b's `bm64`, so this remains a kernel-structure
-probe rather than a recommended setting.
+into a native q4 q_b kernel. `MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL` or
+`--native-q4-qb-from-q-a-kernel` selects that projection kernel: unset/default
+preserves the older `scaled` path, `wscaled` applies norm weights to the loaded
+W tile and row scales at the accumulator/store side, and `auto` tries `wscaled`
+before `scaled`. Initial 2K full-model profiling confirmed the route hits
+shared layers and reduces q_a layernorm work to the full-indexer layers. A
+loader-aware scaled-q_b update now applies q_a RMS scaling to the loaded tile
+values without the earlier extra threadgroup barrier. On the 2K same-build
+check, the shared-layer route improved from about 1.24s to about 1.09s
+q_projection; the separate `bn64` scaled-heads tile then measured about 1.03s.
+In the latest same-build 2K check, the materialized-`qr` baseline measured about
+0.975s q_projection and 13.49s total prefill, `scaled` measured about 1.006s and
+13.69s, and `wscaled` measured about 0.991s and 13.58s. `wscaled` is a modest
+kernel-structure improvement over `scaled`, but the materialized baseline is
+still ahead, so this remains a probe rather than a recommended setting.
 
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16
@@ -408,8 +413,12 @@ Benchmark rows report:
 - `glm_dsa_native_q4_qb_head_layout_import_error`
 - `glm_dsa_native_q4_qb_from_q_a`
 - `glm_dsa_native_q4_qb_from_q_a_env`
+- `glm_dsa_native_q4_qb_from_q_a_kernel`
+- `glm_dsa_native_q4_qb_from_q_a_kernel_env`
 - `glm_dsa_native_q4_qb_from_q_a_available`
 - `glm_dsa_native_q4_qb_from_q_a_rms_scale_source`
+- `glm_dsa_native_q4_qb_from_q_a_projection_source`
+- `glm_dsa_native_q4_qb_from_q_a_wscaled_heads_source`
 - `glm_dsa_native_q4_qb_from_q_a_scaled_heads_source`
 - `glm_dsa_native_q4_qb_from_q_a_import_error`
 - `glm_dsa_native_q4_qb_hits`

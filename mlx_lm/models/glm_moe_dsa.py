@@ -61,6 +61,9 @@ GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV = (
     "MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT"
 )
 GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A"
+GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL"
+)
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
 
@@ -135,6 +138,10 @@ _NATIVE_Q4_QB_SCALED_HEADS_LOOKUP_DONE = False
 _NATIVE_Q4_QB_SCALED_HEADS_KERNEL = None
 _NATIVE_Q4_QB_SCALED_HEADS_SOURCE = None
 _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR = None
+_NATIVE_Q4_QB_WSCALED_HEADS_LOOKUP_DONE = False
+_NATIVE_Q4_QB_WSCALED_HEADS_KERNEL = None
+_NATIVE_Q4_QB_WSCALED_HEADS_SOURCE = None
+_NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -190,6 +197,18 @@ def _native_q4_qb_head_layout_enabled() -> bool:
 
 def _native_q4_qb_from_q_a_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV, False)
+
+
+def _native_q4_qb_from_q_a_kernel_preference() -> str:
+    value = os.environ.get(
+        GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
+        "scaled",
+    ).strip().lower()
+    if value in ("", "default"):
+        return "scaled"
+    if value in ("scaled", "wscaled", "auto"):
+        return value
+    return "scaled"
 
 
 def _prefill_profile_enabled() -> bool:
@@ -484,7 +503,7 @@ def _record_native_q4_qb_from_q_a_decision(used: bool, reason: str):
         if used:
             _LOGGER.info(
                 "GLM DSA native q4 q_b from q_a enabled: source=%s",
-                _NATIVE_Q4_QB_SCALED_HEADS_SOURCE or "unknown",
+                _native_q4_qb_from_q_a_projection_source() or "unknown",
             )
         else:
             _LOGGER.info("GLM DSA native q4 q_b from q_a fallback: %s", reason)
@@ -884,6 +903,68 @@ def _native_q4_qb_scaled_heads_kernel():
     return _NATIVE_Q4_QB_SCALED_HEADS_KERNEL
 
 
+def _native_q4_qb_wscaled_heads_kernel():
+    global _NATIVE_Q4_QB_WSCALED_HEADS_LOOKUP_DONE
+    global _NATIVE_Q4_QB_WSCALED_HEADS_KERNEL
+    global _NATIVE_Q4_QB_WSCALED_HEADS_SOURCE
+    global _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR
+    if _NATIVE_Q4_QB_WSCALED_HEADS_LOOKUP_DONE:
+        return _NATIVE_Q4_QB_WSCALED_HEADS_KERNEL
+
+    _NATIVE_Q4_QB_WSCALED_HEADS_LOOKUP_DONE = True
+    _NATIVE_Q4_QB_WSCALED_HEADS_KERNEL = None
+    _NATIVE_Q4_QB_WSCALED_HEADS_SOURCE = None
+    _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qb_proj_wscaled_heads")
+                and hasattr(fast, "glm_dsa_q4_qb_proj_wscaled_heads")
+            ):
+                _NATIVE_Q4_QB_WSCALED_HEADS_KERNEL = (
+                    fast.glm_dsa_q4_qb_proj_wscaled_heads
+                )
+                _NATIVE_Q4_QB_WSCALED_HEADS_SOURCE = module_name
+                return _NATIVE_Q4_QB_WSCALED_HEADS_KERNEL
+            if _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR is None:
+                _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR = exc
+
+    return _NATIVE_Q4_QB_WSCALED_HEADS_KERNEL
+
+
+def _native_q4_qb_from_q_a_projection_kernel():
+    preference = _native_q4_qb_from_q_a_kernel_preference()
+    if preference == "wscaled":
+        return _native_q4_qb_wscaled_heads_kernel()
+    if preference == "auto":
+        return _native_q4_qb_wscaled_heads_kernel() or _native_q4_qb_scaled_heads_kernel()
+    return _native_q4_qb_scaled_heads_kernel()
+
+
+def _native_q4_qb_from_q_a_projection_source():
+    preference = _native_q4_qb_from_q_a_kernel_preference()
+    if preference == "wscaled":
+        return _NATIVE_Q4_QB_WSCALED_HEADS_SOURCE
+    if preference == "auto":
+        return (
+            _NATIVE_Q4_QB_WSCALED_HEADS_SOURCE
+            or _NATIVE_Q4_QB_SCALED_HEADS_SOURCE
+        )
+    return _NATIVE_Q4_QB_SCALED_HEADS_SOURCE
+
+
 def _native_q4_qa_kernel():
     global _NATIVE_Q4_QA_LOOKUP_DONE
     global _NATIVE_Q4_QA_KERNEL
@@ -1110,7 +1191,21 @@ def get_glm_dsa_native_q4_qb_status():
     kernel = _native_q4_qb_kernel()
     heads_kernel = _native_q4_qb_heads_kernel()
     rms_scale_kernel = _native_q_a_rms_scale_kernel()
+    wscaled_heads_kernel = _native_q4_qb_wscaled_heads_kernel()
     scaled_heads_kernel = _native_q4_qb_scaled_heads_kernel()
+    from_q_a_kernel = _native_q4_qb_from_q_a_projection_kernel()
+    from_q_a_kernel_preference = _native_q4_qb_from_q_a_kernel_preference()
+    from_q_a_import_error = _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR
+    if from_q_a_import_error is None and from_q_a_kernel is None:
+        if from_q_a_kernel_preference == "wscaled":
+            from_q_a_import_error = _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR
+        elif from_q_a_kernel_preference == "auto":
+            from_q_a_import_error = (
+                _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR
+                or _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR
+            )
+        else:
+            from_q_a_import_error = _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR
     return {
         "enabled": _native_q4_qb_enabled(),
         "available": kernel is not None,
@@ -1129,20 +1224,15 @@ def get_glm_dsa_native_q4_qb_status():
             else None
         ),
         "from_q_a_enabled": _native_q4_qb_from_q_a_enabled(),
-        "from_q_a_available": (
-            rms_scale_kernel is not None and scaled_heads_kernel is not None
-        ),
+        "from_q_a_kernel": from_q_a_kernel_preference,
+        "from_q_a_available": (rms_scale_kernel is not None and from_q_a_kernel is not None),
         "from_q_a_rms_scale_source": _NATIVE_Q_A_RMS_SCALE_SOURCE,
+        "from_q_a_projection_source": _native_q4_qb_from_q_a_projection_source(),
+        "from_q_a_wscaled_heads_source": _NATIVE_Q4_QB_WSCALED_HEADS_SOURCE,
         "from_q_a_scaled_heads_source": _NATIVE_Q4_QB_SCALED_HEADS_SOURCE,
         "from_q_a_import_error": (
-            repr(
-                _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR
-                or _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR
-            )
-            if (
-                _NATIVE_Q_A_RMS_SCALE_IMPORT_ERROR is not None
-                or _NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR is not None
-            )
+            repr(from_q_a_import_error)
+            if from_q_a_import_error is not None
             else None
         ),
     }
@@ -2140,7 +2230,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "full_indexer_requires_qr"
         if _native_q_a_rms_scale_kernel() is None:
             return False, "missing_rms_scale_symbol"
-        if _native_q4_qb_scaled_heads_kernel() is None:
+        if _native_q4_qb_from_q_a_projection_kernel() is None:
+            if _native_q4_qb_from_q_a_kernel_preference() == "wscaled":
+                return False, "missing_wscaled_qb_symbol"
             return False, "missing_scaled_qb_symbol"
         use_native_qb, reason = self._native_q4_qb_decision(x)
         if not use_native_qb:
@@ -2157,7 +2249,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if use_native:
             try:
                 scale_kernel = _native_q_a_rms_scale_kernel()
-                q_b_kernel = _native_q4_qb_scaled_heads_kernel()
+                q_b_kernel = _native_q4_qb_from_q_a_projection_kernel()
                 row_scales = _profile_stage(
                     "native_q_a_rms_scale",
                     lambda: scale_kernel(

@@ -24,6 +24,7 @@ from mlx_lm.custom_kernels.glm_moe_dsa.fast import (
     glm_dsa_q4_qb_proj_flat,
     glm_dsa_q4_qb_proj_heads,
     glm_dsa_q4_qb_proj_scaled_heads,
+    glm_dsa_q4_qb_proj_wscaled_heads,
 )
 
 
@@ -318,6 +319,35 @@ def main() -> None:
                     "tile": tile,
                     **summarize_times(scaled_head_times),
                     **diff_stats(smoke_scaled_heads, reference_scaled_heads),
+                }
+            )
+            smoke_wscaled_heads = glm_dsa_q4_qb_proj_wscaled_heads(
+                smoke_x,
+                norm_weight,
+                smoke_row_scales,
+                weight,
+                scales,
+                biases,
+            )
+            synchronize(smoke_wscaled_heads)
+            wscaled_head_times = seconds_for(
+                lambda: glm_dsa_q4_qb_proj_wscaled_heads(
+                    x,
+                    norm_weight,
+                    row_scales,
+                    weight,
+                    scales,
+                    biases,
+                ),
+                warmup_runs=args.warmup_runs,
+                runs=args.runs,
+            )
+            rows.append(
+                {
+                    "name": "native_q4_qb_wscaled_heads",
+                    "tile": tile,
+                    **summarize_times(wscaled_head_times),
+                    **diff_stats(smoke_wscaled_heads, reference_scaled_heads),
                 }
             )
 

@@ -588,6 +588,15 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV] = "1"
     elif native_q4_qb_from_q_a == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV] = "0"
+    native_q4_qb_from_q_a_kernel = getattr(
+        args,
+        "native_q4_qb_from_q_a_kernel",
+        "default",
+    )
+    if native_q4_qb_from_q_a_kernel != "default":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV
+        ] = native_q4_qb_from_q_a_kernel
     if args.fast_prefill_query_chunk is not None:
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
@@ -831,11 +840,24 @@ def collect_glm_dsa_profile(args):
             glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV,
             "default-off",
         ),
+        "glm_dsa_native_q4_qb_from_q_a_kernel": native_q4_qb_status.get(
+            "from_q_a_kernel"
+        ),
+        "glm_dsa_native_q4_qb_from_q_a_kernel_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
+            "default-scaled",
+        ),
         "glm_dsa_native_q4_qb_from_q_a_available": native_q4_qb_status.get(
             "from_q_a_available", False
         ),
         "glm_dsa_native_q4_qb_from_q_a_rms_scale_source": native_q4_qb_status.get(
             "from_q_a_rms_scale_source"
+        ),
+        "glm_dsa_native_q4_qb_from_q_a_projection_source": native_q4_qb_status.get(
+            "from_q_a_projection_source"
+        ),
+        "glm_dsa_native_q4_qb_from_q_a_wscaled_heads_source": native_q4_qb_status.get(
+            "from_q_a_wscaled_heads_source"
         ),
         "glm_dsa_native_q4_qb_from_q_a_scaled_heads_source": native_q4_qb_status.get(
             "from_q_a_scaled_heads_source"
@@ -1999,8 +2021,12 @@ def print_table(rows, output_format):
         "glm_dsa_native_q4_qb_head_layout_import_error",
         "glm_dsa_native_q4_qb_from_q_a",
         "glm_dsa_native_q4_qb_from_q_a_env",
+        "glm_dsa_native_q4_qb_from_q_a_kernel",
+        "glm_dsa_native_q4_qb_from_q_a_kernel_env",
         "glm_dsa_native_q4_qb_from_q_a_available",
         "glm_dsa_native_q4_qb_from_q_a_rms_scale_source",
+        "glm_dsa_native_q4_qb_from_q_a_projection_source",
+        "glm_dsa_native_q4_qb_from_q_a_wscaled_heads_source",
         "glm_dsa_native_q4_qb_from_q_a_scaled_heads_source",
         "glm_dsa_native_q4_qb_from_q_a_import_error",
         "glm_dsa_native_q4_qb_available",
@@ -2882,6 +2908,16 @@ def main():
             "q4 q_b. This requires native q4 q_b to be enabled. The default "
             "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A unchanged; unset "
             "means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qb-from-q-a-kernel",
+        choices=("default", "scaled", "wscaled", "auto"),
+        default="default",
+        help=(
+            "Select the q_b-from-q_a projection kernel. The default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL unchanged; unset "
+            "means scaled."
         ),
     )
     parser.add_argument(

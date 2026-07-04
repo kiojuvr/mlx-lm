@@ -368,16 +368,21 @@ end.
 `--native-q4-qb-from-q-a enabled` is a deeper shared-layer q_projection PoC. It
 skips materializing `qr` on shared-indexer layers by computing a compact q_a
 RMS scale and feeding q_a plus that scale directly into a scaled native q4 q_b
-kernel. Initial 2K profiling confirmed the route works and reduces standalone
-q_a layernorm work to the full-indexer layers. A loader-aware scaled-q_b update
-removes the earlier extra threadgroup barrier and improved the 2K shared-layer
-route from about 1.24s to about 1.09s q_projection; the separate `bn64`
-scaled-heads tile then brought the measured route to about 1.03s q_projection.
-The same-build baseline that materializes `qr` still measured about 0.97s
-q_projection and lower TTFT.
-The scaled-heads tile is now tunable separately from regular q_b so this route
-can use `bn64` without moving the regular q_b default away from `bm64`. Treat
-this as a kernel-structure probe, not a recommended setting.
+kernel. The q_b-from-q_a projection kernel is selectable with
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL` or
+`--native-q4-qb-from-q-a-kernel`; unset/default preserves the older `scaled`
+path, `wscaled` applies norm weights to the loaded W tile and row scales at the
+accumulator/store side, and `auto` tries `wscaled` before `scaled`. Initial 2K
+profiling confirmed the route works and reduces standalone q_a layernorm work
+to the full-indexer layers. A loader-aware scaled-q_b update removed the earlier
+extra threadgroup barrier and improved the 2K shared-layer route from about
+1.24s to about 1.09s q_projection; the separate `bn64` scaled-heads tile then
+brought the route to about 1.03s q_projection. In the latest same-build 2K
+check, the materialized-`qr` baseline measured about 0.975s q_projection and
+13.49s total prefill, `scaled` measured about 1.006s and 13.69s, and `wscaled`
+measured about 0.991s and 13.58s. `wscaled` is a useful kernel-structure step,
+but the materialized baseline is still ahead, so this remains a probe rather
+than a recommended setting.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

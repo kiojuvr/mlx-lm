@@ -1197,6 +1197,7 @@ class TestModels(unittest.TestCase):
         env_keys = [
             glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
             glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
         ]
         saved_env = {key: os.environ.get(key) for key in env_keys}
         native_state = (
@@ -1212,10 +1213,17 @@ class TestModels(unittest.TestCase):
             glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_KERNEL,
             glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_SOURCE,
             glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR,
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_KERNEL,
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_SOURCE,
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR,
         )
         try:
             os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
             os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV] = (
+                "wscaled"
+            )
             norm = nn.RMSNorm(2048, eps=1e-6)
             norm.update({"weight": norm["weight"].astype(mx.float16)})
             projection = nn.QuantizedLinear(
@@ -1268,6 +1276,10 @@ class TestModels(unittest.TestCase):
             glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_KERNEL = fake_scaled_heads
             glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_SOURCE = "test"
             glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR = None
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_KERNEL = fake_scaled_heads
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_SOURCE = "test-wscaled"
+            glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR = None
 
             fake_attention = type("FakeAttention", (), {})()
             fake_attention.skip_topk = True
@@ -1319,6 +1331,10 @@ class TestModels(unittest.TestCase):
                 glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_KERNEL,
                 glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_SOURCE,
                 glm_moe_dsa._NATIVE_Q4_QB_SCALED_HEADS_IMPORT_ERROR,
+                glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_KERNEL,
+                glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_SOURCE,
+                glm_moe_dsa._NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR,
             ) = native_state
             self._restore_env(saved_env)
 
