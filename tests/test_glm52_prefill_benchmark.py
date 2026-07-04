@@ -34,7 +34,11 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "total_prompt_tokens=8192 prefill_step_size=2048 "
                     "adaptive_prefill_step_size=8192 "
                     "effective_prefill_step_size=2048 "
-                    "prefill_max_qk_tokens=67108864 chunk_seconds=1.000000"
+                    "prefill_max_qk_tokens=67108864 chunk_seconds=1.000000 "
+                    "glm_dsa_native_sparse_prefill_hits=78 "
+                    "glm_dsa_native_indexer_hits=21 "
+                    "glm_dsa_native_sparse_attention_seconds=0.500000 "
+                    "glm_dsa_native_indexer_scores_seconds=0.125000"
                 ),
             ]
         )
@@ -59,6 +63,25 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(summary["checkpoint_prefill_chunks"], 1)
         self.assertEqual(summary["checkpoint_max_adaptive_prefill_step_size"], 8192)
         self.assertEqual(summary["checkpoint_max_effective_prefill_step_size"], 2048)
+        self.assertEqual(summary["checkpoint_prefill_chunk_seconds_total"], 1.0)
+        self.assertEqual(summary["checkpoint_max_prefill_chunk_seconds"], 1.0)
+        self.assertEqual(summary["checkpoint_slowest_prefill_chunk_start_tokens"], 6144)
+        self.assertEqual(summary["checkpoint_slowest_prefill_chunk_tokens"], 2048)
+        self.assertEqual(
+            summary["checkpoint_slowest_prefill_chunk_route"],
+            "native_sparse",
+        )
+        self.assertEqual(summary["checkpoint_native_sparse_prefill_chunks"], 1)
+        self.assertEqual(summary["checkpoint_fast_sparse_prefill_chunks"], 0)
+        self.assertEqual(summary["checkpoint_dense_prefill_chunks"], 0)
+        self.assertEqual(summary["checkpoint_native_indexer_chunks"], 1)
+        self.assertEqual(len(summary["checkpoint_prefill_chunk_summaries"]), 1)
+        chunk = summary["checkpoint_prefill_chunk_summaries"][0]
+        self.assertEqual(chunk["route"], "native_sparse")
+        self.assertEqual(chunk["native_sparse_prefill_hits"], 78)
+        self.assertEqual(chunk["native_indexer_hits"], 21)
+        self.assertEqual(chunk["native_sparse_attention_seconds"], 0.5)
+        self.assertEqual(chunk["native_indexer_scores_seconds"], 0.125)
 
     def test_format_output_cell_serializes_compound_values(self):
         self.assertEqual(benchmark.format_output_cell({"decode": 156}), '{"decode":156}')
@@ -482,6 +505,584 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["partial_prefill_total_tokens"], 10)
         self.assertEqual(row["prefill_stop_after_tokens"], 6)
         self.assertGreater(row["prompt_tps"], 0)
+
+    def test_collect_profile_reports_native_sparse_prefill_status(self):
+        old_profile = benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile
+        old_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+        old_indexer_status = (
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
+        )
+        old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q4_vup_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status
+        old_q4_qa_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status
+        old_q4_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status
+
+        def fake_profile():
+            return {
+                "stages": {},
+                "fast_prefill_hits": 3,
+                "fallback_reasons": {"below_sparse_min_context": 1},
+                "native_sparse_prefill_hits": 2,
+                "native_sparse_prefill_fallback_reasons": {"quantized_kv": 1},
+                "native_indexer_hits": 5,
+                "native_indexer_fallback_reasons": {
+                    "below_native_indexer_min_context": 1
+                },
+                "native_q8_vup_hits": 4,
+                "native_q8_vup_fallback_reasons": {"unsupported_heads:1": 1},
+                "native_q4_vup_hits": 9,
+                "native_q4_vup_fallback_reasons": {"disabled": 1},
+                "q_a_dense_cache_hits": 8,
+                "q_a_dense_cache_builds": 2,
+                "q_a_dense_cache_fallback_reasons": {"disabled": 1},
+                "native_q4_qa_hits": 7,
+                "native_q4_qa_fallback_reasons": {"missing_symbol": 1},
+                "native_q4_qb_hits": 6,
+                "native_q4_qb_fallback_reasons": {"disabled": 1},
+            }
+
+        def fake_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "test",
+                "import_error": None,
+                "min_context": 0,
+            }
+
+        def fake_indexer_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "indexer-test",
+                "import_error": None,
+                "scores_available": True,
+                "topk_available": True,
+                "min_context": 4096,
+            }
+
+        def fake_q8_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q8-test",
+                "import_error": None,
+            }
+
+        def fake_q4_vup_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q4-vup-test",
+                "import_error": None,
+            }
+
+        def fake_q4_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q4-test",
+                "import_error": None,
+            }
+
+        def fake_q4_qa_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q4-qa-test",
+                "import_error": None,
+            }
+
+        args = Namespace(
+            prefill_profile=False,
+            fast_prefill="enabled",
+            native_sparse_prefill="enabled",
+            native_indexer="enabled",
+            native_q8_vup="enabled",
+            native_q4_vup="enabled",
+            q_a_dense_cache="enabled",
+            native_q4_qa="enabled",
+            native_q4_qb="enabled",
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = fake_profile
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = fake_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+            fake_indexer_status
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+            fake_q4_vup_status
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = fake_q4_qa_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = fake_q4_status
+        try:
+            profile = benchmark.collect_glm_dsa_profile(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = old_profile
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = old_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+                old_indexer_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+                old_q4_vup_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = (
+                old_q4_qa_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = old_q4_status
+
+        self.assertEqual(profile["glm_dsa_native_sparse_prefill"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_sparse_prefill_available"])
+        self.assertEqual(profile["glm_dsa_native_sparse_prefill_source"], "test")
+        self.assertEqual(profile["glm_dsa_native_sparse_prefill_hits"], 2)
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_fallback_reasons"],
+            {"quantized_kv": 1},
+        )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_route_state"],
+            "hit_with_fallbacks",
+        )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_primary_fallback"],
+            "quantized_kv",
+        )
+        self.assertIsNone(profile["glm_dsa_native_sparse_prefill_config_blocker"])
+        self.assertEqual(profile["glm_dsa_native_indexer"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_indexer_available"])
+        self.assertEqual(profile["glm_dsa_native_indexer_source"], "indexer-test")
+        self.assertEqual(profile["glm_dsa_native_indexer_hits"], 5)
+        self.assertEqual(
+            profile["glm_dsa_native_indexer_fallback_reasons"],
+            {"below_native_indexer_min_context": 1},
+        )
+        self.assertEqual(profile["glm_dsa_native_q8_vup"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_q8_vup_available"])
+        self.assertEqual(profile["glm_dsa_native_q8_vup_source"], "q8-test")
+        self.assertEqual(profile["glm_dsa_native_q8_vup_hits"], 4)
+        self.assertEqual(
+            profile["glm_dsa_native_q8_vup_fallback_reasons"],
+            {"unsupported_heads:1": 1},
+        )
+        self.assertEqual(profile["glm_dsa_native_q4_vup"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_q4_vup_available"])
+        self.assertEqual(profile["glm_dsa_native_q4_vup_source"], "q4-vup-test")
+        self.assertEqual(profile["glm_dsa_native_q4_vup_hits"], 9)
+        self.assertEqual(
+            profile["glm_dsa_native_q4_vup_fallback_reasons"],
+            {"disabled": 1},
+        )
+        self.assertEqual(profile["glm_dsa_q_a_dense_cache"], "enabled")
+        self.assertEqual(profile["glm_dsa_q_a_dense_cache_hits"], 8)
+        self.assertEqual(profile["glm_dsa_q_a_dense_cache_builds"], 2)
+        self.assertEqual(
+            profile["glm_dsa_q_a_dense_cache_fallback_reasons"],
+            {"disabled": 1},
+        )
+        self.assertEqual(profile["glm_dsa_native_q4_qa"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_q4_qa_available"])
+        self.assertEqual(profile["glm_dsa_native_q4_qa_source"], "q4-qa-test")
+        self.assertEqual(profile["glm_dsa_native_q4_qa_hits"], 7)
+        self.assertEqual(
+            profile["glm_dsa_native_q4_qa_fallback_reasons"],
+            {"missing_symbol": 1},
+        )
+        self.assertEqual(profile["glm_dsa_native_q4_qb"], "enabled")
+        self.assertTrue(profile["glm_dsa_native_q4_qb_available"])
+        self.assertEqual(profile["glm_dsa_native_q4_qb_source"], "q4-test")
+        self.assertEqual(profile["glm_dsa_native_q4_qb_hits"], 6)
+        self.assertEqual(
+            profile["glm_dsa_native_q4_qb_fallback_reasons"],
+            {"disabled": 1},
+        )
+
+    def test_collect_profile_reports_quantized_native_route_blocker(self):
+        old_profile = benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile
+        old_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+        old_indexer_status = (
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
+        )
+        old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q4_vup_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status
+        old_q4_qa_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status
+        old_q4_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status
+        env_key = benchmark.glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+        quantized_env_key = (
+            benchmark.glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        )
+        old_env = os.environ.get(env_key)
+        old_quantized_env = os.environ.get(quantized_env_key)
+
+        def fake_profile():
+            return {
+                "stages": {},
+                "fast_prefill_hits": 0,
+                "fallback_reasons": {},
+                "native_sparse_prefill_hits": 0,
+                "native_sparse_prefill_fallback_reasons": {},
+                "native_indexer_hits": 0,
+                "native_indexer_fallback_reasons": {},
+                "native_q8_vup_hits": 0,
+                "native_q8_vup_fallback_reasons": {},
+                "native_q4_vup_hits": 0,
+                "native_q4_vup_fallback_reasons": {},
+                "q_a_dense_cache_hits": 0,
+                "q_a_dense_cache_builds": 0,
+                "q_a_dense_cache_fallback_reasons": {},
+                "native_q4_qa_hits": 0,
+                "native_q4_qa_fallback_reasons": {},
+                "native_q4_qb_hits": 0,
+                "native_q4_qb_fallback_reasons": {},
+            }
+
+        def fake_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "mlx_lm.custom_kernels.glm_moe_dsa",
+                "import_error": None,
+                "min_context": 8192,
+            }
+
+        def fake_indexer_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "indexer-test",
+                "import_error": None,
+                "scores_available": True,
+                "topk_available": True,
+                "min_context": 4096,
+            }
+
+        def fake_q8_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q8-test",
+                "import_error": None,
+            }
+
+        def fake_q4_vup_status():
+            return {
+                "enabled": False,
+                "available": True,
+                "source": "q4-vup-test",
+                "import_error": None,
+            }
+
+        def fake_q4_status():
+            return {
+                "enabled": False,
+                "available": True,
+                "source": "q4-test",
+                "import_error": None,
+            }
+
+        def fake_q4_qa_status():
+            return {
+                "enabled": False,
+                "available": True,
+                "source": "q4-qa-test",
+                "import_error": None,
+            }
+
+        args = Namespace(
+            prefill_profile=False,
+            fast_prefill="enabled",
+            native_sparse_prefill="enabled",
+            native_indexer="enabled",
+            native_q8_vup="enabled",
+            native_q4_vup="default",
+            q_a_dense_cache="default",
+            native_q4_qa="default",
+            native_q4_qb="default",
+            mode="single",
+            batch_size=1,
+            kv_bits=8,
+            quantized_kv_start=4096,
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = fake_profile
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = fake_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+            fake_indexer_status
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+            fake_q4_vup_status
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = fake_q4_qa_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = fake_q4_status
+        os.environ.pop(env_key, None)
+        os.environ.pop(quantized_env_key, None)
+        try:
+            profile = benchmark.collect_glm_dsa_profile(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_prefill_profile = old_profile
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = old_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+                old_indexer_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_vup_status = (
+                old_q4_vup_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qa_status = (
+                old_q4_qa_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q4_qb_status = old_q4_status
+            if old_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_env
+            if old_quantized_env is None:
+                os.environ.pop(quantized_env_key, None)
+            else:
+                os.environ[quantized_env_key] = old_quantized_env
+
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_route_state"],
+            "not_attempted",
+        )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_config_blocker"],
+            "quantized_kv_at_native_threshold",
+        )
+        self.assertEqual(
+            profile["glm_dsa_native_sparse_prefill_attempt_min_context"],
+            8192,
+        )
+
+    def test_native_sparse_config_blocker_allows_quantized_kv_opt_in(self):
+        env_key = (
+            benchmark.glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        )
+        old_env = os.environ.get(env_key)
+        args = Namespace(
+            fast_prefill="enabled",
+            native_sparse_prefill="enabled",
+            mode="single",
+            batch_size=1,
+            kv_bits=8,
+            quantized_kv_start=4096,
+        )
+        native_status = {
+            "enabled": True,
+            "available": True,
+            "min_context": 8192,
+        }
+
+        os.environ[env_key] = "1"
+        try:
+            blocker = benchmark.native_sparse_prefill_config_blocker(
+                args,
+                native_status,
+            )
+        finally:
+            if old_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_env
+
+        self.assertIsNone(blocker)
+
+    def test_prefill_config_summary_reports_kv_quantization_settings(self):
+        args = Namespace(
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=4096,
+            prefill_step_size=1024,
+            prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_size=0,
+            glm_dsa_adaptive_prefill_after_tokens=0,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=0,
+        )
+
+        summary = benchmark.prefill_config_summary(args)
+
+        self.assertEqual(summary["kv_bits"], 8)
+        self.assertEqual(summary["kv_group_size"], 64)
+        self.assertEqual(summary["quantized_kv_start"], 4096)
+
+    def test_native_kernel_smoke_reports_unavailable_status(self):
+        old_status = benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+        old_indexer_status = (
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
+        )
+
+        def fake_status():
+            return {
+                "enabled": True,
+                "available": False,
+                "source": None,
+                "import_error": "ImportError('missing')",
+                "min_context": 8192,
+            }
+
+        def fake_indexer_status():
+            return {
+                "enabled": True,
+                "available": False,
+                "source": None,
+                "import_error": "ImportError('missing indexer')",
+                "scores_available": False,
+                "topk_available": False,
+                "min_context": 4096,
+            }
+
+        args = Namespace(
+            native_sparse_prefill="default",
+            native_smoke_q_len=2,
+            native_smoke_k_len=32,
+            native_smoke_seed=7,
+            native_smoke_max_diff=0.02,
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = fake_status
+        benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+            fake_indexer_status
+        )
+        try:
+            row = benchmark.run_native_kernel_smoke(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = old_status
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+                old_indexer_status
+            )
+
+        self.assertFalse(row["native_smoke_available"])
+        self.assertFalse(row["native_smoke_passed"])
+        self.assertEqual(row["native_smoke_import_error"], "ImportError('missing')")
+        self.assertEqual(
+            row["native_smoke_error"],
+            "native sparse MLA kernel unavailable",
+        )
+        self.assertEqual(row["glm_dsa_native_sparse_prefill_min_context"], 8192)
+        self.assertFalse(row["native_indexer_smoke_available"])
+        self.assertEqual(
+            row["native_indexer_smoke_error"],
+            "native DSA indexer kernels unavailable",
+        )
+
+    def test_native_q8_vup_smoke_benchmark_reports_timings(self):
+        old_sparse_status = (
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status
+        )
+        old_indexer_status = (
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status
+        )
+        old_q8_status = benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status
+        old_q8_kernel = benchmark._native_q8_vup_smoke_kernel
+
+        def fake_sparse_status():
+            return {
+                "enabled": True,
+                "available": False,
+                "source": None,
+                "import_error": "missing",
+                "min_context": 8192,
+            }
+
+        def fake_indexer_status():
+            return {
+                "enabled": True,
+                "available": False,
+                "source": None,
+                "import_error": "missing-indexer",
+                "scores_available": False,
+                "topk_available": False,
+                "min_context": 4096,
+            }
+
+        def fake_q8_status():
+            return {
+                "enabled": True,
+                "available": True,
+                "source": "q8-test",
+                "import_error": None,
+            }
+
+        def fake_q8_kernel(_source):
+            def kernel(x, q_weight, scales, biases):
+                return benchmark._native_q8_vup_reference(
+                    x,
+                    q_weight,
+                    scales,
+                    biases,
+                )
+
+            return kernel
+
+        args = Namespace(
+            native_sparse_prefill="default",
+            native_smoke_q_len=2,
+            native_smoke_k_len=32,
+            native_smoke_seed=7,
+            native_smoke_max_diff=0.02,
+            native_smoke_benchmark_runs=1,
+            native_smoke_benchmark_warmup_runs=0,
+            native_q8_vup_benchmark_q_len=2,
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = (
+            fake_sparse_status
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+            fake_indexer_status
+        )
+        benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = fake_q8_status
+        benchmark._native_q8_vup_smoke_kernel = fake_q8_kernel
+        try:
+            row = benchmark.run_native_kernel_smoke(args)
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status = (
+                old_sparse_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_indexer_status = (
+                old_indexer_status
+            )
+            benchmark.glm_moe_dsa.get_glm_dsa_native_q8_vup_status = old_q8_status
+            benchmark._native_q8_vup_smoke_kernel = old_q8_kernel
+
+        self.assertTrue(row["native_q8_vup_smoke_passed"])
+        self.assertEqual(row["native_q8_vup_benchmark_runs"], 1)
+        self.assertEqual(row["native_q8_vup_benchmark_q_len"], 2)
+        self.assertIsNone(row["native_q8_vup_benchmark_error"])
+        self.assertGreater(row["native_q8_vup_native_seconds_mean"], 0)
+        self.assertGreater(row["native_q8_vup_reference_seconds_mean"], 0)
+        self.assertIsNotNone(row["native_q8_vup_speedup_mean"])
+
+    def test_main_native_smoke_does_not_load_model(self):
+        old_argv = sys.argv
+        old_load = benchmark.load
+        old_run_native_kernel_smoke = benchmark.run_native_kernel_smoke
+        calls = []
+
+        def fake_load(*_args, **_kwargs):
+            raise AssertionError("native-smoke should not load a model")
+
+        def fake_run_native_kernel_smoke(args):
+            calls.append(args.model)
+            return {
+                "case": "native-smoke",
+                "mode": "native-smoke",
+                "native_smoke_passed": True,
+            }
+
+        sys.argv = ["glm52_prefill_benchmark.py", "--mode", "native-smoke"]
+        benchmark.load = fake_load
+        benchmark.run_native_kernel_smoke = fake_run_native_kernel_smoke
+        try:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                benchmark.main()
+        finally:
+            sys.argv = old_argv
+            benchmark.load = old_load
+            benchmark.run_native_kernel_smoke = old_run_native_kernel_smoke
+
+        self.assertEqual(calls, [""])
+        self.assertIn("native_smoke_passed", stdout.getvalue())
+        self.assertIn("True", stdout.getvalue())
 
     def test_policy_sweep_runs_isolated_candidates(self):
         args = Namespace(

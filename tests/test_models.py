@@ -504,6 +504,678 @@ class TestModels(unittest.TestCase):
         finally:
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_native_sparse_prefill_missing_symbol_falls_back(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        prefix = mx.array([[1, 2, 3, 4]])
+        suffix = mx.array([[5, 6, 7, 8]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL = None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE = None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR = RuntimeError("missing")
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            cache = make_prompt_cache(model)
+            model(prefix, cache=cache)
+            logits = model(suffix, cache=cache)
+            mx.eval(logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertGreater(profile["fast_prefill_hits"], 0)
+            self.assertEqual(profile["native_sparse_prefill_hits"], 0)
+            self.assertGreater(
+                profile["native_sparse_prefill_fallback_reasons"].get(
+                    "missing_symbol", 0
+                ),
+                0,
+            )
+            self.assertTrue(mx.all(mx.isfinite(logits)).item())
+        finally:
+            (
+                glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_sparse_prefill_quantized_kv_guard(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV
+            ] = "0"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL = lambda *args, **kwargs: None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE = "test"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {"num_heads": 64})()
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
+                fake_attention,
+                B=1,
+                L=2,
+                kv_cache=QuantizedGlmMlaKVCache(),
+                kv_latent=(),
+                k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+            )
+
+            self.assertFalse(ready)
+            self.assertEqual(reason, "quantized_kv")
+        finally:
+            (
+                glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_sparse_prefill_quantized_kv_opt_in(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV
+            ] = "0"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+            ] = "1"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV
+            ] = "4096"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL = lambda *args, **kwargs: None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE = "test"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {"num_heads": 64})()
+            ready, reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
+                    fake_attention,
+                    B=1,
+                    L=2,
+                    kv_cache=QuantizedGlmMlaKVCache(),
+                    kv_latent=(
+                        mx.zeros((1, 1, 2048, 64), dtype=mx.uint32),
+                        mx.zeros((1, 1, 2048, 8), dtype=mx.float16),
+                        mx.zeros((1, 1, 2048, 8), dtype=mx.float16),
+                    ),
+                    k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                    topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+                )
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(reason, "native_sparse_mla_quantized_kv")
+        finally:
+            (
+                glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_sparse_prefill_uses_native_min_context(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV
+            ] = "16"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "32768"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL = lambda *args, **kwargs: None
+            glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE = "test"
+            glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {"num_heads": 64})()
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
+                fake_attention,
+                B=1,
+                L=2,
+                kv_cache=GlmMlaKVCache(),
+                kv_latent=mx.zeros((1, 1, 2048, 512), dtype=mx.float16),
+                k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(reason, "native_sparse_mla")
+        finally:
+            (
+                glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_KERNEL,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_SOURCE,
+                glm_moe_dsa._NATIVE_SPARSE_MLA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_indexer_decision_uses_real_shape(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        old_available = glm_moe_dsa._native_indexer_available
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "1"
+            glm_moe_dsa._native_indexer_available = lambda: True
+
+            fake_attention = type(
+                "FakeAttention",
+                (),
+                {"indexer": type("FakeIndexer", (), {"index_topk": 2048})()},
+            )()
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._native_indexer_decision(
+                fake_attention,
+                q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
+                x=mx.zeros((1, 64, 4096), dtype=mx.float16),
+                k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
+                mask=mx.ones((64, 4096), dtype=mx.bool_),
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(reason, "native_indexer")
+        finally:
+            glm_moe_dsa._native_indexer_available = old_available
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_indexer_decision_respects_master_switch(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        old_available = glm_moe_dsa._native_indexer_available
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "1"
+            glm_moe_dsa._native_indexer_available = lambda: True
+
+            fake_attention = type(
+                "FakeAttention",
+                (),
+                {"indexer": type("FakeIndexer", (), {"index_topk": 2048})()},
+            )()
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._native_indexer_decision(
+                fake_attention,
+                q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
+                x=mx.zeros((1, 64, 4096), dtype=mx.float16),
+                k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
+                mask=mx.ones((64, 4096), dtype=mx.bool_),
+            )
+
+            self.assertFalse(ready)
+            self.assertEqual(reason, "fast_prefill_disabled")
+        finally:
+            glm_moe_dsa._native_indexer_available = old_available
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_q4_vup_projection_matches_fallback(self):
+        from mlx_lm.models import glm_moe_dsa
+        from mlx_lm.models.mla import QuantizedMultiLinear
+
+        env_keys = [glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_Q4_VUP_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q4_VUP_KERNEL,
+            glm_moe_dsa._NATIVE_Q4_VUP_SOURCE,
+            glm_moe_dsa._NATIVE_Q4_VUP_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV] = "1"
+            projection = QuantizedMultiLinear(
+                input_dims=512,
+                output_dims=256,
+                num_heads=64,
+                group_size=64,
+                bits=4,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            def fake_q4_vup(x, weight, scales, biases):
+                output = mx.quantized_matmul(
+                    x,
+                    weight,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=64,
+                    bits=4,
+                    mode="affine",
+                )
+                B, H, L, V = output.shape
+                return output.transpose(0, 2, 1, 3).reshape(B, L, H * V)
+
+            glm_moe_dsa._NATIVE_Q4_VUP_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q4_VUP_KERNEL = fake_q4_vup
+            glm_moe_dsa._NATIVE_Q4_VUP_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q4_VUP_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.unembed_out = projection
+            fake_attention._native_q4_vup_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_vup_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 64, 2, 512), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            output = glm_moe_dsa.GlmMoeDsaAttention._unembed_out_project(
+                fake_attention,
+                x,
+            )
+            expected = projection(x)
+            mx.eval(output, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["native_q4_vup_hits"], 1)
+            self.assertTrue(mx.allclose(output, expected, rtol=1e-4, atol=1e-4))
+        finally:
+            (
+                glm_moe_dsa._NATIVE_Q4_VUP_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q4_VUP_KERNEL,
+                glm_moe_dsa._NATIVE_Q4_VUP_SOURCE,
+                glm_moe_dsa._NATIVE_Q4_VUP_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_q8_vup_projection_matches_fallback(self):
+        from mlx_lm.models import glm_moe_dsa
+        from mlx_lm.models.mla import QuantizedMultiLinear
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_Q8_VUP_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q8_VUP_KERNEL,
+            glm_moe_dsa._NATIVE_Q8_VUP_SOURCE,
+            glm_moe_dsa._NATIVE_Q8_VUP_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV] = "0"
+            projection = QuantizedMultiLinear(
+                input_dims=512,
+                output_dims=256,
+                num_heads=64,
+                group_size=64,
+                bits=8,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            def fake_q8_vup(x, weight, scales, biases):
+                output = mx.quantized_matmul(
+                    x,
+                    weight,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=64,
+                    bits=8,
+                    mode="affine",
+                )
+                B, H, L, V = output.shape
+                return output.transpose(0, 2, 1, 3).reshape(B, L, H * V)
+
+            glm_moe_dsa._NATIVE_Q8_VUP_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q8_VUP_KERNEL = fake_q8_vup
+            glm_moe_dsa._NATIVE_Q8_VUP_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q8_VUP_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.unembed_out = projection
+            fake_attention._native_q4_vup_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_vup_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            fake_attention._native_q8_vup_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q8_vup_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 64, 2, 512), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            output = glm_moe_dsa.GlmMoeDsaAttention._unembed_out_project(
+                fake_attention,
+                x,
+            )
+            expected = projection(x)
+            mx.eval(output, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["native_q8_vup_hits"], 1)
+            self.assertTrue(mx.allclose(output, expected, rtol=1e-4, atol=1e-4))
+        finally:
+            (
+                glm_moe_dsa._NATIVE_Q8_VUP_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q8_VUP_KERNEL,
+                glm_moe_dsa._NATIVE_Q8_VUP_SOURCE,
+                glm_moe_dsa._NATIVE_Q8_VUP_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_q4_qb_projection_matches_fallback(self):
+        import mlx.nn as nn
+
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_Q4_QB_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q4_QB_KERNEL,
+            glm_moe_dsa._NATIVE_Q4_QB_SOURCE,
+            glm_moe_dsa._NATIVE_Q4_QB_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
+            projection = nn.QuantizedLinear(
+                input_dims=2048,
+                output_dims=64 * 256,
+                bias=False,
+                group_size=64,
+                bits=4,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            def fake_q4_qb(x, weight, scales, biases):
+                return mx.quantized_matmul(
+                    x,
+                    weight,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=64,
+                    bits=4,
+                    mode="affine",
+                )
+
+            glm_moe_dsa._NATIVE_Q4_QB_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q4_QB_KERNEL = fake_q4_qb
+            glm_moe_dsa._NATIVE_Q4_QB_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q4_QB_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.q_b_proj = projection
+            fake_attention.num_heads = 64
+            fake_attention.q_head_dim = 256
+            fake_attention._native_q4_qb_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_qb_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 2, 2048), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            output = glm_moe_dsa.GlmMoeDsaAttention._q_b_project(
+                fake_attention,
+                x,
+            )
+            expected = projection(x)
+            mx.eval(output, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["native_q4_qb_hits"], 1)
+            self.assertTrue(mx.allclose(output, expected, rtol=1e-4, atol=1e-4))
+        finally:
+            (
+                glm_moe_dsa._NATIVE_Q4_QB_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q4_QB_KERNEL,
+                glm_moe_dsa._NATIVE_Q4_QB_SOURCE,
+                glm_moe_dsa._NATIVE_Q4_QB_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_q4_qa_projection_matches_fallback(self):
+        import mlx.nn as nn
+
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+            glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_Q4_QA_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q4_QA_KERNEL,
+            glm_moe_dsa._NATIVE_Q4_QA_SOURCE,
+            glm_moe_dsa._NATIVE_Q4_QA_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "0"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "1"
+            projection = nn.QuantizedLinear(
+                input_dims=6144,
+                output_dims=2048,
+                bias=False,
+                group_size=64,
+                bits=4,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            def fake_q4_qa(x, weight, scales, biases):
+                return mx.quantized_matmul(
+                    x,
+                    weight,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=64,
+                    bits=4,
+                    mode="affine",
+                )
+
+            glm_moe_dsa._NATIVE_Q4_QA_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q4_QA_KERNEL = fake_q4_qa
+            glm_moe_dsa._NATIVE_Q4_QA_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q4_QA_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.q_a_proj = projection
+            fake_attention.q_lora_rank = 2048
+            fake_attention._q_a_dense_cache_project = lambda x: None
+            fake_attention._native_q4_qa_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_qa_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 2, 6144), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            output = glm_moe_dsa.GlmMoeDsaAttention._q_a_project(
+                fake_attention,
+                x,
+            )
+            expected = projection(x)
+            mx.eval(output, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["native_q4_qa_hits"], 1)
+            self.assertTrue(mx.allclose(output, expected, rtol=1e-4, atol=1e-4))
+        finally:
+            (
+                glm_moe_dsa._NATIVE_Q4_QA_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q4_QA_KERNEL,
+                glm_moe_dsa._NATIVE_Q4_QA_SOURCE,
+                glm_moe_dsa._NATIVE_Q4_QA_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_q_a_dense_cache_projection_matches_fallback(self):
+        import mlx.nn as nn
+
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "1"
+            projection = nn.QuantizedLinear(
+                input_dims=6144,
+                output_dims=2048,
+                bias=False,
+                group_size=64,
+                bits=4,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.q_a_proj = projection
+            fake_attention.q_lora_rank = 2048
+            fake_attention._q_a_dense_cache = None
+            fake_attention._q_a_dense_cache_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            fake_attention._q_a_dense_cache_key = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_key(
+                    fake_attention,
+                    x,
+                )
+            )
+            fake_attention._q_a_dense_weight = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_weight(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 2, 6144), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            first = glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_project(
+                fake_attention,
+                x,
+            )
+            second = glm_moe_dsa.GlmMoeDsaAttention._q_a_dense_cache_project(
+                fake_attention,
+                x,
+            )
+            expected = projection(x)
+            mx.eval(first, second, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["q_a_dense_cache_hits"], 2)
+            self.assertEqual(profile["q_a_dense_cache_builds"], 1)
+            self.assertTrue(mx.allclose(first, expected, rtol=1e-3, atol=1e-3))
+            self.assertTrue(mx.allclose(second, expected, rtol=1e-3, atol=1e-3))
+        finally:
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_quantized_fast_prefill_dequantizes_selected_kv(self):
         from mlx_lm.models import glm_moe_dsa
 

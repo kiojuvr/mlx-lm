@@ -24,6 +24,7 @@ from .deepseek_v32 import (
     DeepseekV32Model,
 )
 from .deepseek_v32 import Model as DSV32Model
+from .mla import QuantizedMultiLinear
 
 
 GLM_DSA_FAST_PREFILL_ENV = "MLX_LM_GLM_DSA_FAST_PREFILL"
@@ -33,25 +34,79 @@ GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV = "MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK"
 GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV = (
     "MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT"
 )
+GLM_DSA_NATIVE_SPARSE_PREFILL_ENV = "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL"
+GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT"
+)
+GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV"
+)
+GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT"
+)
+GLM_DSA_SPARSE_MLA_TILE_ENV = "MLX_LM_GLM_DSA_SPARSE_MLA_TILE"
+GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
+GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
+GLM_DSA_NATIVE_Q4_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_VUP"
+GLM_DSA_Q_A_DENSE_CACHE_ENV = "MLX_LM_GLM_DSA_Q_A_DENSE_CACHE"
+GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
+GLM_DSA_NATIVE_Q4_QA_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE"
+GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
+GLM_DSA_NATIVE_Q4_QB_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
+GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
 
 _PROFILE_STAGES = (
     "q_projection",
+    "q_a_projection",
+    "q_a_dense_cache_dequantization",
+    "q_a_dense_projection",
+    "native_q4_qa_projection",
+    "q_a_layernorm",
+    "q_b_projection",
+    "native_q4_qb_projection",
     "kv_cache_update",
     "dsa_indexer_topk",
+    "native_indexer_scores",
+    "native_indexer_topk",
     "latent_kv_dequantization",
     "latent_kv_projection",
+    "native_sparse_kv_dequantization",
+    "native_q8_vup",
+    "native_q4_vup",
     "sparse_gather",
     "attention",
+    "native_sparse_attention",
     "total_prefill",
 )
 _DEFAULT_FAST_PREFILL_QUERY_CHUNK = 16
 _DEFAULT_FAST_PREFILL_KEY_BLOCK = 8192
 _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT = 131072
+_DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT = 6144
 _FAST_PREFILL_LARGE_TOPK_WARNING = 1024
 _LOGGER = logging.getLogger(__name__)
 _GLM_DSA_PREFILL_PROFILE = None
 _WARNED_FAST_PREFILL_LARGE_TOPK = False
+_NATIVE_SPARSE_MLA_LOOKUP_DONE = False
+_NATIVE_SPARSE_MLA_KERNEL = None
+_NATIVE_SPARSE_MLA_SOURCE = None
+_NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+_NATIVE_Q8_VUP_LOOKUP_DONE = False
+_NATIVE_Q8_VUP_KERNEL = None
+_NATIVE_Q8_VUP_SOURCE = None
+_NATIVE_Q8_VUP_IMPORT_ERROR = None
+_NATIVE_Q4_VUP_LOOKUP_DONE = False
+_NATIVE_Q4_VUP_KERNEL = None
+_NATIVE_Q4_VUP_SOURCE = None
+_NATIVE_Q4_VUP_IMPORT_ERROR = None
+_NATIVE_Q4_QA_LOOKUP_DONE = False
+_NATIVE_Q4_QA_KERNEL = None
+_NATIVE_Q4_QA_SOURCE = None
+_NATIVE_Q4_QA_IMPORT_ERROR = None
+_NATIVE_Q4_QB_LOOKUP_DONE = False
+_NATIVE_Q4_QB_KERNEL = None
+_NATIVE_Q4_QB_SOURCE = None
+_NATIVE_Q4_QB_IMPORT_ERROR = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -65,8 +120,44 @@ def _fast_prefill_enabled() -> bool:
     return _env_flag(GLM_DSA_FAST_PREFILL_ENV, True)
 
 
+def _native_sparse_prefill_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_SPARSE_PREFILL_ENV, True)
+
+
+def _native_sparse_prefill_quantized_kv_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV, False)
+
+
+def _native_indexer_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_INDEXER_ENV, True)
+
+
+def _native_q8_vup_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q8_VUP_ENV, False)
+
+
+def _native_q4_vup_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_VUP_ENV, False)
+
+
+def _q_a_dense_cache_enabled() -> bool:
+    return _env_flag(GLM_DSA_Q_A_DENSE_CACHE_ENV, False)
+
+
+def _native_q4_qa_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_QA_ENV, False)
+
+
+def _native_q4_qb_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q4_QB_ENV, False)
+
+
 def _prefill_profile_enabled() -> bool:
     return _env_flag(GLM_DSA_PREFILL_PROFILE_ENV, False)
+
+
+def _prefill_profile_isolate_enabled() -> bool:
+    return _env_flag(GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV, False)
 
 
 def _fast_prefill_debug_enabled() -> bool:
@@ -104,6 +195,28 @@ def _sparse_prefill_min_context_length() -> int:
     return _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT
 
 
+def _native_sparse_prefill_min_context_length() -> int:
+    raw_value = os.environ.get(GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV)
+    if raw_value is not None:
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            pass
+    return _DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT
+
+
+def _native_sparse_prefill_quantized_kv_max_context_length() -> int:
+    raw_value = os.environ.get(
+        GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV
+    )
+    if raw_value is not None:
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            pass
+    return 65536
+
+
 def _sparse_prefill_min_effective_context_length() -> int:
     # Generation prefill leaves the final prompt token for logits, so a nominal
     # N-token prompt can expose at most N-1 tokens to the attention call.
@@ -121,6 +234,21 @@ def _new_profile():
         },
         "fast_prefill_hits": 0,
         "fallback_reasons": Counter(),
+        "native_sparse_prefill_hits": 0,
+        "native_sparse_prefill_fallback_reasons": Counter(),
+        "native_indexer_hits": 0,
+        "native_indexer_fallback_reasons": Counter(),
+        "native_q8_vup_hits": 0,
+        "native_q8_vup_fallback_reasons": Counter(),
+        "native_q4_vup_hits": 0,
+        "native_q4_vup_fallback_reasons": Counter(),
+        "q_a_dense_cache_hits": 0,
+        "q_a_dense_cache_builds": 0,
+        "q_a_dense_cache_fallback_reasons": Counter(),
+        "native_q4_qa_hits": 0,
+        "native_q4_qa_fallback_reasons": Counter(),
+        "native_q4_qb_hits": 0,
+        "native_q4_qb_fallback_reasons": Counter(),
     }
 
 
@@ -140,6 +268,39 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         },
         "fast_prefill_hits": _GLM_DSA_PREFILL_PROFILE["fast_prefill_hits"],
         "fallback_reasons": dict(_GLM_DSA_PREFILL_PROFILE["fallback_reasons"]),
+        "native_sparse_prefill_hits": _GLM_DSA_PREFILL_PROFILE[
+            "native_sparse_prefill_hits"
+        ],
+        "native_sparse_prefill_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_sparse_prefill_fallback_reasons"]
+        ),
+        "native_indexer_hits": _GLM_DSA_PREFILL_PROFILE["native_indexer_hits"],
+        "native_indexer_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_indexer_fallback_reasons"]
+        ),
+        "native_q8_vup_hits": _GLM_DSA_PREFILL_PROFILE["native_q8_vup_hits"],
+        "native_q8_vup_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q8_vup_fallback_reasons"]
+        ),
+        "native_q4_vup_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_vup_hits"],
+        "native_q4_vup_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_vup_fallback_reasons"]
+        ),
+        "q_a_dense_cache_hits": _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_hits"],
+        "q_a_dense_cache_builds": _GLM_DSA_PREFILL_PROFILE[
+            "q_a_dense_cache_builds"
+        ],
+        "q_a_dense_cache_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_fallback_reasons"]
+        ),
+        "native_q4_qa_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qa_hits"],
+        "native_q4_qa_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_qa_fallback_reasons"]
+        ),
+        "native_q4_qb_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qb_hits"],
+        "native_q4_qb_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_qb_fallback_reasons"]
+        ),
     }
     if reset:
         reset_glm_dsa_prefill_profile()
@@ -166,6 +327,555 @@ def _record_fast_prefill_decision(used: bool, reason: str):
             _LOGGER.info("GLM DSA fast sparse prefill enabled")
         else:
             _LOGGER.info("GLM DSA fast sparse prefill fallback: %s", reason)
+
+
+def _record_native_sparse_prefill_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_sparse_prefill_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_sparse_prefill_fallback_reasons"][
+            reason
+        ] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native sparse MLA prefill enabled: source=%s",
+                _NATIVE_SPARSE_MLA_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info(
+                "GLM DSA native sparse MLA prefill fallback: %s", reason
+            )
+
+
+def _record_native_indexer_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_indexer_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_indexer_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info("GLM DSA native indexer enabled")
+        else:
+            _LOGGER.info("GLM DSA native indexer fallback: %s", reason)
+
+
+def _record_native_q8_vup_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q8_vup_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q8_vup_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q8 V-up projection enabled: source=%s",
+                _NATIVE_Q8_VUP_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q8 V-up fallback: %s", reason)
+
+
+def _record_native_q4_vup_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_vup_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_vup_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 V-up projection enabled: source=%s",
+                _NATIVE_Q4_VUP_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 V-up fallback: %s", reason)
+
+
+def _record_native_q4_qb_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qb_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qb_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 q_b projection enabled: source=%s",
+                _NATIVE_Q4_QB_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 q_b fallback: %s", reason)
+
+
+def _record_q_a_dense_cache_decision(
+    used: bool,
+    reason: str,
+    *,
+    built: bool = False,
+):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_hits"] += 1
+        if built:
+            _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_builds"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA q_a dense cache enabled%s",
+                " with build" if built else "",
+            )
+        else:
+            _LOGGER.info("GLM DSA q_a dense cache fallback: %s", reason)
+
+
+def _record_native_q4_qa_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qa_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qa_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 q_a projection enabled: source=%s",
+                _NATIVE_Q4_QA_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 q_a fallback: %s", reason)
+
+
+def _native_sparse_mla_kernel():
+    global _NATIVE_SPARSE_MLA_LOOKUP_DONE
+    global _NATIVE_SPARSE_MLA_KERNEL
+    global _NATIVE_SPARSE_MLA_SOURCE
+    global _NATIVE_SPARSE_MLA_IMPORT_ERROR
+    if _NATIVE_SPARSE_MLA_LOOKUP_DONE:
+        return _NATIVE_SPARSE_MLA_KERNEL
+
+    _NATIVE_SPARSE_MLA_LOOKUP_DONE = True
+    _NATIVE_SPARSE_MLA_KERNEL = None
+    _NATIVE_SPARSE_MLA_SOURCE = None
+    _NATIVE_SPARSE_MLA_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_sparse_mla_attention")
+                and hasattr(fast, "glm_dsa_sparse_mla_attention")
+            ):
+                _NATIVE_SPARSE_MLA_KERNEL = fast.glm_dsa_sparse_mla_attention
+                _NATIVE_SPARSE_MLA_SOURCE = module_name
+                return _NATIVE_SPARSE_MLA_KERNEL
+            if _NATIVE_SPARSE_MLA_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_SPARSE_MLA_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_SPARSE_MLA_IMPORT_ERROR is None:
+                _NATIVE_SPARSE_MLA_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_sparse_mla_attention"):
+        _NATIVE_SPARSE_MLA_KERNEL = mx.fast.glm_dsa_sparse_mla_attention
+        _NATIVE_SPARSE_MLA_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_SPARSE_MLA_KERNEL
+
+
+def _native_q8_vup_kernel():
+    global _NATIVE_Q8_VUP_LOOKUP_DONE
+    global _NATIVE_Q8_VUP_KERNEL
+    global _NATIVE_Q8_VUP_SOURCE
+    global _NATIVE_Q8_VUP_IMPORT_ERROR
+    if _NATIVE_Q8_VUP_LOOKUP_DONE:
+        return _NATIVE_Q8_VUP_KERNEL
+
+    _NATIVE_Q8_VUP_LOOKUP_DONE = True
+    _NATIVE_Q8_VUP_KERNEL = None
+    _NATIVE_Q8_VUP_SOURCE = None
+    _NATIVE_Q8_VUP_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q8_vup_flat")
+                and hasattr(fast, "glm_dsa_q8_vup_flat")
+            ):
+                _NATIVE_Q8_VUP_KERNEL = fast.glm_dsa_q8_vup_flat
+                _NATIVE_Q8_VUP_SOURCE = module_name
+                return _NATIVE_Q8_VUP_KERNEL
+            if _NATIVE_Q8_VUP_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q8_VUP_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q8_VUP_IMPORT_ERROR is None:
+                _NATIVE_Q8_VUP_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q8_vup_flat"):
+        _NATIVE_Q8_VUP_KERNEL = mx.fast.glm_dsa_q8_vup_flat
+        _NATIVE_Q8_VUP_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q8_VUP_KERNEL
+
+
+def _native_q4_vup_kernel():
+    global _NATIVE_Q4_VUP_LOOKUP_DONE
+    global _NATIVE_Q4_VUP_KERNEL
+    global _NATIVE_Q4_VUP_SOURCE
+    global _NATIVE_Q4_VUP_IMPORT_ERROR
+    if _NATIVE_Q4_VUP_LOOKUP_DONE:
+        return _NATIVE_Q4_VUP_KERNEL
+
+    _NATIVE_Q4_VUP_LOOKUP_DONE = True
+    _NATIVE_Q4_VUP_KERNEL = None
+    _NATIVE_Q4_VUP_SOURCE = None
+    _NATIVE_Q4_VUP_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_vup_flat")
+                and hasattr(fast, "glm_dsa_q4_vup_flat")
+            ):
+                _NATIVE_Q4_VUP_KERNEL = fast.glm_dsa_q4_vup_flat
+                _NATIVE_Q4_VUP_SOURCE = module_name
+                return _NATIVE_Q4_VUP_KERNEL
+            if _NATIVE_Q4_VUP_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_VUP_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_VUP_IMPORT_ERROR is None:
+                _NATIVE_Q4_VUP_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_vup_flat"):
+        _NATIVE_Q4_VUP_KERNEL = mx.fast.glm_dsa_q4_vup_flat
+        _NATIVE_Q4_VUP_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_VUP_KERNEL
+
+
+def _native_q4_qb_kernel():
+    global _NATIVE_Q4_QB_LOOKUP_DONE
+    global _NATIVE_Q4_QB_KERNEL
+    global _NATIVE_Q4_QB_SOURCE
+    global _NATIVE_Q4_QB_IMPORT_ERROR
+    if _NATIVE_Q4_QB_LOOKUP_DONE:
+        return _NATIVE_Q4_QB_KERNEL
+
+    _NATIVE_Q4_QB_LOOKUP_DONE = True
+    _NATIVE_Q4_QB_KERNEL = None
+    _NATIVE_Q4_QB_SOURCE = None
+    _NATIVE_Q4_QB_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qb_proj_flat")
+                and hasattr(fast, "glm_dsa_q4_qb_proj_flat")
+            ):
+                _NATIVE_Q4_QB_KERNEL = fast.glm_dsa_q4_qb_proj_flat
+                _NATIVE_Q4_QB_SOURCE = module_name
+                return _NATIVE_Q4_QB_KERNEL
+            if _NATIVE_Q4_QB_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QB_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QB_IMPORT_ERROR is None:
+                _NATIVE_Q4_QB_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_qb_proj_flat"):
+        _NATIVE_Q4_QB_KERNEL = mx.fast.glm_dsa_q4_qb_proj_flat
+        _NATIVE_Q4_QB_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_QB_KERNEL
+
+
+def _native_q4_qa_kernel():
+    global _NATIVE_Q4_QA_LOOKUP_DONE
+    global _NATIVE_Q4_QA_KERNEL
+    global _NATIVE_Q4_QA_SOURCE
+    global _NATIVE_Q4_QA_IMPORT_ERROR
+    if _NATIVE_Q4_QA_LOOKUP_DONE:
+        return _NATIVE_Q4_QA_KERNEL
+
+    _NATIVE_Q4_QA_LOOKUP_DONE = True
+    _NATIVE_Q4_QA_KERNEL = None
+    _NATIVE_Q4_QA_SOURCE = None
+    _NATIVE_Q4_QA_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qa_proj_flat")
+                and hasattr(fast, "glm_dsa_q4_qa_proj_flat")
+            ):
+                _NATIVE_Q4_QA_KERNEL = fast.glm_dsa_q4_qa_proj_flat
+                _NATIVE_Q4_QA_SOURCE = module_name
+                return _NATIVE_Q4_QA_KERNEL
+            if _NATIVE_Q4_QA_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QA_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QA_IMPORT_ERROR is None:
+                _NATIVE_Q4_QA_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_qa_proj_flat"):
+        _NATIVE_Q4_QA_KERNEL = mx.fast.glm_dsa_q4_qa_proj_flat
+        _NATIVE_Q4_QA_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_QA_KERNEL
+
+
+def _native_indexer_fast_module():
+    try:
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+    except Exception as exc:
+        return None, None, exc
+    source = (
+        "mlx_lm.custom_kernels.glm_moe_dsa"
+        if fast.is_native_available()
+        else "mlx.core.fast"
+    )
+    return fast, source, fast.import_error()
+
+
+def _native_indexer_available():
+    fast, _source, _error = _native_indexer_fast_module()
+    if fast is None:
+        return False
+    return fast.has_symbol("dsa_indexer_scores") and fast.has_symbol(
+        "dsa_topk_indices"
+    )
+
+
+def _native_indexer_scores(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    *,
+    causal: bool,
+    skip_causal_future_store: bool = False,
+    causal_q_offset: int = -1,
+):
+    fast, _source, _error = _native_indexer_fast_module()
+    if (
+        fast is None
+        or not fast.has_symbol("dsa_indexer_scores")
+        or len(queries.shape) != 4
+        or len(keys.shape) != 4
+        or len(weights.shape) != 3
+        or queries.shape[0] != keys.shape[0]
+        or queries.shape[0] != weights.shape[0]
+        or queries.shape[1] != 32
+        or keys.shape[1] != 1
+        or queries.shape[2] != weights.shape[1]
+        or queries.shape[1] != weights.shape[2]
+        or queries.shape[3] != 128
+        or keys.shape[3] != 128
+        or keys.shape[2] < 4096
+        or queries.dtype != keys.dtype
+        or queries.dtype != weights.dtype
+        or queries.dtype not in (mx.float16, mx.bfloat16)
+    ):
+        return None
+
+    _B, _H, L, _D = queries.shape
+    K = keys.shape[2]
+    q_pad = (-L) % 64
+    k_pad = (-K) % 64
+    if causal and causal_q_offset < 0 and (q_pad or k_pad):
+        causal_q_offset = K - L
+
+    q = queries
+    k = keys
+    w = weights
+    if q_pad:
+        q = mx.pad(q, [(0, 0), (0, 0), (0, q_pad), (0, 0)])
+        w = mx.pad(w, [(0, 0), (0, q_pad), (0, 0)])
+    if k_pad:
+        k = mx.pad(k, [(0, 0), (0, 0), (0, k_pad), (0, 0)])
+
+    try:
+        scores = fast.dsa_indexer_scores(
+            q,
+            k,
+            w,
+            causal=causal,
+            unused_causal_prefix_topk=0,
+            skip_causal_future_store=skip_causal_future_store,
+            causal_q_offset=causal_q_offset,
+            stream=mx.gpu,
+        )
+    except Exception:
+        return None
+    if q_pad or k_pad:
+        scores = scores[:, :, :L, :K]
+    return scores
+
+
+def _native_indexer_topk_indices(
+    scores: mx.array,
+    topk: int,
+    *,
+    bucketed: bool,
+    causal_valid_prefix: bool,
+):
+    fast, _source, _error = _native_indexer_fast_module()
+    if (
+        fast is None
+        or not fast.has_symbol("dsa_topk_indices")
+        or len(scores.shape) != 4
+        or scores.shape[1] != 1
+        or topk != 2048
+        or scores.shape[-1] < topk
+        or scores.dtype not in (mx.float16, mx.bfloat16)
+    ):
+        return None
+    try:
+        return fast.dsa_topk_indices(
+            scores,
+            topk,
+            bucketed=bucketed,
+            causal_valid_prefix=causal_valid_prefix,
+            stream=mx.gpu,
+        )
+    except Exception:
+        return None
+
+
+def get_glm_dsa_native_sparse_prefill_status():
+    kernel = _native_sparse_mla_kernel()
+    return {
+        "enabled": _native_sparse_prefill_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_SPARSE_MLA_SOURCE,
+        "import_error": (
+            repr(_NATIVE_SPARSE_MLA_IMPORT_ERROR)
+            if _NATIVE_SPARSE_MLA_IMPORT_ERROR is not None
+            else None
+        ),
+        "min_context": _native_sparse_prefill_min_context_length(),
+        "quantized_kv_enabled": _native_sparse_prefill_quantized_kv_enabled(),
+        "quantized_kv_max_context": (
+            _native_sparse_prefill_quantized_kv_max_context_length()
+        ),
+    }
+
+
+def get_glm_dsa_native_indexer_status():
+    fast, source, import_error = _native_indexer_fast_module()
+    scores_available = fast is not None and fast.has_symbol("dsa_indexer_scores")
+    topk_available = fast is not None and fast.has_symbol("dsa_topk_indices")
+    return {
+        "enabled": _native_indexer_enabled(),
+        "available": scores_available and topk_available,
+        "source": source if scores_available and topk_available else None,
+        "import_error": repr(import_error) if import_error is not None else None,
+        "scores_available": scores_available,
+        "topk_available": topk_available,
+        "min_context": 4096,
+    }
+
+
+def get_glm_dsa_native_q8_vup_status():
+    kernel = _native_q8_vup_kernel()
+    return {
+        "enabled": _native_q8_vup_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q8_VUP_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q8_VUP_IMPORT_ERROR)
+            if _NATIVE_Q8_VUP_IMPORT_ERROR is not None
+            else None
+        ),
+    }
+
+
+def get_glm_dsa_native_q4_vup_status():
+    kernel = _native_q4_vup_kernel()
+    return {
+        "enabled": _native_q4_vup_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q4_VUP_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q4_VUP_IMPORT_ERROR)
+            if _NATIVE_Q4_VUP_IMPORT_ERROR is not None
+            else None
+        ),
+    }
+
+
+def get_glm_dsa_native_q4_qb_status():
+    kernel = _native_q4_qb_kernel()
+    return {
+        "enabled": _native_q4_qb_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q4_QB_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q4_QB_IMPORT_ERROR)
+            if _NATIVE_Q4_QB_IMPORT_ERROR is not None
+            else None
+        ),
+    }
+
+
+def get_glm_dsa_native_q4_qa_status():
+    kernel = _native_q4_qa_kernel()
+    return {
+        "enabled": _native_q4_qa_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q4_QA_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q4_QA_IMPORT_ERROR)
+            if _NATIVE_Q4_QA_IMPORT_ERROR is not None
+            else None
+        ),
+    }
 
 
 def _warn_fast_prefill_large_topk(topk: int):
@@ -200,9 +910,11 @@ def _eval_profile_value(value):
     mx.synchronize()
 
 
-def _profile_stage(stage: str, fn):
+def _profile_stage(stage: str, fn, *, inputs=None):
     if not _prefill_profile_enabled():
         return fn()
+    if inputs is not None and _prefill_profile_isolate_enabled():
+        _eval_profile_value(inputs)
     start = time.perf_counter()
     value = fn()
     _eval_profile_value(value)
@@ -368,6 +1080,7 @@ class ModelArgs(BaseModelArgs):
 class GlmMoeDsaAttention(DeepseekV32Attention):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__(config)
+        object.__setattr__(self, "_q_a_dense_cache", None)
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
         if self.skip_topk:
             self.indexer = None
@@ -395,6 +1108,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0], dtype=k.dtype))
         if k.shape[2] <= indexer.index_topk:
             return None
+        native_indices = self._native_indexer_topk(q, x, k, mask)
+        if native_indices is not None:
+            return native_indices
         if (
             _fast_prefill_enabled()
             and b == 1
@@ -425,6 +1141,99 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         return mx.argpartition(scores, kth=-indexer.index_topk, axis=-1)[
             ..., -indexer.index_topk :
         ]
+
+    def _native_indexer_decision(
+        self,
+        q: mx.array,
+        x: mx.array,
+        k: mx.array,
+        mask: Optional[mx.array],
+    ):
+        indexer = self.indexer
+        if not _fast_prefill_enabled():
+            return False, "fast_prefill_disabled"
+        if not _native_indexer_enabled():
+            return False, "disabled"
+        if not _native_indexer_available():
+            return False, "missing_symbol"
+        if isinstance(mask, str):
+            if mask != "causal":
+                return False, "mask_type"
+        elif mask is not None and len(mask.shape) not in (2, 4):
+            return False, "mask_rank"
+        B, H, L, D = q.shape
+        if B != 1:
+            return False, "batch_size_not_one"
+        if L <= 1:
+            return False, "decode"
+        if H != 32:
+            return False, f"unsupported_index_heads:{H}"
+        if D != 128:
+            return False, f"unsupported_index_head_dim:{D}"
+        if k.shape[1] != 1:
+            return False, "unsupported_kv_heads"
+        if k.shape[-1] != D:
+            return False, "mixed_index_head_dim"
+        if indexer.index_topk != 2048:
+            return False, f"unsupported_topk:{indexer.index_topk}"
+        if k.shape[2] < 4096:
+            return False, "below_native_indexer_min_context"
+        if q.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{q.dtype}"
+        if k.dtype != q.dtype:
+            return False, "mixed_dtype"
+        return True, "native_indexer"
+
+    def _native_indexer_topk(
+        self,
+        q: mx.array,
+        x: mx.array,
+        k: mx.array,
+        mask: Optional[mx.array],
+    ):
+        use_native, reason = self._native_indexer_decision(q, x, k, mask)
+        if not use_native:
+            _record_native_indexer_decision(False, reason)
+            return None
+
+        indexer = self.indexer
+        weights = indexer.weights_proj(x) * (
+            indexer.n_heads**-0.5 * indexer.softmax_scale
+        )
+        if weights.dtype != q.dtype:
+            _record_native_indexer_decision(False, "mixed_weight_dtype")
+            return None
+        causal = mask is not None
+        scores = _profile_stage(
+            "native_indexer_scores",
+            lambda: _native_indexer_scores(
+                q,
+                k,
+                weights,
+                causal=causal,
+                skip_causal_future_store=causal,
+                causal_q_offset=k.shape[2] - q.shape[2] if causal else -1,
+            ),
+            inputs=(q, k, weights),
+        )
+        if scores is None:
+            _record_native_indexer_decision(False, "scores_unavailable")
+            return None
+        indices = _profile_stage(
+            "native_indexer_topk",
+            lambda: _native_indexer_topk_indices(
+                scores,
+                indexer.index_topk,
+                bucketed=True,
+                causal_valid_prefix=causal,
+            ),
+            inputs=scores,
+        )
+        if indices is None:
+            _record_native_indexer_decision(False, "topk_unavailable")
+            return None
+        _record_native_indexer_decision(True, reason)
+        return indices
 
     def _block_indexer_topk(
         self,
@@ -556,6 +1365,517 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         _warn_fast_prefill_large_topk(K)
         return True, "fast"
 
+    def _native_sparse_prefill_decision(
+        self,
+        *,
+        B: int,
+        L: int,
+        kv_cache: Any,
+        kv_latent: Any,
+        k_pe: mx.array,
+        topk_indices: mx.array,
+    ):
+        if not _fast_prefill_enabled():
+            return False, "fast_prefill_disabled"
+        if not _native_sparse_prefill_enabled():
+            return False, "disabled"
+        if _native_sparse_mla_kernel() is None:
+            return False, "missing_symbol"
+        if L <= 1:
+            return False, "decode"
+        if len(topk_indices.shape) != 4:
+            return False, "topk_rank"
+        if topk_indices.shape[0] != B or topk_indices.shape[2] != L:
+            return False, "topk_shape"
+        quantized_kv = isinstance(kv_cache, QuantizedGlmMlaKVCache)
+        if not isinstance(kv_cache, GlmMlaKVCache):
+            if quantized_kv:
+                if not _native_sparse_prefill_quantized_kv_enabled():
+                    return False, "quantized_kv"
+            elif isinstance(kv_cache, BatchQuantizedGlmMlaKVCache):
+                return False, "batched_quantized_kv_cache"
+            elif isinstance(kv_cache, BatchGlmMlaKVCache):
+                return False, "batched_kv_cache"
+            else:
+                return False, f"unsupported_cache:{type(kv_cache).__name__}"
+        if isinstance(kv_latent, (tuple, list)) and not quantized_kv:
+            return False, "quantized_kv_state"
+        if B != 1:
+            return False, "batch_size_not_one"
+        if topk_indices.shape[1] != 1:
+            return False, "topk_heads"
+        if self.num_heads != 64:
+            return False, "unsupported_heads"
+        rope_dim = k_pe.shape[-1]
+        if rope_dim != 64:
+            return False, f"unsupported_rope_dim:{rope_dim}"
+        if k_pe.shape[1] != 1:
+            return False, "unsupported_kv_heads"
+        if quantized_kv:
+            if kv_cache.bits != 8:
+                return False, f"unsupported_kv_bits:{kv_cache.bits}"
+            if kv_cache.group_size != 64:
+                return False, f"unsupported_kv_group_size:{kv_cache.group_size}"
+            max_context = _native_sparse_prefill_quantized_kv_max_context_length()
+            if max_context and k_pe.shape[2] > max_context:
+                return False, "quantized_kv_context_exceeds_limit"
+        else:
+            if kv_latent.shape[1] != 1:
+                return False, "unsupported_kv_heads"
+            if kv_latent.shape[-1] != 512:
+                return False, f"unsupported_latent_dim:{kv_latent.shape[-1]}"
+            if kv_latent.dtype not in (mx.float16, mx.bfloat16):
+                return False, f"unsupported_kv_dtype:{kv_latent.dtype}"
+            if k_pe.dtype != kv_latent.dtype:
+                return False, "mixed_kv_dtype"
+        if topk_indices.shape[-1] != 2048:
+            return False, f"unsupported_topk:{topk_indices.shape[-1]}"
+        if k_pe.shape[2] < _native_sparse_prefill_min_context_length():
+            return False, "below_native_sparse_min_context"
+        return (
+            True,
+            "native_sparse_mla_quantized_kv" if quantized_kv else "native_sparse_mla",
+        )
+
+    def _native_q8_vup_decision(self, x: mx.array):
+        if not _native_q8_vup_enabled():
+            return False, "disabled"
+        if _native_q8_vup_kernel() is None:
+            return False, "missing_symbol"
+        if not isinstance(self.unembed_out, QuantizedMultiLinear):
+            return False, "unquantized_unembed_out"
+        if self.unembed_out.bits != 8:
+            return False, f"unsupported_bits:{self.unembed_out.bits}"
+        if self.unembed_out.group_size != 64:
+            return False, f"unsupported_group_size:{self.unembed_out.group_size}"
+        if self.unembed_out.mode != "affine":
+            return False, f"unsupported_mode:{self.unembed_out.mode}"
+        weight = self.unembed_out["weight"]
+        scales = self.unembed_out["scales"]
+        biases = self.unembed_out.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 4:
+            return False, "input_rank"
+        B, H, L, K = x.shape
+        if H != 64:
+            return False, f"unsupported_heads:{H}"
+        if K != 512:
+            return False, f"unsupported_latent_dim:{K}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 3 or len(scales.shape) != 3 or len(biases.shape) != 3:
+            return False, "weight_rank"
+        if weight.shape[0] != H or scales.shape[0] != H or biases.shape[0] != H:
+            return False, "weight_heads"
+        if scales.shape[1] != 256 or biases.shape[1] != 256:
+            return False, "unsupported_value_dim"
+        if weight.shape[2] * 4 != K:
+            return False, "weight_latent_dim"
+        if scales.shape[2] != K // 64 or biases.shape[2] != K // 64:
+            return False, "weight_group_shape"
+        return True, "native_q8_vup"
+
+    def _native_q4_vup_decision(self, x: mx.array):
+        if not _native_q4_vup_enabled():
+            return False, "disabled"
+        if _native_q4_vup_kernel() is None:
+            return False, "missing_symbol"
+        if not isinstance(self.unembed_out, QuantizedMultiLinear):
+            return False, "unquantized_unembed_out"
+        if self.unembed_out.bits != 4:
+            return False, f"unsupported_bits:{self.unembed_out.bits}"
+        if self.unembed_out.group_size != 64:
+            return False, f"unsupported_group_size:{self.unembed_out.group_size}"
+        if self.unembed_out.mode != "affine":
+            return False, f"unsupported_mode:{self.unembed_out.mode}"
+        weight = self.unembed_out["weight"]
+        scales = self.unembed_out["scales"]
+        biases = self.unembed_out.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 4:
+            return False, "input_rank"
+        B, H, L, K = x.shape
+        if H != 64:
+            return False, f"unsupported_heads:{H}"
+        if K != 512:
+            return False, f"unsupported_latent_dim:{K}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 3 or len(scales.shape) != 3 or len(biases.shape) != 3:
+            return False, "weight_rank"
+        if weight.shape[0] != H or scales.shape[0] != H or biases.shape[0] != H:
+            return False, "weight_heads"
+        if scales.shape[1] != 256 or biases.shape[1] != 256:
+            return False, "unsupported_value_dim"
+        if weight.shape[2] * 8 != K:
+            return False, "weight_latent_dim"
+        if scales.shape[2] != K // 64 or biases.shape[2] != K // 64:
+            return False, "weight_group_shape"
+        return True, "native_q4_vup"
+
+    def _q_a_dense_cache_decision(self, x: mx.array):
+        if not _q_a_dense_cache_enabled():
+            return False, "disabled"
+        if not hasattr(self.q_a_proj, "bits"):
+            return False, "unquantized_q_a_proj"
+        if self.q_a_proj.bits != 4:
+            return False, f"unsupported_bits:{self.q_a_proj.bits}"
+        if self.q_a_proj.group_size != 64:
+            return False, f"unsupported_group_size:{self.q_a_proj.group_size}"
+        if self.q_a_proj.mode != "affine":
+            return False, f"unsupported_mode:{self.q_a_proj.mode}"
+        weight = self.q_a_proj["weight"]
+        scales = self.q_a_proj["scales"]
+        biases = self.q_a_proj.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 3:
+            return False, "input_rank"
+        if x.shape[-1] != 6144:
+            return False, f"unsupported_input_dim:{x.shape[-1]}"
+        if self.q_lora_rank != 2048:
+            return False, f"unsupported_q_lora_rank:{self.q_lora_rank}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{x.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 2 or len(scales.shape) != 2 or len(biases.shape) != 2:
+            return False, "weight_rank"
+        if weight.shape[0] != self.q_lora_rank:
+            return False, "weight_output_dim"
+        if scales.shape[0] != weight.shape[0] or biases.shape[0] != weight.shape[0]:
+            return False, "scale_output_dim"
+        if weight.shape[1] * 8 != x.shape[-1]:
+            return False, "weight_input_dim"
+        if scales.shape[1] != x.shape[-1] // 64:
+            return False, "scale_group_shape"
+        if biases.shape[1] != x.shape[-1] // 64:
+            return False, "bias_group_shape"
+        return True, "q_a_dense_cache"
+
+    def _q_a_dense_cache_key(self, x: mx.array):
+        return (
+            x.dtype,
+            id(self.q_a_proj["weight"]),
+            id(self.q_a_proj["scales"]),
+            id(self.q_a_proj.get("biases")),
+        )
+
+    def _q_a_dense_weight(self, x: mx.array):
+        key = self._q_a_dense_cache_key(x)
+        cache = object.__getattribute__(self, "_q_a_dense_cache")
+        if cache is not None and cache[0] == key:
+            return cache[1], False
+
+        def dequantize_weight():
+            dense_weight = mx.dequantize(
+                self.q_a_proj["weight"],
+                scales=self.q_a_proj["scales"],
+                biases=self.q_a_proj["biases"],
+                group_size=self.q_a_proj.group_size,
+                bits=self.q_a_proj.bits,
+                mode=self.q_a_proj.mode,
+            )
+            if not _prefill_profile_enabled():
+                mx.eval(dense_weight)
+            return dense_weight
+
+        dense_weight = _profile_stage(
+            "q_a_dense_cache_dequantization",
+            dequantize_weight,
+        )
+        object.__setattr__(self, "_q_a_dense_cache", (key, dense_weight))
+        return dense_weight, True
+
+    def _q_a_dense_cache_project(self, x: mx.array):
+        use_dense, reason = self._q_a_dense_cache_decision(x)
+        if not use_dense:
+            if hasattr(self.q_a_proj, "bits"):
+                _record_q_a_dense_cache_decision(False, reason)
+            return None
+        try:
+            dense_weight, built = self._q_a_dense_weight(x)
+            output = _profile_stage(
+                "q_a_dense_projection",
+                lambda: x @ dense_weight.T,
+            )
+            _record_q_a_dense_cache_decision(True, reason, built=built)
+            return output
+        except Exception as exc:
+            _record_q_a_dense_cache_decision(
+                False,
+                f"runtime_error:{type(exc).__name__}",
+            )
+            return None
+
+    def _native_q4_qa_decision(self, x: mx.array):
+        if not _native_q4_qa_enabled():
+            return False, "disabled"
+        if _native_q4_qa_kernel() is None:
+            return False, "missing_symbol"
+        if not hasattr(self.q_a_proj, "bits"):
+            return False, "unquantized_q_a_proj"
+        if self.q_a_proj.bits != 4:
+            return False, f"unsupported_bits:{self.q_a_proj.bits}"
+        if self.q_a_proj.group_size != 64:
+            return False, f"unsupported_group_size:{self.q_a_proj.group_size}"
+        if self.q_a_proj.mode != "affine":
+            return False, f"unsupported_mode:{self.q_a_proj.mode}"
+        weight = self.q_a_proj["weight"]
+        scales = self.q_a_proj["scales"]
+        biases = self.q_a_proj.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 3:
+            return False, "input_rank"
+        if x.shape[-1] != 6144:
+            return False, f"unsupported_input_dim:{x.shape[-1]}"
+        if self.q_lora_rank != 2048:
+            return False, f"unsupported_q_lora_rank:{self.q_lora_rank}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{x.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 2 or len(scales.shape) != 2 or len(biases.shape) != 2:
+            return False, "weight_rank"
+        if weight.shape[0] != self.q_lora_rank:
+            return False, "weight_output_dim"
+        if scales.shape[0] != weight.shape[0] or biases.shape[0] != weight.shape[0]:
+            return False, "scale_output_dim"
+        if weight.shape[1] * 8 != x.shape[-1]:
+            return False, "weight_input_dim"
+        if scales.shape[1] != x.shape[-1] // 64:
+            return False, "scale_group_shape"
+        if biases.shape[1] != x.shape[-1] // 64:
+            return False, "bias_group_shape"
+        return True, "native_q4_qa"
+
+    def _q_a_project(self, x: mx.array):
+        dense_output = self._q_a_dense_cache_project(x)
+        if dense_output is not None:
+            return dense_output
+        use_native, reason = self._native_q4_qa_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_qa_kernel()
+                output = _profile_stage(
+                    "native_q4_qa_projection",
+                    lambda: kernel(
+                        x,
+                        self.q_a_proj["weight"],
+                        self.q_a_proj["scales"],
+                        self.q_a_proj["biases"],
+                    ),
+                )
+                _record_native_q4_qa_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if hasattr(self.q_a_proj, "bits"):
+            _record_native_q4_qa_decision(False, reason)
+        return self.q_a_proj(x)
+
+    def _native_q4_qb_decision(self, x: mx.array):
+        if not _native_q4_qb_enabled():
+            return False, "disabled"
+        if _native_q4_qb_kernel() is None:
+            return False, "missing_symbol"
+        if not hasattr(self.q_b_proj, "bits"):
+            return False, "unquantized_q_b_proj"
+        if self.q_b_proj.bits != 4:
+            return False, f"unsupported_bits:{self.q_b_proj.bits}"
+        if self.q_b_proj.group_size != 64:
+            return False, f"unsupported_group_size:{self.q_b_proj.group_size}"
+        if self.q_b_proj.mode != "affine":
+            return False, f"unsupported_mode:{self.q_b_proj.mode}"
+        weight = self.q_b_proj["weight"]
+        scales = self.q_b_proj["scales"]
+        biases = self.q_b_proj.get("biases")
+        if biases is None:
+            return False, "missing_biases"
+        if len(x.shape) != 3:
+            return False, "input_rank"
+        if x.shape[-1] != 2048:
+            return False, f"unsupported_input_dim:{x.shape[-1]}"
+        if self.num_heads != 64:
+            return False, f"unsupported_heads:{self.num_heads}"
+        if self.q_head_dim != 256:
+            return False, f"unsupported_q_head_dim:{self.q_head_dim}"
+        if weight.dtype != mx.uint32:
+            return False, f"unsupported_weight_dtype:{weight.dtype}"
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{x.dtype}"
+        if scales.dtype != x.dtype or biases.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 2 or len(scales.shape) != 2 or len(biases.shape) != 2:
+            return False, "weight_rank"
+        if weight.shape[0] != self.num_heads * self.q_head_dim:
+            return False, "weight_output_dim"
+        if scales.shape[0] != weight.shape[0] or biases.shape[0] != weight.shape[0]:
+            return False, "scale_output_dim"
+        if weight.shape[1] * 8 != x.shape[-1]:
+            return False, "weight_input_dim"
+        if scales.shape[1] != x.shape[-1] // 64:
+            return False, "scale_group_shape"
+        if biases.shape[1] != x.shape[-1] // 64:
+            return False, "bias_group_shape"
+        return True, "native_q4_qb"
+
+    def _q_b_project(self, x: mx.array):
+        use_native, reason = self._native_q4_qb_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_qb_kernel()
+                output = _profile_stage(
+                    "native_q4_qb_projection",
+                    lambda: kernel(
+                        x,
+                        self.q_b_proj["weight"],
+                        self.q_b_proj["scales"],
+                        self.q_b_proj["biases"],
+                    ),
+                    inputs=x,
+                )
+                _record_native_q4_qb_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if hasattr(self.q_b_proj, "bits"):
+            _record_native_q4_qb_decision(False, reason)
+        return self.q_b_proj(x)
+
+    def _unembed_out_project(self, x: mx.array):
+        use_native, reason = self._native_q4_vup_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_vup_kernel()
+                flat = _profile_stage(
+                    "native_q4_vup",
+                    lambda: kernel(
+                        x,
+                        self.unembed_out["weight"],
+                        self.unembed_out["scales"],
+                        self.unembed_out["biases"],
+                    ),
+                    inputs=x,
+                )
+                B, H, L, _ = x.shape
+                V = flat.shape[-1] // H
+                output = flat.reshape(B, L, H, V).transpose(0, 2, 1, 3)
+                _record_native_q4_vup_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if isinstance(self.unembed_out, QuantizedMultiLinear):
+            _record_native_q4_vup_decision(False, reason)
+
+        use_native, reason = self._native_q8_vup_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q8_vup_kernel()
+                flat = _profile_stage(
+                    "native_q8_vup",
+                    lambda: kernel(
+                        x,
+                        self.unembed_out["weight"],
+                        self.unembed_out["scales"],
+                        self.unembed_out["biases"],
+                    ),
+                    inputs=x,
+                )
+                B, H, L, _ = x.shape
+                V = flat.shape[-1] // H
+                output = flat.reshape(B, L, H, V).transpose(0, 2, 1, 3)
+                _record_native_q8_vup_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if isinstance(self.unembed_out, QuantizedMultiLinear):
+            _record_native_q8_vup_decision(False, reason)
+        return _profile_stage(
+            "latent_kv_projection",
+            lambda: self.unembed_out(x),
+            inputs=x,
+        )
+
+    def _dense_sparse_mask(self, mask, topk_indices, key_length: int):
+        shape = list(topk_indices.shape)
+        shape[-1] = key_length
+        sparse_mask = mx.zeros(shape, dtype=mx.bool_)
+        sparse_mask = mx.put_along_axis(
+            sparse_mask, topk_indices, mx.array(True), axis=-1
+        )
+        if mask is not None:
+            sparse_mask = sparse_mask & mask
+        return sparse_mask
+
+    def _native_sparse_prefill_attention(
+        self,
+        q_nope: mx.array,
+        q_pe: mx.array,
+        kv_cache: Any,
+        kv_latent: Any,
+        k_pe: mx.array,
+        topk_indices: mx.array,
+    ):
+        kernel = _native_sparse_mla_kernel()
+        if kernel is None:
+            return None, "missing_symbol"
+        topk = (
+            topk_indices
+            if topk_indices.dtype == mx.uint32
+            else topk_indices.astype(mx.uint32)
+        )
+        try:
+            q_latent = _profile_stage(
+                "latent_kv_projection",
+                lambda: self.embed_q(q_nope),
+                inputs=q_nope,
+            )
+            if isinstance(kv_cache, QuantizedGlmMlaKVCache):
+                kv_latent = _profile_stage(
+                    "native_sparse_kv_dequantization",
+                    lambda: kv_cache.dequantize_keys(kv_latent),
+                    inputs=kv_latent,
+                )
+            output = _profile_stage(
+                "native_sparse_attention",
+                lambda: kernel(
+                    q_latent,
+                    q_pe,
+                    kv_latent,
+                    k_pe,
+                    topk,
+                    self.scale,
+                    causal=True,
+                ),
+                inputs=(q_latent, q_pe, kv_latent, k_pe, topk),
+            )
+            return (
+                self._unembed_out_project(output),
+                (
+                    "native_sparse_mla_quantized_kv"
+                    if isinstance(kv_cache, QuantizedGlmMlaKVCache)
+                    else "native_sparse_mla"
+                ),
+            )
+        except Exception as exc:
+            return None, f"runtime_error:{type(exc).__name__}"
+
     def _fast_sparse_prefill_attention(
         self,
         q_nope: mx.array,
@@ -593,6 +1913,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         chunk_topk,
                     ),
                 ),
+                inputs=(kv_latent, k_pe, chunk_topk, gather_mask),
             )
 
             q_nope_chunk = q_nope[:, :, start:stop, :]
@@ -604,6 +1925,13 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     q_pe_chunk=q_pe_chunk,
                     latent_selected=latent_selected,
                     k_pe_selected=k_pe_selected: self._fast_sparse_attention_chunk(
+                        q_nope_chunk,
+                        q_pe_chunk,
+                        latent_selected,
+                        k_pe_selected,
+                        mask_selected,
+                    ),
+                    inputs=(
                         q_nope_chunk,
                         q_pe_chunk,
                         latent_selected,
@@ -628,6 +1956,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return _profile_stage(
                 "latent_kv_dequantization",
                 lambda selected=selected: kv_cache.dequantize_keys(selected),
+                inputs=selected,
             )
         return _gather_sequence_by_flat_index(kv_latent, topk_indices)
 
@@ -666,7 +1995,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             mask=pe_scores.reshape(B * H * L, 1, 1, K),
         )
         output = output.reshape(B, H, L, R)
-        return _profile_stage("latent_kv_projection", lambda: self.unembed_out(output))
+        return self._unembed_out_project(output)
 
     def __call__(
         self,
@@ -680,15 +2009,28 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         total_start = time.perf_counter() if profile_total else None
 
         def project_q():
-            qr = self.q_a_layernorm(self.q_a_proj(x))
-            q = self.q_b_proj(qr)
+            q_a = _profile_stage(
+                "q_a_projection",
+                lambda: self._q_a_project(x),
+                inputs=x,
+            )
+            qr = _profile_stage(
+                "q_a_layernorm",
+                lambda: self.q_a_layernorm(q_a),
+                inputs=q_a,
+            )
+            q = _profile_stage(
+                "q_b_projection",
+                lambda: self._q_b_project(qr),
+                inputs=qr,
+            )
             q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(
                 0, 2, 1, 3
             )
             q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
             return qr, q_nope, q_pe
 
-        qr, q_nope, q_pe = _profile_stage("q_projection", project_q)
+        qr, q_nope, q_pe = _profile_stage("q_projection", project_q, inputs=x)
 
         offset = cache[0].offset if cache is not None else 0
 
@@ -711,7 +2053,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 return cache[0].update_and_fetch(kv_latent, k_pe), q_pe_rope
             return (kv_latent, k_pe), q_pe_rope
 
-        (kv_latent, k_pe), q_pe = _profile_stage("kv_cache_update", update_kv_cache)
+        (kv_latent, k_pe), q_pe = _profile_stage(
+            "kv_cache_update",
+            update_kv_cache,
+            inputs=(x, q_pe),
+        )
 
         kv_cache = cache[0] if cache is not None else None
         kv_latent_dequantized = not hasattr(kv_cache, "dequantize_keys")
@@ -723,6 +2069,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             kv_latent = _profile_stage(
                 "latent_kv_dequantization",
                 lambda: kv_cache.dequantize_keys(kv_latent),
+                inputs=kv_latent,
             )
             kv_latent_dequantized = True
             return kv_latent
@@ -734,11 +2081,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             topk_indices = _profile_stage(
                 "dsa_indexer_topk",
                 lambda: self._indexer_topk(x, qr, mask, cache=cache[1]),
+                inputs=(x, qr, mask),
             )
         else:
             topk_indices = prev_topk_indices
 
         fast_sparse_prefill = False
+        native_sparse_prefill = False
+        native_sparse_prefill_reason = None
+        dense_sparse_mask_applied = False
         if topk_indices is not None:
             if L == 1:
                 _record_fast_prefill_decision(False, "decode")
@@ -753,25 +2104,32 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     mask = _gather_attention_mask(mask, topk_indices)
             else:
-                fast_sparse_prefill, reason = self._fast_prefill_decision(
-                    B=B,
-                    L=L,
-                    cache=cache,
-                    topk_indices=topk_indices,
-                    k_pe=k_pe,
-                )
-                _record_fast_prefill_decision(fast_sparse_prefill, reason)
-                if not fast_sparse_prefill:
-                    ensure_kv_latent_dequantized()
-                    shape = list(topk_indices.shape)
-                    shape[-1] = kv_latent.shape[2]
-                    sparse_mask = mx.zeros(shape, dtype=mx.bool_)
-                    sparse_mask = mx.put_along_axis(
-                        sparse_mask, topk_indices, mx.array(True), axis=-1
+                native_sparse_prefill, native_sparse_prefill_reason = (
+                    self._native_sparse_prefill_decision(
+                        B=B,
+                        L=L,
+                        kv_cache=kv_cache,
+                        kv_latent=kv_latent,
+                        k_pe=k_pe,
+                        topk_indices=topk_indices,
                     )
-                    if mask is not None:
-                        sparse_mask = sparse_mask & mask
-                    mask = sparse_mask
+                )
+                if not native_sparse_prefill:
+                    _record_native_sparse_prefill_decision(
+                        False, native_sparse_prefill_reason
+                    )
+                    fast_sparse_prefill, reason = self._fast_prefill_decision(
+                        B=B,
+                        L=L,
+                        cache=cache,
+                        topk_indices=topk_indices,
+                        k_pe=k_pe,
+                    )
+                    _record_fast_prefill_decision(fast_sparse_prefill, reason)
+                if not native_sparse_prefill and not fast_sparse_prefill:
+                    ensure_kv_latent_dequantized()
+                    mask = self._dense_sparse_mask(mask, topk_indices, k_pe.shape[2])
+                    dense_sparse_mask_applied = True
         elif L > 1:
             _record_fast_prefill_decision(False, "no_topk_indices")
 
@@ -788,7 +2146,40 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     cache[0].keys, (cache[1].keys, cache[1].values)
                 )
 
-        if fast_sparse_prefill:
+        output = None
+        if native_sparse_prefill:
+            output, native_sparse_prefill_reason = (
+                self._native_sparse_prefill_attention(
+                    q_nope,
+                    q_pe,
+                    kv_cache,
+                    kv_latent,
+                    k_pe,
+                    topk_indices,
+                )
+            )
+            if output is not None:
+                _record_native_sparse_prefill_decision(
+                    True, native_sparse_prefill_reason
+                )
+            else:
+                _record_native_sparse_prefill_decision(
+                    False, native_sparse_prefill_reason
+                )
+                fast_sparse_prefill, reason = self._fast_prefill_decision(
+                    B=B,
+                    L=L,
+                    cache=cache,
+                    topk_indices=topk_indices,
+                    k_pe=k_pe,
+                )
+                _record_fast_prefill_decision(fast_sparse_prefill, reason)
+                if not fast_sparse_prefill and not dense_sparse_mask_applied:
+                    ensure_kv_latent_dequantized()
+                    mask = self._dense_sparse_mask(mask, topk_indices, k_pe.shape[2])
+                    dense_sparse_mask_applied = True
+
+        if output is None and fast_sparse_prefill:
             output = self._fast_sparse_prefill_attention(
                 q_nope,
                 q_pe,
@@ -798,7 +2189,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 topk_indices,
                 mask,
             )
-        else:
+        if output is None:
             ensure_kv_latent_dequantized()
             pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
             if mask is not None:
@@ -818,6 +2209,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         self.embed_q(kv_latent, transpose=False),
                         self.unembed_out(kv_latent),
                     ),
+                    inputs=kv_latent,
                 )
 
             output = _profile_stage(
@@ -825,9 +2217,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 lambda: scaled_dot_product_attention(
                     q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
                 ),
+                inputs=(q_nope, k, v, pe_scores),
             )
             if L == 1:
-                output = self.unembed_out(output)
+                output = self._unembed_out_project(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.o_proj(output)

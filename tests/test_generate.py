@@ -12,6 +12,8 @@ from mlx_lm.generate import (
     SequenceStateMachine,
     _effective_prefill_step_size,
     _glm_dsa_adaptive_prefill_step_size,
+    _format_prefill_chunk_fields,
+    _glm_dsa_prefill_profile_chunk_fields,
     batch_generate,
     generate,
     generate_step,
@@ -90,6 +92,51 @@ class TestGenerateUtilities(unittest.TestCase):
         )
 
         self.assertIsNone(step)
+
+    def test_glm_dsa_prefill_chunk_fields_report_deltas(self):
+        before = {
+            "fast_prefill_hits": 0,
+            "native_sparse_prefill_hits": 10,
+            "native_indexer_hits": 4,
+            "fallback_reasons": {},
+            "native_sparse_prefill_fallback_reasons": {"below": 1},
+            "native_indexer_fallback_reasons": {},
+            "stages": {
+                "native_sparse_attention": {"seconds": 1.0, "count": 2},
+                "native_indexer_scores": {"seconds": 0.25, "count": 1},
+            },
+        }
+        after = {
+            "fast_prefill_hits": 0,
+            "native_sparse_prefill_hits": 88,
+            "native_indexer_hits": 25,
+            "fallback_reasons": {},
+            "native_sparse_prefill_fallback_reasons": {
+                "below": 1,
+                "runtime_error": 2,
+            },
+            "native_indexer_fallback_reasons": {},
+            "stages": {
+                "native_sparse_attention": {"seconds": 1.5, "count": 3},
+                "native_indexer_scores": {"seconds": 0.375, "count": 2},
+            },
+        }
+
+        fields = _glm_dsa_prefill_profile_chunk_fields(before, after)
+
+        self.assertEqual(fields["glm_dsa_native_sparse_prefill_hits"], 78)
+        self.assertEqual(fields["glm_dsa_native_indexer_hits"], 21)
+        self.assertEqual(
+            fields["glm_dsa_native_sparse_prefill_fallback_reasons"],
+            {"runtime_error": 2},
+        )
+        self.assertEqual(fields["glm_dsa_native_sparse_attention_seconds"], 0.5)
+        self.assertEqual(fields["glm_dsa_native_sparse_attention_count"], 1)
+        self.assertEqual(fields["glm_dsa_native_indexer_scores_seconds"], 0.125)
+        self.assertIn(
+            'glm_dsa_native_sparse_prefill_fallback_reasons={"runtime_error":2}',
+            _format_prefill_chunk_fields(fields),
+        )
 
 
 class TestGenerate(unittest.TestCase):

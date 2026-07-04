@@ -1,2 +1,5 @@
 include requirements.txt
 recursive-include mlx_lm/ *.py
+recursive-include mlx_lm/custom_kernels/glm_moe_dsa/csrc *
+include mlx_lm/custom_kernels/glm_moe_dsa/LICENSE
+include mlx_lm/custom_kernels/glm_moe_dsa/README.md

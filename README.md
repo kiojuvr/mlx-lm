@@ -14,6 +14,71 @@ This branch is not intended as an upstream `mlx-lm` PR. Several changes intentio
 - GLM-5.2-specific MLA latent int8 KV cache support via `--kv-bits 8`.
 - Server-side support for `--kv-bits`, `--kv-group-size`, and `--quantized-kv-start`.
 - Local GLM-5.2 runtime cache layout designed for one-command invalidation.
+- Vendored GLM MoE DSA native custom kernels for optional native DSA indexer
+  score/top-k, sparse MLA prefill, and experimental q projection probes. These
+  are built from this repository and no longer require a runtime oMLX checkout.
+
+### Native custom-kernel build
+
+The GLM DSA native routes are optional. Without them, the server still runs with
+the Python/MLX sparse prefill and projection fallbacks. To build the native
+kernels self-contained from this repository, install Apple's full Xcode, not
+only Command Line Tools. Xcode 26 may also require the separate Metal Toolchain
+component:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcodebuild -downloadComponent MetalToolchain
+```
+
+The build requires MLX 0.31.2, CMake 3.27+, nanobind 2.12.0, and wheel/setuptools
+inside the isolated build environment. The `pyproject.toml` build-system section
+pins those build dependencies. With `uv`, rebuild the editable install with:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+MLX_LM_WITH_CUSTOM_KERNEL=1 \
+uv pip install --python /Users/kioju/.venvs/mlx-glm52/bin/python --no-deps -e .
+```
+
+Verify that the vendored native extension is visible:
+
+```sh
+python - <<'PY'
+from mlx_lm.models import glm_moe_dsa
+print(glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status())
+PY
+```
+
+Expected fields include `available=True` and
+`source='mlx_lm.custom_kernels.glm_moe_dsa'`. The vendored sources live under
+`mlx_lm/custom_kernels/glm_moe_dsa` and are derived from oMLX's Apache-2.0 GLM
+custom kernels; see the license file in that directory.
+
+For a quick arithmetic smoke test that does not load the full model:
+
+```sh
+python benchmarks/glm52_prefill_benchmark.py \
+  --mode native-smoke \
+  --json-output glm52-native-smoke.json
+```
+
+Expected fields include `native_smoke_passed=True`,
+`native_indexer_smoke_passed=True`, and
+`native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`. The same smoke run
+also checks the native q8 V-up projection used for quantized GLM DSA
+`unembed_out` weights; expect `native_q8_vup_smoke_passed=True`.
+
+To time native q8 V-up against the MLX `quantized_matmul` fallback without
+loading the model:
+
+```sh
+python benchmarks/glm52_prefill_benchmark.py \
+  --mode native-smoke \
+  --native-smoke-benchmark-runs 20 \
+  --native-q8-vup-benchmark-q-len 256 \
+  --json-output glm52-native-smoke-bench.json
+```
 
 ### Recommended target model
 
@@ -48,6 +113,8 @@ are common rather than exceptional, the recommended starting point is:
 MLX_LM_PROMPT_CHECKPOINT_DEBUG=1 \
 MLX_METAL_FAST_SYNCH=1 \
 MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 \
+MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1 \
+MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144 \
 python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --host 0.0.0.0 \
@@ -55,11 +122,12 @@ python -m mlx_lm server \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
-  --prefill-step-size 2048 \
+  --prefill-step-size 8192 \
   --prefill-max-qk-tokens 67108864 \
   --glm-dsa-adaptive-prefill-step-size 0 \
   --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
   --checkpoint-save-exact disabled \
+  --checkpoint-shutdown-save-limit 0 \
   --request-max-tokens-floor 384000 \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
@@ -80,9 +148,9 @@ The recommended server command intentionally leaves `--temp` and `--top-p` unset
 
 `--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it. If the model still enters near-duplicate but non-exact loops, lower request sampling first (`temperature`, `top_p`) and add a small request-side `repetition_penalty` such as `1.05` to `1.10` when your client supports it.
 
-`--kv-bits 8` is not a prefill-compute speedup by itself. Its value is that GLM MLA int8 KV cache reduces long-context KV memory and keeps 200K+ prompts inside the intended memory envelope.
+`--kv-bits 8` is not a prefill-compute speedup by itself. Its value is that GLM MLA int8 KV cache reduces long-context KV memory and keeps 200K+ prompts inside the intended memory envelope. The native DSA indexer score/top-k route remains compatible with this setting because it uses the DSA indexer cache, not the GLM MLA KV cache.
 
-Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that writes and reuses disk prompt checkpoints, including frontier checkpoints. Disable final exact checkpoints for this long-running server profile: 190K-token exact checkpoints are around 11GB each on the tested setup and can spend tens of seconds writing only to be pruned immediately. The measured cold-prefill sweep favored `--prefill-step-size 2048`, `--prefill-max-qk-tokens 67108864`, and adaptive GLM DSA prefill disabled (`--glm-dsa-adaptive-prefill-step-size 0`). The QK cap shrinks only the chunks whose query-by-context product would get too large. Keep `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` at its default/effective 131072 handoff for now; lowering the sparse handoff threshold increased runtime and memory in the tested 128K runs. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery or memory pressure appears on your real prompt distribution, retry with `--prefill-step-size 1024` first, then 512.
+Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that writes and reuses disk prompt checkpoints, including frontier checkpoints. Disable final exact checkpoints for this long-running server profile: 190K-token exact checkpoints are around 11GB each on the tested setup and can spend tens of seconds writing only to be pruned immediately. The measured cold-prefill sweep now favors `--prefill-step-size 8192`, `--prefill-max-qk-tokens 67108864`, and adaptive GLM DSA prefill disabled (`--glm-dsa-adaptive-prefill-step-size 0`). The QK cap shrinks only the chunks whose query-by-context product would get too large; the 8192-token first chunk crosses the native sparse handoff immediately, then later chunks shrink automatically as the cap requires. Keep `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` at its default/effective 131072 handoff for the Python selected-KV sparse path; lowering that handoff increased runtime and memory in the tested 128K runs. The vendored native DSA indexer route is enabled by default through `MLX_LM_GLM_DSA_NATIVE_INDEXER` and can replace the Python/MLX indexer score plus top-k path for supported GLM-5.2 M3 chunks at context 4096 and above. The vendored native sparse MLA route has its own lower handoff, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 6144). `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1` lets it consume int8 GLM MLA KV cache by temporarily dequantizing the full latent KV cache for the native kernel; the recommended `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144` has been profiled through 204800 tokens with all chunks on the native sparse route and no dense fallback. Keep larger values bounded until your target context length is profiled. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery or memory pressure appears on your real prompt distribution, retry with `--prefill-step-size 4096` first, then 2048 and 1024.
 
 For shorter mixed workloads where throughput matters more than per-request TTFT
 and disk frontier checkpoints are less important, continuous batching can still
@@ -121,6 +189,7 @@ This fork automatically stores trusted local GLM-5.2 prompt checkpoints and reus
 Benchmark-backed measurements on this local fork showed exact 4096/8192-token checkpoint hits dropping TTFT from roughly 23s/52s to roughly 0.2s. Controlled LCP runs are the clean way to measure partial reuse: for example, an 8192-token cached prefix plus a 2048-token suffix should report `expected_reused_prefix_tokens=8192`, `disk_cached_tokens=8192`, `fresh_prompt_tokens=2048`, and `checkpoint_expected_match=true`.
 
 Use `--no-prompt-checkpoint` only for cold or disabled-baseline measurements. Use `--checkpoint-save-exact disabled` or `--no-save-exact-checkpoint` when you want to store only configured prefix/frontier checkpoints without also creating a final exact full-prompt checkpoint.
+Shutdown-time RAM checkpoint flushes are disabled by default via `--checkpoint-shutdown-save-limit 0`; only enable them for short bounded caches, and keep `--checkpoint-shutdown-max-tokens` below the largest prompt size you are willing to serialize during Ctrl+C shutdown.
 
 ### Controlled LCP benchmark examples
 
@@ -196,10 +265,105 @@ On the tested Mac Studio M3 Ultra 512GB setup, a controlled 10240-token run with
 
 ### Fast sparse DSA prefill caveat
 
-GLM DSA sparse prefill is enabled by default because the old dense fallback materialized full `(heads, query_length, context_length)` prefill tensors and could OOM well below the advertised long-context envelope. To avoid the exact sparse path becoming pathologically slow too early, it now waits until the effective context reaches one token below `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072), because generation prefill leaves the final prompt token for logits. For sparse chunks, MLA attention stays in latent space and avoids selected K/V projection; long chunks whose causal prefix already covers the full top-k set also skip the redundant selected-mask gather. Use `--fast-prefill disabled` only for short-context comparison runs. `--fast-prefill-query-chunk` controls selected-query microbatches, and `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK` controls the DSA indexer key block size. The practical TTFT win for repeated coding-agent prefixes is still checkpoint reuse.
+GLM DSA sparse prefill is enabled by default because the old dense fallback materialized full `(heads, query_length, context_length)` prefill tensors and could OOM well below the advertised long-context envelope. To avoid the Python selected-KV sparse path becoming pathologically slow too early, it waits until the effective context reaches one token below `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` (default 131072), because generation prefill leaves the final prompt token for logits. For sparse chunks, MLA attention stays in latent space and avoids selected K/V projection; long chunks whose causal prefix already covers the full top-k set also skip the redundant selected-mask gather. Use `--fast-prefill disabled` only for short-context comparison runs. `--fast-prefill-query-chunk` controls selected-query microbatches, and `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK` controls the DSA indexer key block size. If the vendored native extension is built, `MLX_LM_GLM_DSA_NATIVE_INDEXER` can route supported GLM-5.2 M3 indexer score/top-k chunks from context 4096 onward. This route remains usable with `--kv-bits 8`. `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL` can route supported GLM MLA chunks from its own `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` threshold (default 6144), without waiting for the Python sparse handoff. The int8 GLM MLA KV path is opt-in through `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1`; it keeps the cache stored as int8 but temporarily dequantizes the full latent KV tensor for native sparse MLA. Use `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT` as a memory guard.
+
+Benchmark rows include `glm_dsa_native_sparse_prefill_route_state`,
+`glm_dsa_native_sparse_prefill_primary_fallback`, and
+`glm_dsa_native_sparse_prefill_config_blocker`. With
+`--native-sparse-quantized-kv enabled`, 32K cold prefill on the tested setup
+dropped from about 395s to about 231s, replacing the long Python/MLX sparse
+attention tail with native sparse MLA while leaving q projection as the next
+large bottleneck. A later chunk-route sweep favored the 6144-token native sparse
+handoff: 8K prefill-stop improved from about 55.85s at 8192 to 53.72s, and 16K
+prefill-stop improved from about 110.28s at 8192 to 109.90s. Delaying the
+handoff to 10240 regressed the 16K run to about 112.15s. With that 6144-token
+handoff, raising the base prefill step from 2048 to 4096 reduced 16K
+prefill-stop from about 109.90s to 105.44s and 32K prefill-stop from about
+225.18s to 219.63s. Raising the base step again to 8192 with the same QK cap
+reduced 16K to 104.11s, 32K to 207.10s, 64K to 436.05s, and 128K to 963.13s.
+The larger first chunk avoids the early dense fallback and lowers total
+q-projection time; on the 128K run q projection dropped from about 550.84s at
+4096 to about 434.19s at 8192. The QK cap shrinks later chunks automatically,
+and 128K peak memory stayed about 336.41GB. Peak memory at 16K through 64K rose
+by about 0.53GB compared with the 4096-step runs.
+
+Extending the native sparse quantized-KV guard beyond 128K kept the route stable
+on the tested Mac Studio M3 Ultra 512GB setup. With `--prefill-step-size 8192`
+and `--prefill-max-qk-tokens 67108864`, cold prefill measured 160K at about
+1302.12s, 196608 tokens at about 1646.78s, and 204800 tokens at about 1739.78s.
+All three runs stayed on native sparse MLA with dense chunks at 0; the 204800
+run used 336 native chunks, peaked at about 340.64GB, and reported about
+730.91s in q projection, 491.57s in native sparse attention, and 196.14s in
+native indexer top-k.
+
+The vendored native `glm_dsa_q8_vup_flat` kernel can be enabled separately for
+quantized GLM DSA `unembed_out` projection when the fixed M3 GLM shape matches
+64 heads, latent dim 512, value dim 256, affine int8 weights, and group size 64.
+It is opt-in via `MLX_LM_GLM_DSA_NATIVE_Q8_VUP=1` or `--native-q8-vup enabled`
+because the model-free microbench can be slower than MLX `quantized_matmul` on
+some lengths. Benchmark rows report `glm_dsa_native_q8_vup_hits` and
+`glm_dsa_native_q8_vup_fallback_reasons`.
+
+For q4 `unembed_out` weights, `MLX_LM_GLM_DSA_NATIVE_Q4_VUP=1` /
+`--native-q4-vup enabled` enables the matching `glm_dsa_q4_vup_flat` probe. It
+is also disabled by default. On the tested 16K native sparse MLA profile it hit
+the q4 route but left end-to-end TTFT effectively unchanged.
+
+The vendored native q4 q projection probes are also opt-in:
+`MLX_LM_GLM_DSA_NATIVE_Q4_QA=1` / `--native-q4-qa enabled` and
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB=1` / `--native-q4-qb enabled`. They are useful for
+isolated profiling but are not part of the recommended server command yet. On
+the tested 8K cold prefill, q projection split into about 29.7s q_a projection,
+0.18s q_a RMSNorm, and 2.1s q_b projection; earlier q4 native probes did not
+reduce end-to-end TTFT.
+Use `--prefill-profile-isolate enabled` when reading q_projection sub-stage
+timings: without it, MLX lazy evaluation can charge upstream work to q_a. On a
+2K check, q_a changed from about 9.18s in normal profiling to about 0.23s with
+isolated profiling.
+With isolated profiling extended across indexer and attention stages, the tested
+8K native sparse run spent about 0.49s in DSA indexer top-k and about 16.87s in
+native sparse MLA attention, making sparse MLA attention the next attention-side
+target.
+
+The native sparse MLA kernel can also select an experimental tile with
+`MLX_LM_GLM_DSA_SPARSE_MLA_TILE` or `--native-sparse-mla-tile`; unset/default
+uses `bk256_dc32_wm8`. Available aliases are `bk128`, `bk256`,
+`bk128_dc64`, `wm4`, `bk128_wm4`, and `bk128_dc64_wm4`. This is a profiling
+knob, not a new recommended server default yet. For low-memory tile sweeps
+without loading the full model, use
+`benchmarks/glm52_sparse_mla_tile_microbench.py`. Initial synthetic sweeps at
+512x8192/topk2048 and 2048x16384/topk2048 still favored the default `bk256`
+tile.
+
+The q_a probe can also select a tile with
+`MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE` or `--native-q4-qa-tile`; unset/default uses
+`bk64`. Available tiles are `bk32`, `bk64`, `bm16`, `bn16`, `bn64`, `bm64`,
+`bm16bn64`, and `bm64bn64`. This is still an experimental measurement knob. On
+the same 8K
+benchmark build, native q4 q_a with `bk64` measured about 52.99s TTFT and
+26.41s q_a projection versus about 53.26s TTFT and 26.58s q_a projection with
+the native q4 q_a route disabled. The 2K run favored `bn64`, but the 8K run
+regressed to about 53.41s TTFT and 26.71s q_a projection, so `bn64` is not a
+long-context default. For low-memory tile sweeps without loading the full
+model, use `benchmarks/glm52_q4_qa_tile_microbench.py`.
+
+The q_b probe has a matching tile selector through
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE` or `--native-q4-qb-tile`; unset/default uses
+`bm64` for the opt-in native q4 q_b path. Available tiles are `bk32`, `bk64`,
+`bm16`, `bn16`, `bn64`, `bm64`, `bm16bn64`, `bm64bn64`, and `bk64bn64`. The
+standalone `benchmarks/glm52_q4_qb_tile_microbench.py` measured only a small
+tile-level margin, with `bm64` best on the 2048/8192 synthetic sweeps.
+
+There is also an opt-in q_a dense-cache probe:
+`MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It
+dequantizes each q4 `q_a_proj` weight to a dense fp16/bf16 matrix on first use
+and reuses it for later prefill calls. This trades roughly 1.5-2GB of extra
+resident memory for a warmed q_a projection path, so it is a measurement knob
+rather than a recommended server setting. On the tested 8K repeat run, the
+warmed path was effectively unchanged versus dense-cache disabled.
 
 **Bottleneck hypothesis**
-The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now.
+The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now. Benchmark JSON now includes `checkpoint_prefill_chunk_summaries` plus slowest-chunk and route-count columns so native sparse MLA/indexer policy changes can be evaluated chunk by chunk.
 
 ### OpenCode configuration example
 

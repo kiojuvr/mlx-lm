@@ -77,6 +77,112 @@ def _prompt_checkpoint_debug(message):
     logging.getLogger(__name__).info("prompt checkpoint: %s", message)
 
 
+_GLM_DSA_CHUNK_COUNTER_KEYS = (
+    "fast_prefill_hits",
+    "native_sparse_prefill_hits",
+    "native_indexer_hits",
+)
+_GLM_DSA_CHUNK_REASON_KEYS = (
+    "fallback_reasons",
+    "native_sparse_prefill_fallback_reasons",
+    "native_indexer_fallback_reasons",
+)
+_GLM_DSA_CHUNK_STAGE_KEYS = (
+    "q_projection",
+    "kv_cache_update",
+    "dsa_indexer_topk",
+    "native_indexer_scores",
+    "native_indexer_topk",
+    "latent_kv_dequantization",
+    "latent_kv_projection",
+    "native_sparse_kv_dequantization",
+    "sparse_gather",
+    "attention",
+    "native_sparse_attention",
+)
+
+
+def _glm_dsa_prefill_profile_snapshot():
+    module = sys.modules.get("mlx_lm.models.glm_moe_dsa")
+    getter = getattr(module, "get_glm_dsa_prefill_profile", None)
+    if getter is None:
+        return None
+    try:
+        profile = getter(reset=False)
+    except Exception:
+        return None
+    snapshot = {
+        key: int(profile.get(key, 0)) for key in _GLM_DSA_CHUNK_COUNTER_KEYS
+    }
+    for key in _GLM_DSA_CHUNK_REASON_KEYS:
+        snapshot[key] = dict(profile.get(key, {}))
+    stages = profile.get("stages", {})
+    snapshot["stages"] = {
+        stage: {
+            "seconds": float(stages.get(stage, {}).get("seconds", 0.0)),
+            "count": int(stages.get(stage, {}).get("count", 0)),
+        }
+        for stage in _GLM_DSA_CHUNK_STAGE_KEYS
+    }
+    return snapshot
+
+
+def _counter_delta(before, after, key):
+    return int(after.get(key, 0)) - int(before.get(key, 0))
+
+
+def _counter_dict_delta(before, after, key):
+    before_values = before.get(key, {})
+    after_values = after.get(key, {})
+    delta = {}
+    for reason in sorted(set(before_values) | set(after_values)):
+        value = int(after_values.get(reason, 0)) - int(before_values.get(reason, 0))
+        if value:
+            delta[reason] = value
+    return delta
+
+
+def _glm_dsa_prefill_profile_chunk_fields(before, after):
+    if before is None or after is None:
+        return {}
+    fields = {}
+    for key in _GLM_DSA_CHUNK_COUNTER_KEYS:
+        value = _counter_delta(before, after, key)
+        if value:
+            fields[f"glm_dsa_{key}"] = value
+    for key in _GLM_DSA_CHUNK_REASON_KEYS:
+        value = _counter_dict_delta(before, after, key)
+        if value:
+            fields[f"glm_dsa_{key}"] = value
+    before_stages = before.get("stages", {})
+    after_stages = after.get("stages", {})
+    for stage in _GLM_DSA_CHUNK_STAGE_KEYS:
+        before_stage = before_stages.get(stage, {})
+        after_stage = after_stages.get(stage, {})
+        seconds = float(after_stage.get("seconds", 0.0)) - float(
+            before_stage.get("seconds", 0.0)
+        )
+        count = int(after_stage.get("count", 0)) - int(
+            before_stage.get("count", 0)
+        )
+        if seconds:
+            fields[f"glm_dsa_{stage}_seconds"] = seconds
+        if count:
+            fields[f"glm_dsa_{stage}_count"] = count
+    return fields
+
+
+def _format_prefill_chunk_fields(fields):
+    parts = []
+    for key, value in fields.items():
+        if isinstance(value, dict):
+            value = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        elif isinstance(value, float):
+            value = f"{value:.6f}"
+        parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
 def _as_token_list(tokens):
     if tokens is None:
         return None
@@ -1233,6 +1339,7 @@ def generate_step(
                     n_to_process = store_length - prompt_processed_tokens
                     break
             chunk_start_tokens = prompt_processed_tokens
+            chunk_profile_before = _glm_dsa_prefill_profile_snapshot()
             chunk_t0 = time.perf_counter()
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
@@ -1245,6 +1352,12 @@ def generate_step(
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             chunk_seconds = time.perf_counter() - chunk_t0
+            chunk_profile_after = _glm_dsa_prefill_profile_snapshot()
+            chunk_fields = _glm_dsa_prefill_profile_chunk_fields(
+                chunk_profile_before,
+                chunk_profile_after,
+            )
+            chunk_profile_suffix = _format_prefill_chunk_fields(chunk_fields)
             prompt_processed_tokens += n_to_process
             _prompt_checkpoint_debug(
                 "prefill chunk "
@@ -1257,6 +1370,7 @@ def generate_step(
                 f"effective_prefill_step_size={n_to_process} "
                 f"prefill_max_qk_tokens={prefill_max_qk_tokens} "
                 f"chunk_seconds={chunk_seconds:.6f}"
+                f"{' ' + chunk_profile_suffix if chunk_profile_suffix else ''}"
             )
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]

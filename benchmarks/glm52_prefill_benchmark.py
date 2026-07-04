@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import re
 import statistics
@@ -276,6 +277,29 @@ def build_queued_prompt_texts(tokenizer, args):
     return prompts
 
 
+def parse_checkpoint_log_value(value):
+    if value == "None":
+        return None
+    if value.startswith("{") or value.startswith("["):
+        return json.loads(value)
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def chunk_sparse_route(values):
+    if int(values.get("glm_dsa_native_sparse_prefill_hits", 0) or 0) > 0:
+        return "native_sparse"
+    if int(values.get("glm_dsa_fast_prefill_hits", 0) or 0) > 0:
+        return "fast_sparse"
+    return "dense"
+
+
 def extract_checkpoint_summary(messages):
     summary = {
         "checkpoint_total_prompt_tokens": None,
@@ -291,6 +315,16 @@ def extract_checkpoint_summary(messages):
         "checkpoint_prefill_chunks": 0,
         "checkpoint_max_adaptive_prefill_step_size": None,
         "checkpoint_max_effective_prefill_step_size": None,
+        "checkpoint_prefill_chunk_seconds_total": 0.0,
+        "checkpoint_max_prefill_chunk_seconds": None,
+        "checkpoint_slowest_prefill_chunk_start_tokens": None,
+        "checkpoint_slowest_prefill_chunk_tokens": None,
+        "checkpoint_slowest_prefill_chunk_route": None,
+        "checkpoint_native_sparse_prefill_chunks": 0,
+        "checkpoint_fast_sparse_prefill_chunks": 0,
+        "checkpoint_dense_prefill_chunks": 0,
+        "checkpoint_native_indexer_chunks": 0,
+        "checkpoint_prefill_chunk_summaries": [],
         "checkpoint_resolution": None,
         "checkpoint_lookup_seconds": None,
         "checkpoint_files_scanned": None,
@@ -302,7 +336,7 @@ def extract_checkpoint_summary(messages):
     }
     for message in messages:
         if "prefill summary " in message:
-            for key, value in re.findall(r"([a-z_]+)=([^ ]+)", message):
+            for key, value in re.findall(r"([a-z0-9_]+)=([^ ]+)", message):
                 output_key = {
                     "total_prompt_tokens": "checkpoint_total_prompt_tokens",
                     "prefill_step_size": "checkpoint_prefill_step_size",
@@ -338,8 +372,36 @@ def extract_checkpoint_summary(messages):
 
         if "prefill chunk " not in message:
             continue
-        values = dict(re.findall(r"([a-z_]+)=([^ ]+)", message))
+        values = {
+            key: parse_checkpoint_log_value(value)
+            for key, value in re.findall(r"([a-z0-9_]+)=([^ ]+)", message)
+        }
         summary["checkpoint_prefill_chunks"] += 1
+        route = chunk_sparse_route(values)
+        if route == "native_sparse":
+            summary["checkpoint_native_sparse_prefill_chunks"] += 1
+        elif route == "fast_sparse":
+            summary["checkpoint_fast_sparse_prefill_chunks"] += 1
+        else:
+            summary["checkpoint_dense_prefill_chunks"] += 1
+        if int(values.get("glm_dsa_native_indexer_hits", 0) or 0) > 0:
+            summary["checkpoint_native_indexer_chunks"] += 1
+        chunk_seconds = values.get("chunk_seconds")
+        if chunk_seconds is not None:
+            chunk_seconds = float(chunk_seconds)
+            summary["checkpoint_prefill_chunk_seconds_total"] += chunk_seconds
+            if (
+                summary["checkpoint_max_prefill_chunk_seconds"] is None
+                or chunk_seconds > summary["checkpoint_max_prefill_chunk_seconds"]
+            ):
+                summary["checkpoint_max_prefill_chunk_seconds"] = chunk_seconds
+                summary["checkpoint_slowest_prefill_chunk_start_tokens"] = values.get(
+                    "start_tokens"
+                )
+                summary["checkpoint_slowest_prefill_chunk_tokens"] = values.get(
+                    "chunk_tokens"
+                )
+                summary["checkpoint_slowest_prefill_chunk_route"] = route
         for key, output_key in (
             (
                 "adaptive_prefill_step_size",
@@ -355,7 +417,70 @@ def extract_checkpoint_summary(messages):
             value = int(values[key])
             current = summary[output_key]
             summary[output_key] = value if current is None else max(current, value)
+        chunk_summary = {
+            "start_tokens": values.get("start_tokens"),
+            "chunk_tokens": values.get("chunk_tokens"),
+            "processed_tokens": values.get("processed_tokens"),
+            "route": route,
+            "chunk_seconds": chunk_seconds,
+            "native_sparse_prefill_hits": values.get(
+                "glm_dsa_native_sparse_prefill_hits",
+                0,
+            ),
+            "fast_prefill_hits": values.get("glm_dsa_fast_prefill_hits", 0),
+            "native_indexer_hits": values.get("glm_dsa_native_indexer_hits", 0),
+            "native_sparse_prefill_fallback_reasons": values.get(
+                "glm_dsa_native_sparse_prefill_fallback_reasons",
+                {},
+            ),
+            "fast_prefill_fallback_reasons": values.get(
+                "glm_dsa_fallback_reasons",
+                {},
+            ),
+            "native_indexer_fallback_reasons": values.get(
+                "glm_dsa_native_indexer_fallback_reasons",
+                {},
+            ),
+            "native_indexer_scores_seconds": values.get(
+                "glm_dsa_native_indexer_scores_seconds"
+            ),
+            "native_indexer_topk_seconds": values.get(
+                "glm_dsa_native_indexer_topk_seconds"
+            ),
+            "native_sparse_attention_seconds": values.get(
+                "glm_dsa_native_sparse_attention_seconds"
+            ),
+            "attention_seconds": values.get("glm_dsa_attention_seconds"),
+            "latent_kv_projection_seconds": values.get(
+                "glm_dsa_latent_kv_projection_seconds"
+            ),
+        }
+        summary["checkpoint_prefill_chunk_summaries"].append(chunk_summary)
     return summary
+
+
+def effective_native_q4_qa_tile() -> str:
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_TILE_ENV, "default")
+    tile = value.strip().lower()
+    if tile in ("", "default"):
+        return "bk64"
+    return tile
+
+
+def effective_native_q4_qb_tile() -> str:
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV, "default")
+    tile = value.strip().lower()
+    if tile in ("", "default"):
+        return "bm64"
+    return tile
+
+
+def effective_sparse_mla_tile() -> str:
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV, "default")
+    tile = value.strip().lower()
+    if tile in ("", "default"):
+        return "bk256_dc32_wm8"
+    return tile
 
 
 def configure_glm_dsa_fast_prefill(args):
@@ -363,6 +488,72 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
     elif args.fast_prefill == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+    native_sparse_prefill = getattr(args, "native_sparse_prefill", "default")
+    if native_sparse_prefill == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
+    elif native_sparse_prefill == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "0"
+    native_sparse_quantized_kv = getattr(
+        args, "native_sparse_quantized_kv", "default"
+    )
+    if native_sparse_quantized_kv == "enabled":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        ] = "1"
+    elif native_sparse_quantized_kv == "disabled":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+        ] = "0"
+    native_sparse_quantized_kv_max_context = getattr(
+        args,
+        "native_sparse_quantized_kv_max_context",
+        None,
+    )
+    if native_sparse_quantized_kv_max_context is not None:
+        os.environ[
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV
+        ] = str(native_sparse_quantized_kv_max_context)
+    native_indexer = getattr(args, "native_indexer", "default")
+    if native_indexer == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "1"
+    elif native_indexer == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV] = "0"
+    native_q8_vup = getattr(args, "native_q8_vup", "default")
+    if native_q8_vup == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "1"
+    elif native_q8_vup == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV] = "0"
+    native_q4_vup = getattr(args, "native_q4_vup", "default")
+    if native_q4_vup == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV] = "1"
+    elif native_q4_vup == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV] = "0"
+    q_a_dense_cache = getattr(args, "q_a_dense_cache", "default")
+    if q_a_dense_cache == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "1"
+    elif q_a_dense_cache == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "0"
+    native_q4_qa = getattr(args, "native_q4_qa", "default")
+    if native_q4_qa == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "1"
+    elif native_q4_qa == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "0"
+    native_q4_qa_tile = getattr(args, "native_q4_qa_tile", "default")
+    if native_q4_qa_tile != "default":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_TILE_ENV] = native_q4_qa_tile
+    native_sparse_mla_tile = getattr(args, "native_sparse_mla_tile", "default")
+    if native_sparse_mla_tile != "default":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV
+        ] = native_sparse_mla_tile
+    native_q4_qb = getattr(args, "native_q4_qb", "default")
+    if native_q4_qb == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
+    elif native_q4_qb == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "0"
+    native_q4_qb_tile = getattr(args, "native_q4_qb_tile", "default")
+    if native_q4_qb_tile != "default":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV] = native_q4_qb_tile
     if args.fast_prefill_query_chunk is not None:
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = str(
             args.fast_prefill_query_chunk
@@ -375,8 +566,20 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = str(
             args.fast_prefill_min_context
         )
+    native_sparse_prefill_min_context = getattr(
+        args, "native_sparse_prefill_min_context", None
+    )
+    if native_sparse_prefill_min_context is not None:
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV] = str(
+            native_sparse_prefill_min_context
+        )
     if args.prefill_profile:
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ENV] = "1"
+    prefill_profile_isolate = getattr(args, "prefill_profile_isolate", "default")
+    if prefill_profile_isolate == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV] = "1"
+    elif prefill_profile_isolate == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV] = "0"
 
 
 def reset_glm_dsa_profile():
@@ -385,12 +588,26 @@ def reset_glm_dsa_profile():
 
 def collect_glm_dsa_profile(args):
     profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+    native_status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
+    native_indexer_status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
+    native_q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
+    native_q4_vup_status = glm_moe_dsa.get_glm_dsa_native_q4_vup_status()
+    native_q4_qa_status = glm_moe_dsa.get_glm_dsa_native_q4_qa_status()
+    native_q4_qb_status = glm_moe_dsa.get_glm_dsa_native_q4_qb_status()
     stage_values = {}
     for stage, values in profile["stages"].items():
         key = f"glm_dsa_{stage}_seconds"
         stage_values[key] = values["seconds"] if args.prefill_profile else None
         stage_values[f"glm_dsa_{stage}_count"] = values["count"]
     return {
+        "glm_dsa_prefill_profile": bool(args.prefill_profile),
+        "glm_dsa_prefill_profile_isolate": getattr(
+            args, "prefill_profile_isolate", "default"
+        ),
+        "glm_dsa_prefill_profile_isolate_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV,
+            "default-off",
+        ),
         "glm_dsa_fast_prefill": args.fast_prefill,
         "glm_dsa_fast_prefill_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
@@ -408,14 +625,679 @@ def collect_glm_dsa_profile(args):
             glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
             "default",
         ),
+        "glm_dsa_native_sparse_prefill": getattr(
+            args, "native_sparse_prefill", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            "default-on",
+        ),
+        "glm_dsa_native_sparse_prefill_available": native_status["available"],
+        "glm_dsa_native_sparse_prefill_source": native_status["source"],
+        "glm_dsa_native_sparse_prefill_import_error": native_status["import_error"],
+        "glm_dsa_native_sparse_prefill_min_context": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+            "default",
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv": getattr(
+            args, "native_sparse_quantized_kv", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_max_context": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
+            "default",
+        ),
+        "glm_dsa_sparse_mla_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_sparse_mla_tile": effective_sparse_mla_tile(),
         "glm_dsa_fast_prefill_hits": profile["fast_prefill_hits"],
         "glm_dsa_fast_prefill_fallback_reasons": profile["fallback_reasons"],
+        "glm_dsa_native_sparse_prefill_hits": profile[
+            "native_sparse_prefill_hits"
+        ],
+        "glm_dsa_native_sparse_prefill_fallback_reasons": profile[
+            "native_sparse_prefill_fallback_reasons"
+        ],
+        "glm_dsa_native_indexer": getattr(args, "native_indexer", "default"),
+        "glm_dsa_native_indexer_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_ENV,
+            "default-on",
+        ),
+        "glm_dsa_native_indexer_available": native_indexer_status["available"],
+        "glm_dsa_native_indexer_source": native_indexer_status["source"],
+        "glm_dsa_native_indexer_import_error": native_indexer_status["import_error"],
+        "glm_dsa_native_indexer_scores_available": native_indexer_status[
+            "scores_available"
+        ],
+        "glm_dsa_native_indexer_topk_available": native_indexer_status[
+            "topk_available"
+        ],
+        "glm_dsa_native_indexer_min_context": native_indexer_status["min_context"],
+        "glm_dsa_native_indexer_hits": profile.get("native_indexer_hits", 0),
+        "glm_dsa_native_indexer_fallback_reasons": profile.get(
+            "native_indexer_fallback_reasons", {}
+        ),
+        "glm_dsa_native_q8_vup_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q8_VUP_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q8_vup_available": native_q8_vup_status["available"],
+        "glm_dsa_native_q8_vup_source": native_q8_vup_status["source"],
+        "glm_dsa_native_q8_vup_import_error": native_q8_vup_status["import_error"],
+        "glm_dsa_native_q8_vup_hits": profile["native_q8_vup_hits"],
+        "glm_dsa_native_q8_vup_fallback_reasons": profile[
+            "native_q8_vup_fallback_reasons"
+        ],
+        "glm_dsa_native_q4_vup": getattr(args, "native_q4_vup", "default"),
+        "glm_dsa_native_q4_vup_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_VUP_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q4_vup_available": native_q4_vup_status["available"],
+        "glm_dsa_native_q4_vup_source": native_q4_vup_status["source"],
+        "glm_dsa_native_q4_vup_import_error": native_q4_vup_status[
+            "import_error"
+        ],
+        "glm_dsa_native_q4_vup_hits": profile["native_q4_vup_hits"],
+        "glm_dsa_native_q4_vup_fallback_reasons": profile[
+            "native_q4_vup_fallback_reasons"
+        ],
+        "glm_dsa_q_a_dense_cache": getattr(args, "q_a_dense_cache", "default"),
+        "glm_dsa_q_a_dense_cache_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+            "default-off",
+        ),
+        "glm_dsa_q_a_dense_cache_hits": profile["q_a_dense_cache_hits"],
+        "glm_dsa_q_a_dense_cache_builds": profile["q_a_dense_cache_builds"],
+        "glm_dsa_q_a_dense_cache_fallback_reasons": profile[
+            "q_a_dense_cache_fallback_reasons"
+        ],
+        "glm_dsa_native_q4_qa": getattr(args, "native_q4_qa", "default"),
+        "glm_dsa_native_q4_qa_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q4_qa_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_native_q4_qa_tile": effective_native_q4_qa_tile(),
+        "glm_dsa_native_q4_qa_available": native_q4_qa_status["available"],
+        "glm_dsa_native_q4_qa_source": native_q4_qa_status["source"],
+        "glm_dsa_native_q4_qa_import_error": native_q4_qa_status["import_error"],
+        "glm_dsa_native_q4_qa_hits": profile["native_q4_qa_hits"],
+        "glm_dsa_native_q4_qa_fallback_reasons": profile[
+            "native_q4_qa_fallback_reasons"
+        ],
+        "glm_dsa_native_q4_qb": getattr(args, "native_q4_qb", "default"),
+        "glm_dsa_native_q4_qb_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q4_qb_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_native_q4_qb_tile": effective_native_q4_qb_tile(),
+        "glm_dsa_native_q4_qb_available": native_q4_qb_status["available"],
+        "glm_dsa_native_q4_qb_source": native_q4_qb_status["source"],
+        "glm_dsa_native_q4_qb_import_error": native_q4_qb_status["import_error"],
+        "glm_dsa_native_q4_qb_hits": profile["native_q4_qb_hits"],
+        "glm_dsa_native_q4_qb_fallback_reasons": profile[
+            "native_q4_qb_fallback_reasons"
+        ],
+        **native_sparse_prefill_route_diagnostics(args, profile, native_status),
+        "glm_dsa_native_q8_vup": getattr(args, "native_q8_vup", "default"),
         **stage_values,
     }
 
 
+def primary_counter_reason(reasons):
+    if not reasons:
+        return None
+    return sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _fast_prefill_disabled_by_config(args):
+    if getattr(args, "fast_prefill", "default") == "disabled":
+        return True
+    value = os.environ.get(glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV)
+    if value is None:
+        return False
+    return value.strip().lower() in ("", "0", "false", "no", "off")
+
+
+def native_sparse_prefill_attempt_min_context(native_status):
+    return int(native_status.get("min_context") or 0)
+
+
+def native_sparse_prefill_config_blocker(args, native_status):
+    if _fast_prefill_disabled_by_config(args):
+        return "fast_prefill_disabled"
+    if not native_status["enabled"]:
+        return "disabled"
+    if not native_status["available"]:
+        return "missing_symbol"
+    mode = getattr(args, "mode", "single")
+    batch_size = getattr(args, "batch_size", 1)
+    if mode == "batch" and batch_size != 1:
+        return "batch_size_not_one"
+    kv_bits = getattr(args, "kv_bits", None)
+    if kv_bits is None:
+        return None
+    if kv_bits != 8:
+        return f"unsupported_kv_bits:{kv_bits}"
+    quantized_kv_enabled = os.environ.get(
+        glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV
+    )
+    quantized_kv_opt_in = (
+        quantized_kv_enabled is not None
+        and quantized_kv_enabled.strip().lower()
+        not in ("", "0", "false", "no", "off")
+    )
+    if quantized_kv_opt_in:
+        return None
+    attempt_min_context = native_sparse_prefill_attempt_min_context(native_status)
+    quantized_kv_start = getattr(args, "quantized_kv_start", 0)
+    if quantized_kv_start <= attempt_min_context:
+        return "quantized_kv_at_native_threshold"
+    return "quantized_kv_after_native_threshold"
+
+
+def native_sparse_prefill_route_state(profile, native_status):
+    hits = profile["native_sparse_prefill_hits"]
+    fallback_reasons = profile["native_sparse_prefill_fallback_reasons"]
+    if hits and fallback_reasons:
+        return "hit_with_fallbacks"
+    if hits:
+        return "hit"
+    if fallback_reasons:
+        return "fallback"
+    if not native_status["enabled"]:
+        return "disabled"
+    if not native_status["available"]:
+        return "unavailable"
+    return "not_attempted"
+
+
+def native_sparse_prefill_route_diagnostics(args, profile, native_status):
+    return {
+        "glm_dsa_native_sparse_prefill_route_state": (
+            native_sparse_prefill_route_state(profile, native_status)
+        ),
+        "glm_dsa_native_sparse_prefill_primary_fallback": primary_counter_reason(
+            profile["native_sparse_prefill_fallback_reasons"]
+        ),
+        "glm_dsa_native_sparse_prefill_config_blocker": (
+            native_sparse_prefill_config_blocker(args, native_status)
+        ),
+        "glm_dsa_native_sparse_prefill_attempt_min_context": (
+            native_sparse_prefill_attempt_min_context(native_status)
+        ),
+    }
+
+
+def _native_smoke_status_fields(args, status):
+    return {
+        "glm_dsa_native_sparse_prefill": getattr(
+            args, "native_sparse_prefill", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV,
+            "default-on",
+        ),
+        "glm_dsa_native_sparse_prefill_available": status["available"],
+        "glm_dsa_native_sparse_prefill_source": status["source"],
+        "glm_dsa_native_sparse_prefill_import_error": status["import_error"],
+        "glm_dsa_native_sparse_prefill_min_context": status["min_context"],
+        "glm_dsa_native_sparse_prefill_quantized_kv": getattr(
+            args, "native_sparse_quantized_kv", "default"
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_sparse_prefill_quantized_kv_max_context": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV,
+            "default",
+        ),
+        "glm_dsa_sparse_mla_tile_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_SPARSE_MLA_TILE_ENV,
+            "default",
+        ),
+        "glm_dsa_sparse_mla_tile": effective_sparse_mla_tile(),
+    }
+
+
+def _native_smoke_symbols(source):
+    if source not in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        if source == "mlx.core.fast":
+            return ("glm_dsa_sparse_mla_attention",)
+        return ()
+    fast = __import__(source, fromlist=["fast"]).fast
+    native_symbols = getattr(fast, "native_symbols", None)
+    if native_symbols is None:
+        return ()
+    return tuple(native_symbols())
+
+
+def _native_smoke_kernel(source):
+    if source in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        fast = __import__(source, fromlist=["fast"]).fast
+        return fast.glm_dsa_sparse_mla_attention
+    if source == "mlx.core.fast":
+        return mx.fast.glm_dsa_sparse_mla_attention
+    loader = getattr(glm_moe_dsa, "_native_sparse_mla_kernel", None)
+    if loader is None:
+        return None
+    return loader()
+
+
+def _native_q8_vup_smoke_kernel(source):
+    if source in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        fast = __import__(source, fromlist=["fast"]).fast
+        return fast.glm_dsa_q8_vup_flat
+    if source == "mlx.core.fast":
+        return mx.fast.glm_dsa_q8_vup_flat
+    loader = getattr(glm_moe_dsa, "_native_q8_vup_kernel", None)
+    if loader is None:
+        return None
+    return loader()
+
+
+def _native_smoke_dense_reference(q_latent, q_pe, kv_latent, k_pe, scale):
+    B, H, L, _ = q_latent.shape
+    K = kv_latent.shape[2]
+    latent = mx.broadcast_to(kv_latent, (B, H, K, kv_latent.shape[-1]))
+    pe = mx.broadcast_to(k_pe, (B, H, K, k_pe.shape[-1]))
+    scores = mx.matmul(q_latent, mx.swapaxes(latent, -1, -2))
+    scores = scores + mx.matmul(q_pe, mx.swapaxes(pe, -1, -2))
+    scores = scores * scale
+
+    q_positions = mx.arange(L).reshape(1, 1, L, 1)
+    k_positions = mx.arange(K).reshape(1, 1, 1, K)
+    causal_mask = k_positions <= (K - L + q_positions)
+    scores = mx.where(causal_mask, scores, mx.array(-1e9, dtype=scores.dtype))
+    weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q_latent.dtype)
+    return mx.matmul(weights, latent)
+
+
+def benchmark_mx_callable(fn, runs, warmup_runs):
+    for _ in range(warmup_runs):
+        value = fn()
+        mx.eval(value)
+    mx.synchronize()
+
+    timings = []
+    for _ in range(runs):
+        start = time.perf_counter()
+        value = fn()
+        mx.eval(value)
+        mx.synchronize()
+        timings.append(time.perf_counter() - start)
+    return {
+        "mean": statistics.mean(timings),
+        "min": min(timings),
+        "p50": percentile(timings, 50),
+    }
+
+
+def _run_native_q8_vup_smoke(row, args, status):
+    if not status["available"]:
+        row["native_q8_vup_smoke_error"] = "native q8 V-up kernel unavailable"
+        return
+    try:
+        kernel = _native_q8_vup_smoke_kernel(status["source"])
+        if kernel is None:
+            raise RuntimeError("native q8 V-up kernel unavailable")
+
+        B, H = 1, 64
+        L = args.native_smoke_q_len
+        latent_dim = 512
+        value_dim = 256
+        mx.random.seed(args.native_smoke_seed + 1)
+        x = mx.random.normal((B, H, L, latent_dim), dtype=mx.float16) * 0.02
+        weight = mx.random.normal(
+            (H, value_dim, latent_dim), dtype=mx.float16
+        ) * 0.02
+        q_weight, scales, biases = mx.quantize(
+            weight,
+            group_size=64,
+            bits=8,
+            mode="affine",
+        )
+        output = kernel(x, q_weight, scales, biases)
+        reference = _native_q8_vup_reference(x, q_weight, scales, biases)
+        diff = mx.abs(output.astype(mx.float32) - reference.astype(mx.float32))
+        mx.eval(output, reference, diff)
+
+        max_abs_diff = float(mx.max(diff).item())
+        mean_abs_diff = float(mx.mean(diff).item())
+        row.update(
+            {
+                "native_q8_vup_smoke_shape": list(output.shape),
+                "native_q8_vup_smoke_max_abs_diff": max_abs_diff,
+                "native_q8_vup_smoke_mean_abs_diff": mean_abs_diff,
+                "native_q8_vup_smoke_passed": (
+                    max_abs_diff <= args.native_smoke_max_diff
+                ),
+            }
+        )
+        benchmark_runs = getattr(args, "native_smoke_benchmark_runs", 0)
+        if benchmark_runs > 0:
+            _run_native_q8_vup_benchmark(
+                row,
+                args,
+                kernel,
+                q_weight,
+                scales,
+                biases,
+                H,
+                latent_dim,
+            )
+    except Exception as exc:
+        row["native_q8_vup_smoke_error"] = repr(exc)
+
+
+def _native_q8_vup_reference(x, q_weight, scales, biases):
+    B, H, L, V = (*x.shape[:3], q_weight.shape[1])
+    reference = mx.quantized_matmul(
+        x,
+        q_weight,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=64,
+        bits=8,
+        mode="affine",
+    )
+    return reference.transpose(0, 2, 1, 3).reshape(B, L, H * V)
+
+
+def _native_indexer_smoke_reference(q, k, weights, *, causal=True):
+    scores = q @ k.swapaxes(-1, -2)
+    scores = mx.maximum(scores, 0)
+    scores = scores * weights.swapaxes(-1, -2)[..., None]
+    scores = scores.sum(axis=1, keepdims=True)
+    if causal:
+        L = q.shape[2]
+        K = k.shape[2]
+        q_positions = mx.arange(L).reshape(1, 1, L, 1)
+        k_positions = mx.arange(K).reshape(1, 1, 1, K)
+        causal_mask = k_positions <= (K - L + q_positions)
+        scores = mx.where(causal_mask, scores, mx.array(-1e9, dtype=scores.dtype))
+    return scores
+
+
+def _run_native_indexer_smoke(row, args, status):
+    if not status["available"]:
+        row["native_indexer_smoke_error"] = "native DSA indexer kernels unavailable"
+        return
+    try:
+        B = 1
+        H = 32
+        L = max(64, ((args.native_smoke_q_len + 63) // 64) * 64)
+        K = max(4096, args.native_smoke_k_len)
+        D = 128
+        topk = 2048
+        mx.random.seed(args.native_smoke_seed + 3)
+        q = mx.random.normal((B, H, L, D), dtype=mx.float16) * 0.02
+        k = mx.random.normal((B, 1, K, D), dtype=mx.float16) * 0.02
+        weights = mx.random.normal((B, L, H), dtype=mx.float16) * 0.02
+        scores = glm_moe_dsa._native_indexer_scores(
+            q,
+            k,
+            weights,
+            causal=True,
+            skip_causal_future_store=False,
+            causal_q_offset=K - L,
+        )
+        if scores is None:
+            raise RuntimeError("native DSA indexer score kernel unavailable")
+        reference = _native_indexer_smoke_reference(q, k, weights, causal=True)
+        q_positions = mx.arange(L).reshape(1, 1, L, 1)
+        k_positions = mx.arange(K).reshape(1, 1, 1, K)
+        causal_mask = k_positions <= (K - L + q_positions)
+        diff = mx.where(
+            causal_mask,
+            mx.abs(scores.astype(mx.float32) - reference.astype(mx.float32)),
+            mx.zeros(scores.shape, dtype=mx.float32),
+        )
+        topk_indices = glm_moe_dsa._native_indexer_topk_indices(
+            scores,
+            topk,
+            bucketed=True,
+            causal_valid_prefix=True,
+        )
+        if topk_indices is None:
+            raise RuntimeError("native DSA indexer top-k kernel unavailable")
+        selected = mx.take_along_axis(
+            reference,
+            topk_indices.astype(mx.int32),
+            axis=-1,
+        )
+        threshold = mx.sort(reference, axis=-1)[..., -topk:]
+        threshold_min = mx.min(threshold, axis=-1, keepdims=True)
+        topk_margin = mx.min(selected - threshold_min)
+        mx.eval(scores, reference, diff, topk_indices, selected, threshold, topk_margin)
+
+        max_abs_diff = float(mx.max(diff).item())
+        mean_abs_diff = float(mx.mean(diff).item())
+        min_topk_margin = float(topk_margin.item())
+        row.update(
+            {
+                "native_indexer_smoke_available": status["available"],
+                "native_indexer_smoke_source": status["source"],
+                "native_indexer_smoke_import_error": status["import_error"],
+                "native_indexer_smoke_score_shape": list(scores.shape),
+                "native_indexer_smoke_topk_shape": list(topk_indices.shape),
+                "native_indexer_smoke_max_abs_diff": max_abs_diff,
+                "native_indexer_smoke_mean_abs_diff": mean_abs_diff,
+                "native_indexer_smoke_min_topk_margin": min_topk_margin,
+                "native_indexer_smoke_passed": (
+                    max_abs_diff <= args.native_smoke_max_diff
+                    and min_topk_margin >= -args.native_smoke_max_diff
+                ),
+            }
+        )
+    except Exception as exc:
+        row["native_indexer_smoke_error"] = repr(exc)
+
+
+def _run_native_q8_vup_benchmark(
+    row,
+    args,
+    kernel,
+    q_weight,
+    scales,
+    biases,
+    heads,
+    latent_dim,
+):
+    benchmark_runs = args.native_smoke_benchmark_runs
+    benchmark_q_len = args.native_q8_vup_benchmark_q_len
+    warmup_runs = args.native_smoke_benchmark_warmup_runs
+    row.update(
+        {
+            "native_q8_vup_benchmark_runs": benchmark_runs,
+            "native_q8_vup_benchmark_warmup_runs": warmup_runs,
+            "native_q8_vup_benchmark_q_len": benchmark_q_len,
+        }
+    )
+    try:
+        mx.random.seed(args.native_smoke_seed + 2)
+        x = mx.random.normal(
+            (1, heads, benchmark_q_len, latent_dim), dtype=mx.float16
+        ) * 0.02
+
+        native_timings = benchmark_mx_callable(
+            lambda: kernel(x, q_weight, scales, biases),
+            benchmark_runs,
+            warmup_runs,
+        )
+        reference_timings = benchmark_mx_callable(
+            lambda: _native_q8_vup_reference(x, q_weight, scales, biases),
+            benchmark_runs,
+            warmup_runs,
+        )
+        native_mean = native_timings["mean"]
+        reference_mean = reference_timings["mean"]
+        row.update(
+            {
+                "native_q8_vup_native_seconds_mean": native_mean,
+                "native_q8_vup_native_seconds_min": native_timings["min"],
+                "native_q8_vup_native_seconds_p50": native_timings["p50"],
+                "native_q8_vup_reference_seconds_mean": reference_mean,
+                "native_q8_vup_reference_seconds_min": reference_timings["min"],
+                "native_q8_vup_reference_seconds_p50": reference_timings["p50"],
+                "native_q8_vup_speedup_mean": (
+                    reference_mean / native_mean if native_mean > 0 else None
+                ),
+                "native_q8_vup_benchmark_error": None,
+            }
+        )
+    except Exception as exc:
+        row["native_q8_vup_benchmark_error"] = repr(exc)
+
+
+def run_native_kernel_smoke(args):
+    status = glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status()
+    indexer_status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
+    q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
+    row = {
+        "case": "native-smoke",
+        "mode": "native-smoke",
+        "native_smoke_available": status["available"],
+        "native_smoke_source": status["source"],
+        "native_smoke_import_error": status["import_error"],
+        "native_smoke_symbols": (),
+        "native_smoke_q_len": args.native_smoke_q_len,
+        "native_smoke_k_len": args.native_smoke_k_len,
+        "native_smoke_seed": args.native_smoke_seed,
+        "native_smoke_max_diff": args.native_smoke_max_diff,
+        "native_smoke_shape": None,
+        "native_smoke_max_abs_diff": None,
+        "native_smoke_mean_abs_diff": None,
+        "native_smoke_passed": False,
+        "native_smoke_error": None,
+        "native_indexer_smoke_available": indexer_status["available"],
+        "native_indexer_smoke_source": indexer_status["source"],
+        "native_indexer_smoke_import_error": indexer_status["import_error"],
+        "native_indexer_smoke_score_shape": None,
+        "native_indexer_smoke_topk_shape": None,
+        "native_indexer_smoke_max_abs_diff": None,
+        "native_indexer_smoke_mean_abs_diff": None,
+        "native_indexer_smoke_min_topk_margin": None,
+        "native_indexer_smoke_passed": False,
+        "native_indexer_smoke_error": None,
+        "native_q8_vup_smoke_available": q8_vup_status["available"],
+        "native_q8_vup_smoke_source": q8_vup_status["source"],
+        "native_q8_vup_smoke_import_error": q8_vup_status["import_error"],
+        "native_q8_vup_smoke_shape": None,
+        "native_q8_vup_smoke_max_abs_diff": None,
+        "native_q8_vup_smoke_mean_abs_diff": None,
+        "native_q8_vup_smoke_passed": False,
+        "native_q8_vup_smoke_error": None,
+        "native_q8_vup_benchmark_runs": getattr(
+            args, "native_smoke_benchmark_runs", 0
+        ),
+        "native_q8_vup_benchmark_warmup_runs": getattr(
+            args, "native_smoke_benchmark_warmup_runs", 0
+        ),
+        "native_q8_vup_benchmark_q_len": getattr(
+            args, "native_q8_vup_benchmark_q_len", None
+        ),
+        "native_q8_vup_native_seconds_mean": None,
+        "native_q8_vup_native_seconds_min": None,
+        "native_q8_vup_native_seconds_p50": None,
+        "native_q8_vup_reference_seconds_mean": None,
+        "native_q8_vup_reference_seconds_min": None,
+        "native_q8_vup_reference_seconds_p50": None,
+        "native_q8_vup_speedup_mean": None,
+        "native_q8_vup_benchmark_error": None,
+    }
+    row.update(_native_smoke_status_fields(args, status))
+    if not status["available"]:
+        row["native_smoke_error"] = "native sparse MLA kernel unavailable"
+    else:
+        try:
+            symbols = _native_smoke_symbols(status["source"])
+            kernel = _native_smoke_kernel(status["source"])
+            if kernel is None:
+                raise RuntimeError("native sparse MLA kernel unavailable")
+
+            B, H = 1, 64
+            L = args.native_smoke_q_len
+            K = args.native_smoke_k_len
+            latent_dim = 512
+            rope_dim = 64
+            mx.random.seed(args.native_smoke_seed)
+            q_latent = mx.random.normal(
+                (B, H, L, latent_dim), dtype=mx.float16
+            ) * 0.02
+            q_pe = mx.random.normal((B, H, L, rope_dim), dtype=mx.float16) * 0.02
+            kv_latent = mx.random.normal(
+                (B, 1, K, latent_dim), dtype=mx.float16
+            ) * 0.02
+            k_pe = mx.random.normal((B, 1, K, rope_dim), dtype=mx.float16) * 0.02
+            topk_indices = mx.broadcast_to(
+                mx.arange(K, dtype=mx.uint32).reshape(1, 1, 1, K),
+                (B, 1, L, K),
+            )
+            scale = 1.0 / math.sqrt(latent_dim + rope_dim)
+
+            output = kernel(
+                q_latent,
+                q_pe,
+                kv_latent,
+                k_pe,
+                topk_indices,
+                scale,
+                causal=True,
+            )
+            reference = _native_smoke_dense_reference(
+                q_latent, q_pe, kv_latent, k_pe, scale
+            )
+            diff = mx.abs(output.astype(mx.float32) - reference.astype(mx.float32))
+            mx.eval(output, reference, diff)
+
+            max_abs_diff = float(mx.max(diff).item())
+            mean_abs_diff = float(mx.mean(diff).item())
+            row.update(
+                {
+                    "native_smoke_symbols": symbols,
+                    "native_smoke_shape": list(output.shape),
+                    "native_smoke_max_abs_diff": max_abs_diff,
+                    "native_smoke_mean_abs_diff": mean_abs_diff,
+                    "native_smoke_passed": max_abs_diff <= args.native_smoke_max_diff,
+                }
+            )
+        except Exception as exc:
+            row["native_smoke_error"] = repr(exc)
+    _run_native_indexer_smoke(row, args, indexer_status)
+    _run_native_q8_vup_smoke(row, args, q8_vup_status)
+    return row
+
+
 def prefill_config_summary(args):
     return {
+        "kv_bits": args.kv_bits,
+        "kv_group_size": args.kv_group_size,
+        "quantized_kv_start": args.quantized_kv_start,
         "prefill_step_size": args.prefill_step_size,
         "prefill_max_qk_tokens": getattr(
             args,
@@ -882,6 +1764,15 @@ def print_table(rows, output_format):
         "checkpoint_prefill_chunks",
         "checkpoint_max_adaptive_prefill_step_size",
         "checkpoint_max_effective_prefill_step_size",
+        "checkpoint_prefill_chunk_seconds_total",
+        "checkpoint_max_prefill_chunk_seconds",
+        "checkpoint_slowest_prefill_chunk_start_tokens",
+        "checkpoint_slowest_prefill_chunk_tokens",
+        "checkpoint_slowest_prefill_chunk_route",
+        "checkpoint_native_sparse_prefill_chunks",
+        "checkpoint_fast_sparse_prefill_chunks",
+        "checkpoint_dense_prefill_chunks",
+        "checkpoint_native_indexer_chunks",
         "checkpoint_cache_dir",
         "checkpoint_save_exact",
         "checkpoint_lookup_seconds",
@@ -900,6 +1791,9 @@ def print_table(rows, output_format):
         "ttft_p50_seconds",
         "ttft_p95_seconds",
         "prompt_tps",
+        "kv_bits",
+        "kv_group_size",
+        "quantized_kv_start",
         "prefill_step_size",
         "prefill_max_qk_tokens",
         "glm_dsa_adaptive_prefill_step_size",
@@ -915,20 +1809,142 @@ def print_table(rows, output_format):
         "active_batch_size_max",
         "queued_request_count",
         "checkpoint_resolution",
+        "glm_dsa_prefill_profile",
+        "glm_dsa_prefill_profile_isolate",
+        "glm_dsa_prefill_profile_isolate_env",
         "glm_dsa_fast_prefill",
         "glm_dsa_fast_prefill_env",
         "glm_dsa_fast_prefill_query_chunk",
         "glm_dsa_fast_prefill_key_block",
         "glm_dsa_sparse_prefill_min_context",
+        "glm_dsa_native_sparse_prefill",
+        "glm_dsa_native_sparse_prefill_env",
+        "glm_dsa_native_sparse_prefill_available",
+        "glm_dsa_native_sparse_prefill_source",
+        "glm_dsa_native_sparse_prefill_import_error",
+        "glm_dsa_native_sparse_prefill_min_context",
+        "glm_dsa_native_sparse_prefill_quantized_kv",
+        "glm_dsa_native_sparse_prefill_quantized_kv_env",
+        "glm_dsa_native_sparse_prefill_quantized_kv_max_context",
+        "glm_dsa_sparse_mla_tile_env",
+        "glm_dsa_sparse_mla_tile",
         "glm_dsa_fast_prefill_hits",
         "glm_dsa_fast_prefill_fallback_reasons",
+        "glm_dsa_native_sparse_prefill_hits",
+        "glm_dsa_native_sparse_prefill_fallback_reasons",
+        "glm_dsa_native_sparse_prefill_route_state",
+        "glm_dsa_native_sparse_prefill_primary_fallback",
+        "glm_dsa_native_sparse_prefill_config_blocker",
+        "glm_dsa_native_sparse_prefill_attempt_min_context",
+        "glm_dsa_native_indexer",
+        "glm_dsa_native_indexer_env",
+        "glm_dsa_native_indexer_available",
+        "glm_dsa_native_indexer_source",
+        "glm_dsa_native_indexer_import_error",
+        "glm_dsa_native_indexer_scores_available",
+        "glm_dsa_native_indexer_topk_available",
+        "glm_dsa_native_indexer_min_context",
+        "glm_dsa_native_indexer_hits",
+        "glm_dsa_native_indexer_fallback_reasons",
+        "glm_dsa_native_q8_vup",
+        "glm_dsa_native_q8_vup_env",
+        "glm_dsa_native_q8_vup_available",
+        "glm_dsa_native_q8_vup_source",
+        "glm_dsa_native_q8_vup_import_error",
+        "glm_dsa_native_q8_vup_hits",
+        "glm_dsa_native_q8_vup_fallback_reasons",
+        "glm_dsa_native_q4_vup",
+        "glm_dsa_native_q4_vup_env",
+        "glm_dsa_native_q4_vup_available",
+        "glm_dsa_native_q4_vup_source",
+        "glm_dsa_native_q4_vup_import_error",
+        "glm_dsa_native_q4_vup_hits",
+        "glm_dsa_native_q4_vup_fallback_reasons",
+        "glm_dsa_q_a_dense_cache",
+        "glm_dsa_q_a_dense_cache_env",
+        "glm_dsa_q_a_dense_cache_hits",
+        "glm_dsa_q_a_dense_cache_builds",
+        "glm_dsa_q_a_dense_cache_fallback_reasons",
+        "glm_dsa_native_q4_qa",
+        "glm_dsa_native_q4_qa_env",
+        "glm_dsa_native_q4_qa_tile_env",
+        "glm_dsa_native_q4_qa_tile",
+        "glm_dsa_native_q4_qa_available",
+        "glm_dsa_native_q4_qa_source",
+        "glm_dsa_native_q4_qa_import_error",
+        "glm_dsa_native_q4_qa_hits",
+        "glm_dsa_native_q4_qa_fallback_reasons",
+        "glm_dsa_native_q4_qb",
+        "glm_dsa_native_q4_qb_env",
+        "glm_dsa_native_q4_qb_tile_env",
+        "glm_dsa_native_q4_qb_tile",
+        "glm_dsa_native_q4_qb_available",
+        "glm_dsa_native_q4_qb_source",
+        "glm_dsa_native_q4_qb_import_error",
+        "glm_dsa_native_q4_qb_hits",
+        "glm_dsa_native_q4_qb_fallback_reasons",
+        "native_smoke_available",
+        "native_smoke_source",
+        "native_smoke_import_error",
+        "native_smoke_symbols",
+        "native_smoke_q_len",
+        "native_smoke_k_len",
+        "native_smoke_seed",
+        "native_smoke_max_diff",
+        "native_smoke_shape",
+        "native_smoke_max_abs_diff",
+        "native_smoke_mean_abs_diff",
+        "native_smoke_passed",
+        "native_smoke_error",
+        "native_indexer_smoke_available",
+        "native_indexer_smoke_source",
+        "native_indexer_smoke_import_error",
+        "native_indexer_smoke_score_shape",
+        "native_indexer_smoke_topk_shape",
+        "native_indexer_smoke_max_abs_diff",
+        "native_indexer_smoke_mean_abs_diff",
+        "native_indexer_smoke_min_topk_margin",
+        "native_indexer_smoke_passed",
+        "native_indexer_smoke_error",
+        "native_q8_vup_smoke_available",
+        "native_q8_vup_smoke_source",
+        "native_q8_vup_smoke_import_error",
+        "native_q8_vup_smoke_shape",
+        "native_q8_vup_smoke_max_abs_diff",
+        "native_q8_vup_smoke_mean_abs_diff",
+        "native_q8_vup_smoke_passed",
+        "native_q8_vup_smoke_error",
+        "native_q8_vup_benchmark_runs",
+        "native_q8_vup_benchmark_warmup_runs",
+        "native_q8_vup_benchmark_q_len",
+        "native_q8_vup_native_seconds_mean",
+        "native_q8_vup_native_seconds_min",
+        "native_q8_vup_native_seconds_p50",
+        "native_q8_vup_reference_seconds_mean",
+        "native_q8_vup_reference_seconds_min",
+        "native_q8_vup_reference_seconds_p50",
+        "native_q8_vup_speedup_mean",
+        "native_q8_vup_benchmark_error",
         "glm_dsa_q_projection_seconds",
+        "glm_dsa_q_a_projection_seconds",
+        "glm_dsa_q_a_dense_cache_dequantization_seconds",
+        "glm_dsa_q_a_dense_projection_seconds",
+        "glm_dsa_native_q4_qa_projection_seconds",
+        "glm_dsa_q_a_layernorm_seconds",
+        "glm_dsa_q_b_projection_seconds",
+        "glm_dsa_native_q4_qb_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
         "glm_dsa_dsa_indexer_topk_seconds",
+        "glm_dsa_native_indexer_scores_seconds",
+        "glm_dsa_native_indexer_topk_seconds",
         "glm_dsa_latent_kv_dequantization_seconds",
         "glm_dsa_latent_kv_projection_seconds",
+        "glm_dsa_native_sparse_kv_dequantization_seconds",
+        "glm_dsa_native_q8_vup_seconds",
+        "glm_dsa_native_q4_vup_seconds",
         "glm_dsa_sparse_gather_seconds",
         "glm_dsa_attention_seconds",
+        "glm_dsa_native_sparse_attention_seconds",
         "glm_dsa_total_prefill_seconds",
     ]
     delimiter = "," if output_format == "csv" else "\t"
@@ -1340,7 +2356,11 @@ def run_prefill_sweep(model, tokenizer, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Local path or HF repo.")
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Local path or HF repo. Not required for --mode native-smoke.",
+    )
     parser.add_argument(
         "--mode",
         choices=(
@@ -1350,6 +2370,7 @@ def main():
             "controlled-lcp",
             "policy-sweep",
             "prefill-sweep",
+            "native-smoke",
         ),
         default="single",
     )
@@ -1569,11 +2590,227 @@ def main():
         ),
     )
     parser.add_argument(
+        "--native-sparse-prefill",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the optional GLM DSA native sparse MLA prefill route. "
+            "The default leaves MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL unchanged; "
+            "unset means enabled but only used when a compatible native symbol "
+            "and shape are available."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-prefill-min-context",
+        type=int,
+        help=(
+            "Minimum effective context length before trying the native sparse "
+            "MLA route."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-quantized-kv",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native sparse MLA route for int8 GLM MLA KV "
+            "cache. It temporarily dequantizes the full latent KV cache for "
+            "the native kernel; default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV unchanged, "
+            "and unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-quantized-kv-max-context",
+        type=int,
+        help=(
+            "Maximum effective context length allowed for the opt-in native "
+            "sparse MLA route over int8 GLM MLA KV cache. Use 0 for no limit."
+        ),
+    )
+    parser.add_argument(
+        "--native-sparse-mla-tile",
+        choices=(
+            "default",
+            "bk128",
+            "bk256",
+            "bk128_dc64",
+            "wm4",
+            "bk128_wm4",
+            "bk128_dc64_wm4",
+        ),
+        default="default",
+        help=(
+            "Select the experimental native sparse MLA tile. The default "
+            "leaves MLX_LM_GLM_DSA_SPARSE_MLA_TILE unchanged; unset means "
+            "bk256_dc32_wm8."
+        ),
+    )
+    parser.add_argument(
+        "--native-indexer",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the optional native GLM DSA indexer score/top-k route. "
+            "The default leaves MLX_LM_GLM_DSA_NATIVE_INDEXER unchanged; "
+            "unset means enabled when compatible vendored symbols and shapes "
+            "are available."
+        ),
+    )
+    parser.add_argument(
+        "--native-q8-vup",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the optional native q8 V-up projection for quantized GLM "
+            "DSA unembed_out weights. The default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_Q8_VUP unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-vup",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native q4 V-up projection for quantized GLM "
+            "DSA unembed_out weights. The default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_Q4_VUP unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qb",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native q4 q_b projection for GLM-5.2 M3 "
+            "attention. The default leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB "
+            "unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qb-tile",
+        choices=(
+            "default",
+            "bk32",
+            "bk64",
+            "bm16",
+            "bn16",
+            "bn64",
+            "bm64",
+            "bm16bn64",
+            "bm64bn64",
+            "bk64bn64",
+        ),
+        default="default",
+        help=(
+            "Select the opt-in native q4 q_b projection tile. The default "
+            "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE unchanged; unset means "
+            "bm64."
+        ),
+    )
+    parser.add_argument(
+        "--q-a-dense-cache",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in dense q_a projection cache for GLM-5.2 M3 "
+            "attention. It dequantizes q_a_proj weights once per layer and "
+            "reuses the dense weight for later prefill calls. The default "
+            "leaves MLX_LM_GLM_DSA_Q_A_DENSE_CACHE unchanged; unset means "
+            "disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qa",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native q4 q_a projection for GLM-5.2 M3 "
+            "attention. The default leaves MLX_LM_GLM_DSA_NATIVE_Q4_QA "
+            "unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q4-qa-tile",
+        choices=(
+            "default",
+            "bk32",
+            "bk64",
+            "bm16",
+            "bn16",
+            "bn64",
+            "bm64",
+            "bm16bn64",
+            "bm64bn64",
+        ),
+        default="default",
+        help=(
+            "Select the opt-in native q4 q_a projection tile. The default "
+            "leaves MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE unchanged; unset means "
+            "bk64."
+        ),
+    )
+    parser.add_argument(
+        "--native-smoke-q-len",
+        type=int,
+        default=2,
+        help="Query length for --mode native-smoke. Must be greater than 1.",
+    )
+    parser.add_argument(
+        "--native-smoke-k-len",
+        type=int,
+        default=32,
+        help="Context length for --mode native-smoke. Must be at least 16.",
+    )
+    parser.add_argument(
+        "--native-smoke-seed",
+        type=int,
+        default=7,
+        help="Random seed for --mode native-smoke.",
+    )
+    parser.add_argument(
+        "--native-smoke-max-diff",
+        type=float,
+        default=0.02,
+        help="Maximum allowed absolute difference for --mode native-smoke.",
+    )
+    parser.add_argument(
+        "--native-smoke-benchmark-runs",
+        type=int,
+        default=0,
+        help=(
+            "Optional timing runs for --mode native-smoke. When positive, "
+            "benchmarks native q8 V-up against the MLX quantized_matmul reference."
+        ),
+    )
+    parser.add_argument(
+        "--native-smoke-benchmark-warmup-runs",
+        type=int,
+        default=2,
+        help="Warmup runs before native-smoke q8 V-up timing.",
+    )
+    parser.add_argument(
+        "--native-q8-vup-benchmark-q-len",
+        type=int,
+        default=256,
+        help="Query length used for native-smoke q8 V-up timing.",
+    )
+    parser.add_argument(
         "--prefill-profile",
         action="store_true",
         help=(
             "Synchronize and report GLM DSA prefill stage timings. This adds "
             "profiling overhead and is intended for measurement runs."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-profile-isolate",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control profiling-only input synchronization before selected GLM "
+            "DSA stages. Enabling it reduces lazy-evaluation attribution drift "
+            "in q_projection sub-stage timings."
         ),
     )
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -1586,8 +2823,8 @@ def main():
     )
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
-    args.model = args.model.strip()
-    if not args.model:
+    args.model = (args.model or "").strip()
+    if args.mode != "native-smoke" and not args.model:
         parser.error(
             "--model is empty; set MODEL to your model directory or pass an "
             "explicit --model /path/to/model value."
@@ -1597,6 +2834,23 @@ def main():
         and args.prefill_stop_after_tokens <= 0
     ):
         parser.error("--prefill-stop-after-tokens must be positive when set.")
+    if args.mode == "native-smoke":
+        if args.native_smoke_q_len <= 1:
+            parser.error("--native-smoke-q-len must be greater than 1.")
+        if args.native_smoke_k_len < 16:
+            parser.error("--native-smoke-k-len must be at least 16.")
+        if args.native_smoke_k_len < args.native_smoke_q_len:
+            parser.error("--native-smoke-k-len must be >= --native-smoke-q-len.")
+        if args.native_smoke_max_diff < 0:
+            parser.error("--native-smoke-max-diff must be non-negative.")
+        if args.native_smoke_benchmark_runs < 0:
+            parser.error("--native-smoke-benchmark-runs must be non-negative.")
+        if args.native_smoke_benchmark_warmup_runs < 0:
+            parser.error(
+                "--native-smoke-benchmark-warmup-runs must be non-negative."
+            )
+        if args.native_q8_vup_benchmark_q_len <= 0:
+            parser.error("--native-q8-vup-benchmark-q-len must be positive.")
     if args.checkpoint_save_exact is None:
         args.checkpoint_save_exact = (
             "disabled"
@@ -1605,6 +2859,13 @@ def main():
         )
     args.target_tokens = None
     configure_glm_dsa_fast_prefill(args)
+    if args.mode == "native-smoke":
+        rows = [run_native_kernel_smoke(args)]
+        print_table(rows, args.output_format)
+        if args.json_output:
+            write_json_output(args.json_output, rows)
+        return
+
     old_checkpoint_cache_dir = configure_checkpoint_cache_dir(args)
 
     try:
