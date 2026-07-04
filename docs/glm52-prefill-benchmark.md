@@ -345,10 +345,12 @@ Shared-indexer layers do not need to return `qr` to the DSA indexer, so this
 route computes a compact q_a RMS scale and feeds q_a plus that scale directly
 into a scaled native q4 q_b kernel. Initial 2K full-model profiling confirmed
 the route hits shared layers and reduces q_a layernorm work to the full-indexer
-layers, but q_projection regressed because the current safe scaled-q_b kernel
-adds an extra threadgroup barrier while scaling loaded q_a tiles. The next useful
-step is a loader-aware scaled q_b path that applies q_a RMS scaling during load
-without an additional barrier.
+layers. A loader-aware scaled-q_b update now applies q_a RMS scaling to the
+loaded tile values without the earlier extra threadgroup barrier. On the 2K
+same-build check, the shared-layer route improved from about 1.24s to about
+1.09s q_projection, but the materialized-`qr` baseline still measured about
+0.97s q_projection and lower TTFT, so this remains a kernel-structure probe
+rather than a recommended setting.
 
 For memory-for-latency comparison runs, `--q-a-dense-cache enabled` can
 dequantize the fixed GLM-5.2 M3 q4 `q_a_proj` weights into dense fp16/bf16

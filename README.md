@@ -365,10 +365,11 @@ end.
 skips materializing `qr` on shared-indexer layers by computing a compact q_a
 RMS scale and feeding q_a plus that scale directly into a scaled native q4 q_b
 kernel. Initial 2K profiling confirmed the route works and reduces standalone
-q_a layernorm work to the full-indexer layers, but the scaled q_b kernel is
-slower than materializing `qr` because the current safe implementation adds an
-extra barrier while scaling loaded q_a tiles. Treat this as a loader-structure
-probe, not a recommended setting.
+q_a layernorm work to the full-indexer layers. A loader-aware scaled-q_b update
+removes the earlier extra threadgroup barrier and improved the 2K shared-layer
+route from about 1.24s to about 1.09s q_projection, but the same-build baseline
+that materializes `qr` still measured about 0.97s q_projection and lower TTFT.
+Treat this as a kernel-structure probe, not a recommended setting.
 
 There is also an opt-in q_a dense-cache probe:
 `MLX_LM_GLM_DSA_Q_A_DENSE_CACHE=1` / `--q-a-dense-cache enabled`. It

@@ -2003,22 +2003,34 @@ template <
 }
 
 template <typename T, const int BM, const int BK, const int BK_padded>
-METAL_FUNC void apply_rmsnorm_scale_to_x_block(
+METAL_FUNC void apply_rmsnorm_scale_to_loaded_x_values(
     threadgroup T* Xs,
     const device T* norm_weight,
     const device T* row_scales,
     const int row_offset,
     const int k_offset,
     const short valid_rows,
-    const uint lid) {
-  for (int idx = int(lid); idx < BM * BK; idx += 128) {
-    const int row = idx / BK;
-    const int col = idx - row * BK;
+    const uint simd_gid,
+    const uint simd_lid) {
+  constexpr short tgp_size = 128;
+  constexpr short n_reads = (BM * BK) / tgp_size;
+  constexpr short tcols = BK / n_reads;
+  constexpr short trows = tgp_size / tcols;
+
+  const short thread_idx = short(simd_gid * SIMD_SIZE + simd_lid);
+  const short bi = thread_idx / tcols;
+  const short bj = n_reads * (thread_idx % tcols);
+
+  for (short i = 0; i < BM; i += trows) {
+    const int row = bi + i;
     if (row < valid_rows) {
-      const int local = row * BK_padded + col;
-      const float scale =
-          float(norm_weight[k_offset + col]) * float(row_scales[row_offset + row]);
-      Xs[local] = T(float(Xs[local]) * scale);
+      for (short j = 0; j < n_reads; j++) {
+        const int col = bj + j;
+        const int local = row * BK_padded + col;
+        const float scale = float(norm_weight[k_offset + col]) *
+            float(row_scales[row_offset + row]);
+        Xs[local] = T(float(Xs[local]) * scale);
+      }
     }
   }
 }
@@ -2355,9 +2367,15 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_safe(short2(BK, num_els));
         loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
-            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        apply_rmsnorm_scale_to_loaded_x_values<T, BM, BK, BK_padded>(
+            Xs,
+            norm_weight,
+            row_scales_batch,
+            y_row,
+            k,
+            num_els,
+            simd_gid,
+            simd_lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(Xs, Ws);
         loader_x.next();
@@ -2368,9 +2386,15 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_safe(short2(BK, num_els));
         loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
-            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        apply_rmsnorm_scale_to_loaded_x_values<T, BM, BK, BK_padded>(
+            Xs,
+            norm_weight,
+            row_scales_batch,
+            y_row,
+            k,
+            num_els,
+            simd_gid,
+            simd_lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(Xs, Ws);
         loader_x.next();
@@ -2383,9 +2407,15 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_unsafe();
         loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
-            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        apply_rmsnorm_scale_to_loaded_x_values<T, BM, BK, BK_padded>(
+            Xs,
+            norm_weight,
+            row_scales_batch,
+            y_row,
+            k,
+            num_els,
+            simd_gid,
+            simd_lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(Xs, Ws);
         loader_x.next();
@@ -2396,9 +2426,15 @@ template <
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_unsafe();
         loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        apply_rmsnorm_scale_to_x_block<T, BM, BK, BK_padded>(
-            Xs, norm_weight, row_scales_batch, y_row, k, num_els, lid);
+        apply_rmsnorm_scale_to_loaded_x_values<T, BM, BK, BK_padded>(
+            Xs,
+            norm_weight,
+            row_scales_batch,
+            y_row,
+            k,
+            num_els,
+            simd_gid,
+            simd_lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(Xs, Ws);
         loader_x.next();
