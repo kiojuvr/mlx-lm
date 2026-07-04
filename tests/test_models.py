@@ -1025,6 +1025,63 @@ class TestModels(unittest.TestCase):
             ) = native_state
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_native_q_a_rms_norm_matches_fallback(self):
+        import mlx.nn as nn
+
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_KERNEL,
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_SOURCE,
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV] = "1"
+            norm = nn.RMSNorm(2048, eps=1e-6)
+            norm.update({"weight": norm["weight"].astype(mx.float16)})
+
+            def fake_rms_norm(x, weight, eps):
+                return mx.fast.rms_norm(x, weight, eps)
+
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_KERNEL = fake_rms_norm
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q_A_RMS_NORM_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.q_a_layernorm = norm
+            fake_attention.q_lora_rank = 2048
+            fake_attention._native_q_a_rms_norm_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q_a_rms_norm_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 2, 2048), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            output = glm_moe_dsa.GlmMoeDsaAttention._q_a_layernorm(
+                fake_attention,
+                x,
+            )
+            expected = norm(x)
+            mx.eval(output, expected)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["native_q_a_rms_norm_hits"], 1)
+            self.assertTrue(mx.allclose(output, expected, rtol=1e-4, atol=1e-4))
+        finally:
+            (
+                glm_moe_dsa._NATIVE_Q_A_RMS_NORM_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q_A_RMS_NORM_KERNEL,
+                glm_moe_dsa._NATIVE_Q_A_RMS_NORM_SOURCE,
+                glm_moe_dsa._NATIVE_Q_A_RMS_NORM_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_native_q4_qb_head_layout_matches_fallback(self):
         import mlx.nn as nn
 

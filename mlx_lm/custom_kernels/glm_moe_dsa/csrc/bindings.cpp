@@ -100,6 +100,13 @@ NB_MODULE(_ext, m) {
       "biases"_a,
       "stream"_a = nb::none());
   m.def(
+      "glm_dsa_q_a_rms_norm",
+      &omlx::glm_kernels::glm_dsa_q_a_rms_norm,
+      "x"_a,
+      "weight"_a,
+      "eps"_a,
+      "stream"_a = nb::none());
+  m.def(
       "glm_moe_weighted_sum",
       &omlx::glm_kernels::glm_moe_weighted_sum,
       "x_sorted"_a,

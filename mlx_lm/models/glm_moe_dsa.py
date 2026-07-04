@@ -49,6 +49,7 @@ GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
 GLM_DSA_NATIVE_Q4_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_VUP"
 GLM_DSA_Q_A_DENSE_CACHE_ENV = "MLX_LM_GLM_DSA_Q_A_DENSE_CACHE"
+GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV = "MLX_LM_GLM_DSA_NATIVE_Q_A_RMS_NORM"
 GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
 GLM_DSA_NATIVE_Q4_QA_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE"
 GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
@@ -66,6 +67,7 @@ _PROFILE_STAGES = (
     "q_a_dense_projection",
     "native_q4_qa_projection",
     "q_a_layernorm",
+    "native_q_a_rms_norm",
     "q_b_projection",
     "native_q4_qb_projection",
     "native_q4_qb_head_layout_projection",
@@ -103,6 +105,10 @@ _NATIVE_Q4_VUP_LOOKUP_DONE = False
 _NATIVE_Q4_VUP_KERNEL = None
 _NATIVE_Q4_VUP_SOURCE = None
 _NATIVE_Q4_VUP_IMPORT_ERROR = None
+_NATIVE_Q_A_RMS_NORM_LOOKUP_DONE = False
+_NATIVE_Q_A_RMS_NORM_KERNEL = None
+_NATIVE_Q_A_RMS_NORM_SOURCE = None
+_NATIVE_Q_A_RMS_NORM_IMPORT_ERROR = None
 _NATIVE_Q4_QA_LOOKUP_DONE = False
 _NATIVE_Q4_QA_KERNEL = None
 _NATIVE_Q4_QA_SOURCE = None
@@ -150,6 +156,10 @@ def _native_q4_vup_enabled() -> bool:
 
 def _q_a_dense_cache_enabled() -> bool:
     return _env_flag(GLM_DSA_Q_A_DENSE_CACHE_ENV, False)
+
+
+def _native_q_a_rms_norm_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV, False)
 
 
 def _native_q4_qa_enabled() -> bool:
@@ -257,6 +267,8 @@ def _new_profile():
         "q_a_dense_cache_hits": 0,
         "q_a_dense_cache_builds": 0,
         "q_a_dense_cache_fallback_reasons": Counter(),
+        "native_q_a_rms_norm_hits": 0,
+        "native_q_a_rms_norm_fallback_reasons": Counter(),
         "native_q4_qa_hits": 0,
         "native_q4_qa_fallback_reasons": Counter(),
         "native_q4_qb_hits": 0,
@@ -304,6 +316,12 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         ],
         "q_a_dense_cache_fallback_reasons": dict(
             _GLM_DSA_PREFILL_PROFILE["q_a_dense_cache_fallback_reasons"]
+        ),
+        "native_q_a_rms_norm_hits": _GLM_DSA_PREFILL_PROFILE[
+            "native_q_a_rms_norm_hits"
+        ],
+        "native_q_a_rms_norm_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q_a_rms_norm_fallback_reasons"]
         ),
         "native_q4_qa_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qa_hits"],
         "native_q4_qa_fallback_reasons": dict(
@@ -451,6 +469,25 @@ def _record_q_a_dense_cache_decision(
             _LOGGER.info("GLM DSA q_a dense cache fallback: %s", reason)
 
 
+def _record_native_q_a_rms_norm_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q_a_rms_norm_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE[
+            "native_q_a_rms_norm_fallback_reasons"
+        ][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q_a RMSNorm enabled: source=%s",
+                _NATIVE_Q_A_RMS_NORM_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q_a RMSNorm fallback: %s", reason)
+
+
 def _record_native_q4_qa_decision(used: bool, reason: str):
     if _GLM_DSA_PREFILL_PROFILE is None:
         reset_glm_dsa_prefill_profile()
@@ -595,6 +632,45 @@ def _native_q4_vup_kernel():
         _NATIVE_Q4_VUP_SOURCE = "mlx.core.fast"
 
     return _NATIVE_Q4_VUP_KERNEL
+
+
+def _native_q_a_rms_norm_kernel():
+    global _NATIVE_Q_A_RMS_NORM_LOOKUP_DONE
+    global _NATIVE_Q_A_RMS_NORM_KERNEL
+    global _NATIVE_Q_A_RMS_NORM_SOURCE
+    global _NATIVE_Q_A_RMS_NORM_IMPORT_ERROR
+    if _NATIVE_Q_A_RMS_NORM_LOOKUP_DONE:
+        return _NATIVE_Q_A_RMS_NORM_KERNEL
+
+    _NATIVE_Q_A_RMS_NORM_LOOKUP_DONE = True
+    _NATIVE_Q_A_RMS_NORM_KERNEL = None
+    _NATIVE_Q_A_RMS_NORM_SOURCE = None
+    _NATIVE_Q_A_RMS_NORM_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q_a_rms_norm")
+                and hasattr(fast, "glm_dsa_q_a_rms_norm")
+            ):
+                _NATIVE_Q_A_RMS_NORM_KERNEL = fast.glm_dsa_q_a_rms_norm
+                _NATIVE_Q_A_RMS_NORM_SOURCE = module_name
+                return _NATIVE_Q_A_RMS_NORM_KERNEL
+            if _NATIVE_Q_A_RMS_NORM_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q_A_RMS_NORM_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q_A_RMS_NORM_IMPORT_ERROR is None:
+                _NATIVE_Q_A_RMS_NORM_IMPORT_ERROR = exc
+
+    return _NATIVE_Q_A_RMS_NORM_KERNEL
 
 
 def _native_q4_qb_kernel():
@@ -923,6 +999,20 @@ def get_glm_dsa_native_q4_qb_status():
         "head_layout_import_error": (
             repr(_NATIVE_Q4_QB_HEADS_IMPORT_ERROR)
             if _NATIVE_Q4_QB_HEADS_IMPORT_ERROR is not None
+            else None
+        ),
+    }
+
+
+def get_glm_dsa_native_q_a_rms_norm_status():
+    kernel = _native_q_a_rms_norm_kernel()
+    return {
+        "enabled": _native_q_a_rms_norm_enabled(),
+        "available": kernel is not None,
+        "source": _NATIVE_Q_A_RMS_NORM_SOURCE,
+        "import_error": (
+            repr(_NATIVE_Q_A_RMS_NORM_IMPORT_ERROR)
+            if _NATIVE_Q_A_RMS_NORM_IMPORT_ERROR is not None
             else None
         ),
     }
@@ -1750,6 +1840,48 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             _record_native_q4_qa_decision(False, reason)
         return self.q_a_proj(x)
 
+    def _native_q_a_rms_norm_decision(self, x: mx.array):
+        if not _native_q_a_rms_norm_enabled():
+            return False, "disabled"
+        if _native_q_a_rms_norm_kernel() is None:
+            return False, "missing_symbol"
+        weight = self.q_a_layernorm["weight"]
+        if len(x.shape) != 3:
+            return False, "input_rank"
+        if x.shape[-1] != 2048:
+            return False, f"unsupported_input_dim:{x.shape[-1]}"
+        if self.q_lora_rank != 2048:
+            return False, f"unsupported_q_lora_rank:{self.q_lora_rank}"
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False, f"unsupported_dtype:{x.dtype}"
+        if weight.dtype != x.dtype:
+            return False, "mixed_dtype"
+        if len(weight.shape) != 1 or weight.shape[0] != x.shape[-1]:
+            return False, "weight_shape"
+        return True, "native_q_a_rms_norm"
+
+    def _q_a_layernorm(self, x: mx.array):
+        use_native, reason = self._native_q_a_rms_norm_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q_a_rms_norm_kernel()
+                output = _profile_stage(
+                    "native_q_a_rms_norm",
+                    lambda: kernel(
+                        x,
+                        self.q_a_layernorm["weight"],
+                        float(self.q_a_layernorm.eps),
+                    ),
+                    inputs=x,
+                )
+                _record_native_q_a_rms_norm_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        _record_native_q_a_rms_norm_decision(False, reason)
+        return self.q_a_layernorm(x)
+
     def _native_q4_qb_decision(self, x: mx.array):
         if not _native_q4_qb_enabled():
             return False, "disabled"
@@ -2117,7 +2249,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             )
             qr = _profile_stage(
                 "q_a_layernorm",
-                lambda: self.q_a_layernorm(q_a),
+                lambda: self._q_a_layernorm(q_a),
                 inputs=q_a,
             )
             def project_q_b():

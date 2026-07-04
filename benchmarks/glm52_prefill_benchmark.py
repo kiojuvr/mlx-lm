@@ -533,6 +533,11 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "1"
     elif q_a_dense_cache == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV] = "0"
+    native_q_a_rms_norm = getattr(args, "native_q_a_rms_norm", "default")
+    if native_q_a_rms_norm == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV] = "1"
+    elif native_q_a_rms_norm == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV] = "0"
     native_q4_qa = getattr(args, "native_q4_qa", "default")
     if native_q4_qa == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "1"
@@ -599,6 +604,9 @@ def collect_glm_dsa_profile(args):
     native_indexer_status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
     native_q8_vup_status = glm_moe_dsa.get_glm_dsa_native_q8_vup_status()
     native_q4_vup_status = glm_moe_dsa.get_glm_dsa_native_q4_vup_status()
+    native_q_a_rms_norm_status = (
+        glm_moe_dsa.get_glm_dsa_native_q_a_rms_norm_status()
+    )
     native_q4_qa_status = glm_moe_dsa.get_glm_dsa_native_q4_qa_status()
     native_q4_qb_status = glm_moe_dsa.get_glm_dsa_native_q4_qb_status()
     stage_values = {}
@@ -724,6 +732,28 @@ def collect_glm_dsa_profile(args):
         "glm_dsa_q_a_dense_cache_fallback_reasons": profile[
             "q_a_dense_cache_fallback_reasons"
         ],
+        "glm_dsa_native_q_a_rms_norm": getattr(
+            args, "native_q_a_rms_norm", "default"
+        ),
+        "glm_dsa_native_q_a_rms_norm_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q_a_rms_norm_available": native_q_a_rms_norm_status[
+            "available"
+        ],
+        "glm_dsa_native_q_a_rms_norm_source": native_q_a_rms_norm_status[
+            "source"
+        ],
+        "glm_dsa_native_q_a_rms_norm_import_error": native_q_a_rms_norm_status[
+            "import_error"
+        ],
+        "glm_dsa_native_q_a_rms_norm_hits": profile.get(
+            "native_q_a_rms_norm_hits", 0
+        ),
+        "glm_dsa_native_q_a_rms_norm_fallback_reasons": profile.get(
+            "native_q_a_rms_norm_fallback_reasons", {}
+        ),
         "glm_dsa_native_q4_qa": getattr(args, "native_q4_qa", "default"),
         "glm_dsa_native_q4_qa_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
@@ -1888,6 +1918,13 @@ def print_table(rows, output_format):
         "glm_dsa_q_a_dense_cache_hits",
         "glm_dsa_q_a_dense_cache_builds",
         "glm_dsa_q_a_dense_cache_fallback_reasons",
+        "glm_dsa_native_q_a_rms_norm",
+        "glm_dsa_native_q_a_rms_norm_env",
+        "glm_dsa_native_q_a_rms_norm_available",
+        "glm_dsa_native_q_a_rms_norm_source",
+        "glm_dsa_native_q_a_rms_norm_import_error",
+        "glm_dsa_native_q_a_rms_norm_hits",
+        "glm_dsa_native_q_a_rms_norm_fallback_reasons",
         "glm_dsa_native_q4_qa",
         "glm_dsa_native_q4_qa_env",
         "glm_dsa_native_q4_qa_tile_env",
@@ -1959,6 +1996,7 @@ def print_table(rows, output_format):
         "glm_dsa_q_a_dense_projection_seconds",
         "glm_dsa_native_q4_qa_projection_seconds",
         "glm_dsa_q_a_layernorm_seconds",
+        "glm_dsa_native_q_a_rms_norm_seconds",
         "glm_dsa_q_b_projection_seconds",
         "glm_dsa_native_q4_qb_projection_seconds",
         "glm_dsa_native_q4_qb_head_layout_projection_seconds",
@@ -2758,6 +2796,17 @@ def main():
             "attention. It dequantizes q_a_proj weights once per layer and "
             "reuses the dense weight for later prefill calls. The default "
             "leaves MLX_LM_GLM_DSA_Q_A_DENSE_CACHE unchanged; unset means "
+            "disabled."
+        ),
+    )
+    parser.add_argument(
+        "--native-q-a-rms-norm",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native GLM q_a RMSNorm kernel for "
+            "q_projection structure experiments. The default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_Q_A_RMS_NORM unchanged; unset means "
             "disabled."
         ),
     )

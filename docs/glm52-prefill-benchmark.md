@@ -348,6 +348,13 @@ projection time improves enough to justify that footprint. On the tested 8K
 repeat run, warmed dense-cache prefill was 51.46s versus 51.51s with the route
 disabled, while peak memory increased by about 1.96GB.
 
+For q_a/RMSNorm/q_b structure work, `MLX_LM_GLM_DSA_NATIVE_Q_A_RMS_NORM=1` or
+`--native-q-a-rms-norm enabled` routes the fixed `[B,L,2048]` q_a RMSNorm
+through a local native kernel. RMSNorm is small in the isolated q_projection
+profile, so this knob is mainly a fusion-readiness and attribution probe before
+larger fused q_projection kernels. Initial 2K full-model profiling showed
+correct native hits but no standalone speedup versus `mx.fast.rms_norm`.
+
 Benchmark rows report:
 
 - `glm_dsa_q_a_dense_cache`
@@ -355,6 +362,13 @@ Benchmark rows report:
 - `glm_dsa_q_a_dense_cache_hits`
 - `glm_dsa_q_a_dense_cache_builds`
 - `glm_dsa_q_a_dense_cache_fallback_reasons`
+- `glm_dsa_native_q_a_rms_norm`
+- `glm_dsa_native_q_a_rms_norm_env`
+- `glm_dsa_native_q_a_rms_norm_available`
+- `glm_dsa_native_q_a_rms_norm_source`
+- `glm_dsa_native_q_a_rms_norm_import_error`
+- `glm_dsa_native_q_a_rms_norm_hits`
+- `glm_dsa_native_q_a_rms_norm_fallback_reasons`
 - `glm_dsa_native_q4_qa`
 - `glm_dsa_native_q4_qa_env`
 - `glm_dsa_native_q4_qa_available`
@@ -467,6 +481,7 @@ Benchmark rows report:
 - `glm_dsa_q_a_dense_projection_seconds`
 - `glm_dsa_native_q4_qa_projection_seconds`
 - `glm_dsa_q_a_layernorm_seconds`
+- `glm_dsa_native_q_a_rms_norm_seconds`
 - `glm_dsa_q_b_projection_seconds`
 - `glm_dsa_native_q4_qb_projection_seconds`
 - `glm_dsa_native_q4_qb_head_layout_projection_seconds`

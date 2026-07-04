@@ -368,6 +368,13 @@ and reuses it for later prefill calls. This trades roughly 1.5-2GB of extra
 resident memory for a warmed q_a projection path, so it is a measurement knob
 rather than a recommended server setting. On the tested 8K repeat run, the
 warmed path was effectively unchanged versus dense-cache disabled.
+For the next q_projection structure step,
+`MLX_LM_GLM_DSA_NATIVE_Q_A_RMS_NORM=1` /
+`--native-q-a-rms-norm enabled` routes the fixed `[B,L,2048]` q_a RMSNorm through
+a local native kernel. RMSNorm is a small slice of isolated q_projection time,
+so this is mainly a fusion-readiness and attribution probe before attempting
+larger q_a/RMSNorm/q_b kernel-structure changes. Initial 2K full-model profiling
+showed correct native hits but no standalone speedup versus `mx.fast.rms_norm`.
 
 **Bottleneck hypothesis**
 The bottleneck is still long-context prefill itself: later 32k chunks climbed to around 40s per 2048-token chunk. DSA/top-k and long-context attention/dequantization are the likely next places to profile, but checkpoint reuse is the practical answer for repeated coding-agent prefixes right now. Benchmark JSON now includes `checkpoint_prefill_chunk_summaries` plus slowest-chunk and route-count columns so native sparse MLA/indexer policy changes can be evaluated chunk by chunk.

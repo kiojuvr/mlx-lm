@@ -722,6 +722,93 @@ class GlmDsaQ4QbProjHeadsPrimitive : public Primitive {
   Q4QbTileConfig tile_;
 };
 
+class GlmDsaQaRmsNormPrimitive : public Primitive {
+ public:
+  GlmDsaQaRmsNormPrimitive(Stream stream, float eps)
+      : Primitive(stream), eps_(eps) {}
+
+  static bool unsupported(const array& x, const array& weight, Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    if (x.dtype() != float16 && x.dtype() != bfloat16) {
+      return true;
+    }
+    if (weight.dtype() != x.dtype()) {
+      return true;
+    }
+    if (x.ndim() != 3 || weight.ndim() != 1) {
+      return true;
+    }
+    if (!row_contiguous(x) || !row_contiguous(weight)) {
+      return true;
+    }
+    constexpr int D = 2048;
+    if (x.shape(2) != D || weight.shape(0) != D) {
+      return true;
+    }
+    return false;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("GlmDsaQaRmsNormPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int D = 2048;
+    constexpr int threads = 256;
+    const int rows = x.size() / D;
+
+    std::string kname;
+    concatenate(
+        kname,
+        "glm_rms_norm_2048_",
+        glm_type_name(x.dtype()),
+        "_t_",
+        threads);
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(kname, lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
+    compute_encoder.set_input_array(weight, 1);
+    compute_encoder.set_output_array(out, 2);
+    compute_encoder.set_bytes(eps_, 3);
+    compute_encoder.set_bytes(rows, 4);
+
+    MTL::Size grid_dims(rows, 1, 1);
+    MTL::Size group_dims(threads, 1, 1);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(GlmDsaQaRmsNormPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const GlmDsaQaRmsNormPrimitive&>(other);
+    return eps_ == rhs.eps_;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, eps_);
+  }
+
+ private:
+  float eps_;
+};
+
 class GlmMoeWeightedSumPrimitive : public Primitive {
  public:
   explicit GlmMoeWeightedSumPrimitive(Stream stream) : Primitive(stream) {}
@@ -1161,6 +1248,53 @@ array glm_dsa_q4_qb_proj_heads(
       x.dtype(),
       std::make_shared<GlmDsaQ4QbProjHeadsPrimitive>(
           stream, q4_qb_tile_config()),
+      std::move(inputs));
+}
+
+array glm_dsa_q_a_rms_norm(
+    const array& x,
+    const array& weight,
+    float eps,
+    StreamOrDevice s /* = {} */) {
+  if (x.ndim() != 3 || weight.ndim() != 1) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q_a_rms_norm] expected x rank 3 and "
+        << "weight rank 1, got " << x.shape() << ", " << weight.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  constexpr int D = 2048;
+  if (x.shape(2) != D || weight.shape(0) != D) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q_a_rms_norm] incompatible shapes: "
+        << x.shape() << ", " << weight.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != float16 && x.dtype() != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q_a_rms_norm] expected float16 or "
+        << "bfloat16 input, got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (weight.dtype() != x.dtype()) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q_a_rms_norm] expected weight dtype "
+        << x.dtype() << ", got " << weight.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {x, weight};
+  if (GlmDsaQaRmsNormPrimitive::unsupported(x, weight, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.glm_dsa_q_a_rms_norm] unsupported M3 GLM shape.");
+  }
+
+  return array(
+      x.shape(),
+      x.dtype(),
+      std::make_shared<GlmDsaQaRmsNormPrimitive>(stream, eps),
       std::move(inputs));
 }
 

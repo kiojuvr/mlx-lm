@@ -33,6 +33,7 @@ NATIVE_SYMBOLS = (
     "glm_dsa_q4_qa_proj_flat",
     "glm_dsa_q4_qb_proj_flat",
     "glm_dsa_q4_qb_proj_heads",
+    "glm_dsa_q_a_rms_norm",
     "glm_moe_weighted_sum",
 )
 
@@ -326,6 +327,28 @@ def glm_dsa_q4_qa_proj_flat(
         weight,
         scales,
         biases,
+        stream=stream or mx.gpu,
+    )
+
+
+def glm_dsa_q_a_rms_norm(
+    x: mx.array,
+    weight: mx.array,
+    eps: float,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "glm_dsa_q_a_rms_norm"):
+        return _ext.glm_dsa_q_a_rms_norm(
+            x,
+            weight,
+            eps,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.rms_norm(
+        x,
+        weight,
+        eps,
         stream=stream or mx.gpu,
     )
 

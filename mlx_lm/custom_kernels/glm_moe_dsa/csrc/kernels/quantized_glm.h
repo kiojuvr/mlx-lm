@@ -2255,6 +2255,52 @@ template <
   }
 }
 
+template <typename T, const int D = 2048, const int THREADS = 256>
+[[kernel]] void glm_rms_norm_2048(
+    const device T* x [[buffer(0)]],
+    const device T* weight [[buffer(1)]],
+    device T* y [[buffer(2)]],
+    const constant float& eps [[buffer(3)]],
+    const constant int& rows [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const int row = int(tid.x);
+  if (row >= rows) {
+    return;
+  }
+
+  constexpr int SIMDS = THREADS / SIMD_SIZE;
+  threadgroup float sums[SIMDS];
+  const int row_base = row * D;
+  float sum = 0.0f;
+  for (int col = int(lid); col < D; col += THREADS) {
+    const float value = float(x[row_base + col]);
+    sum += value * value;
+  }
+  sum = simd_sum(sum);
+  if (simd_lid == 0) {
+    sums[simd_gid] = sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float total = lid < SIMDS ? sums[lid] : 0.0f;
+  if (simd_gid == 0) {
+    total = simd_sum(total);
+    if (simd_lid == 0) {
+      sums[0] = total;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float scale = rsqrt(sums[0] / float(D) + eps);
+  for (int col = int(lid); col < D; col += THREADS) {
+    const float value = float(x[row_base + col]) * float(weight[col]) * scale;
+    y[row_base + col] = T(value);
+  }
+}
+
 template <
     typename T,
     const int group_size,

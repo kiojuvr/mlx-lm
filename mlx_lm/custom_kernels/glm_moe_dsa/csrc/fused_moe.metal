@@ -93,6 +93,14 @@
       topk,                                                                    \
       threads)
 
+#define instantiate_glm_rms_norm_2048(type, threads)                           \
+  instantiate_kernel(                                                          \
+      "glm_rms_norm_2048_" #type "_t_" #threads,                               \
+      glm_rms_norm_2048,                                                       \
+      type,                                                                    \
+      2048,                                                                    \
+      threads)
+
 instantiate_quantized_head_flat(affine_qmm_t_head_flat, float16_t, 64, 8, true);
 instantiate_quantized_head_flat(
     affine_qmm_t_head_flat,
@@ -565,6 +573,9 @@ instantiate_quantized_flat_tiled(
     64,
     64,
     64);
+
+instantiate_glm_rms_norm_2048(float16_t, 256);
+instantiate_glm_rms_norm_2048(bfloat16_t, 256);
 
 instantiate_moe_weighted_sum_tiled(float16_t, float, 8, 256);
 instantiate_moe_weighted_sum_tiled(bfloat16_t, float, 8, 256);
