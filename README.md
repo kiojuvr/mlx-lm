@@ -127,6 +127,10 @@ python -m mlx_lm server \
   --glm-dsa-adaptive-prefill-step-size 0 \
   --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
   --checkpoint-save-exact disabled \
+  --checkpoint-save-delta enabled \
+  --checkpoint-post-response-save-mode async \
+  --checkpoint-async-save-shutdown-timeout 0 \
+  --generation-shutdown-timeout 0 \
   --checkpoint-shutdown-save-limit 0 \
   --request-max-tokens-floor 384000 \
   --prompt-concurrency 1 \
@@ -201,6 +205,15 @@ This fork automatically stores trusted local GLM-5.2 prompt checkpoints and reus
 Benchmark-backed measurements on this local fork showed exact 4096/8192-token checkpoint hits dropping TTFT from roughly 23s/52s to roughly 0.2s. Controlled LCP runs are the clean way to measure partial reuse: for example, an 8192-token cached prefix plus a 2048-token suffix should report `expected_reused_prefix_tokens=8192`, `disk_cached_tokens=8192`, `fresh_prompt_tokens=2048`, and `checkpoint_expected_match=true`.
 
 Use `--no-prompt-checkpoint` only for cold or disabled-baseline measurements. Use `--checkpoint-save-exact disabled` or `--no-save-exact-checkpoint` when you want to store only configured prefix/frontier checkpoints without also creating a final exact full-prompt checkpoint.
+For interactive coding-agent clients, keep delta checkpointing enabled and leave
+`--checkpoint-post-response-save-mode async` in place; post-response continued
+and delta checkpoint writes then run on the background checkpoint worker instead
+of blocking the single generation worker before it accepts the next request.
+Leave `--checkpoint-async-save-shutdown-timeout 0` if Ctrl+C should not wait on
+an in-flight checkpoint write, and leave `--generation-shutdown-timeout 0` if
+Ctrl+C should not wait on startup model loading or an active generation thread.
+Async saves log `async checkpoint save queued`, `save delta start`, and
+`async checkpoint save complete`, making this work visible in the server log.
 Shutdown-time RAM checkpoint flushes are disabled by default via `--checkpoint-shutdown-save-limit 0`; only enable them for short bounded caches, and keep `--checkpoint-shutdown-max-tokens` below the largest prompt size you are willing to serialize during Ctrl+C shutdown.
 
 ### Controlled LCP benchmark examples
@@ -376,6 +389,43 @@ Python reshape/transpose after q_b. The standalone q_b microbench shows the
 alternate kernel's arithmetic time is roughly comparable to the flat q_b kernel;
 use full prefill profiles to judge whether the graph-layout change helps end to
 end.
+For a model-free whole-q_projection structure check, use
+`benchmarks/glm52_q_projection_microbench.py`. It composes the fixed GLM-5.2 M3
+q_a projection, q_a RMSNorm, q_b projection, head layout conversion, and
+q_nope/q_pe split without loading model weights. The first local 8K run showed
+only small margins: native q_b flat and native RMS + native q_b heads were
+slightly ahead of the MLX baseline, while the existing q_b-from-q_a materialized
+qr avoidance remained slower in this synthetic setup. Treat it as a cheap
+candidate filter before running full prefill profiles. For one-load full-model
+confirmation, use `benchmarks/glm52_prefill_benchmark.py` with
+`--q-projection-structure-sweep`, which labels rows with
+`q_projection_structure_sweep_name`. In local 32K and 64K forward/reverse
+full-model sweeps, `native-qa-qb-flat` consistently reduced isolated
+q_projection time, mostly through q_b projection, but the end-to-end prefill
+total at 64K was still dominated by order-sensitive warm-state and sparse
+attention noise. To use the selected structure without spelling out each env
+flag, set `MLX_LM_GLM_DSA_Q_PROJECTION_PRESET=native-qa-qb-flat`; the benchmark
+also accepts `--q-projection-preset native-qa-qb-flat`, and the server accepts
+`--glm-dsa-q-projection-preset native-qa-qb-flat`. Individual q_projection env
+flags still override the preset. The `native-qa-qb-flat-split` candidate keeps
+the native flat q_b kernel but splits q_nope/q_pe before the head-layout
+transpose; it can also be selected directly with
+`MLX_LM_GLM_DSA_Q_B_SPLIT_STRATEGY=flat-before-transpose`,
+`--q-b-split-strategy flat-before-transpose`, or
+`--glm-dsa-q-b-split-strategy flat-before-transpose`. A corrected 32K cold
+comparison with candidate-local checkpoint cache directories measured about
+11.72s q_projection for `native-qa-qb-flat` and about 11.73s for
+`native-qa-qb-flat-split`, so flat-split is not promoted over the flat preset.
+The newer `native-qa-qb-native-split` probe goes one step lower and has the
+native q_b kernel return q_nope/q_pe directly as `[B,H,L,192]` and
+`[B,H,L,64]` outputs. It is controlled by
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_SPLIT=1` or
+`--native-q4-qb-split enabled` in benchmark runs. Keep it in profiling sweeps
+until full-model measurements justify promoting it to a serving preset. In the
+first corrected 8K full-model check, the route hit the native split kernel on
+all 234 q_b calls, but q_projection was about 2.90s versus about 2.84s for
+`native-qa-qb-flat-split`, so it remains a measurement candidate rather than a
+preferred preset.
 `MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A=1` /
 `--native-q4-qb-from-q-a enabled` is a deeper shared-layer q_projection PoC. It
 skips materializing `qr` on shared-indexer layers by computing a compact q_a

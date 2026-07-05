@@ -83,6 +83,50 @@
       bk,                                                                      \
       bn)
 
+#define instantiate_quantized_head_broadcast_split(                            \
+    name, type, group_size, bits, aligned)                                      \
+  instantiate_kernel(                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned,         \
+      name,                                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      aligned)
+
+#define instantiate_quantized_head_broadcast_split_tiled(                      \
+    name, type, group_size, bits, aligned, bm, bk, bn)                          \
+  instantiate_kernel(                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned          \
+      "_bm_" #bm "_bk_" #bk "_bn_" #bn,                                        \
+      name,                                                                    \
+      type,                                                                    \
+      group_size,                                                              \
+      bits,                                                                    \
+      aligned,                                                                 \
+      bm,                                                                      \
+      bk,                                                                      \
+      bn)
+
+#define instantiate_qb_split_variants(type)                                    \
+  instantiate_quantized_head_broadcast_split(                                  \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true);                   \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 32, 64, 32);       \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 16, 32, 32);       \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 32, 32, 16);       \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 32, 32, 64);       \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 64, 32, 32);       \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 16, 32, 64);       \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 64, 32, 64);       \
+  instantiate_quantized_head_broadcast_split_tiled(                            \
+      affine_qmm_t_head_broadcast_split, type, 64, 4, true, 32, 64, 64)
+
 #define instantiate_quantized_head_broadcast_heads_scaled(                     \
     name, type, group_size, bits, aligned)                                      \
   instantiate_kernel(                                                          \
@@ -459,6 +503,8 @@ instantiate_quantized_head_broadcast_heads_tiled(
     32,
     64,
     64);
+instantiate_qb_split_variants(float16_t);
+instantiate_qb_split_variants(bfloat16_t);
 instantiate_quantized_head_broadcast_heads_scaled(
     affine_qmm_t_head_broadcast_heads_scaled,
     float16_t,

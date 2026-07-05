@@ -33,6 +33,7 @@ NATIVE_SYMBOLS = (
     "glm_dsa_q4_qa_proj_flat",
     "glm_dsa_q4_qb_proj_flat",
     "glm_dsa_q4_qb_proj_heads",
+    "glm_dsa_q4_qb_proj_split",
     "glm_dsa_q_a_rms_norm",
     "glm_dsa_q_a_rms_scale",
     "glm_dsa_q4_qb_proj_scaled_heads",
@@ -307,6 +308,43 @@ def glm_dsa_q4_qb_proj_heads(
         biases,
         stream=stream or mx.gpu,
     )
+
+
+def glm_dsa_q4_qb_proj_split(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array]:
+    if _ext is not None and hasattr(_ext, "glm_dsa_q4_qb_proj_split"):
+        q_nope, q_pe = _ext.glm_dsa_q4_qb_proj_split(
+            x,
+            weight,
+            scales,
+            biases,
+            **_native_stream_kwargs(stream),
+        )
+        return q_nope, q_pe
+    if hasattr(mx.fast, "glm_dsa_q4_qb_proj_split"):
+        q_nope, q_pe = mx.fast.glm_dsa_q4_qb_proj_split(
+            x,
+            weight,
+            scales,
+            biases,
+            stream=stream or mx.gpu,
+        )
+        return q_nope, q_pe
+    q_heads = glm_dsa_q4_qb_proj_heads(
+        x,
+        weight,
+        scales,
+        biases,
+        stream=stream,
+    )
+    q_nope, q_pe = mx.split(q_heads, [192], axis=-1)
+    return q_nope, q_pe
 
 
 def glm_dsa_q4_qa_proj_flat(

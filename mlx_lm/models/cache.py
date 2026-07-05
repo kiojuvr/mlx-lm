@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
@@ -58,6 +59,7 @@ PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY = (
 DEFAULT_PROMPT_CHECKPOINT_MAX_FILES = 256
 DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES = 256 * 1024**3
 DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS = 0
+_PROMPT_CHECKPOINT_IO_LOCK = threading.RLock()
 
 _CHECKPOINT_REQUIRED_METADATA_KEYS = (
     "checkpoint_format",
@@ -116,6 +118,10 @@ def ensure_glm52_local_cache_dirs():
     os.makedirs(glm52_prompt_checkpoints_dir(), exist_ok=True)
     if prompt_checkpoint_cache_dir_override() is None:
         os.makedirs(glm52_kv_cache_dir(), exist_ok=True)
+
+
+def prompt_checkpoint_io_lock():
+    return _PROMPT_CHECKPOINT_IO_LOCK
 
 
 def _is_empty_array(value):
@@ -185,7 +191,24 @@ def save_prompt_cache(
     cache_classes = [type(c).__name__ for c in cache]
     cache_metadata = [cache_info, metadata, cache_classes]
     cache_metadata = dict(tree_flatten(cache_metadata))
-    mx.save_safetensors(file_name, cache_data, cache_metadata)
+    file_dir = os.path.dirname(os.path.abspath(file_name))
+    file_base = os.path.basename(file_name)
+    tmp_file = os.path.join(
+        file_dir,
+        (
+            f".{file_base}.{os.getpid()}.{threading.get_ident()}."
+            f"{time.time_ns()}.tmp.safetensors"
+        ),
+    )
+    try:
+        mx.save_safetensors(tmp_file, cache_data, cache_metadata)
+        os.replace(tmp_file, file_name)
+    except Exception:
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+        raise
 
 
 def load_prompt_cache(file_name, return_metadata=False):

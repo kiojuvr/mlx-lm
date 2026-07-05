@@ -4,6 +4,8 @@
 #include "mlx/stream.h"
 #include "mlx/utils.h"
 
+#include <vector>
+
 namespace mx = mlx::core;
 
 namespace omlx::glm_kernels {
@@ -37,6 +39,13 @@ mx::array glm_dsa_q4_qb_proj_flat(
     mx::StreamOrDevice s = {});
 
 mx::array glm_dsa_q4_qb_proj_heads(
+    const mx::array& x,
+    const mx::array& weight,
+    const mx::array& scales,
+    const mx::array& biases,
+    mx::StreamOrDevice s = {});
+
+std::vector<mx::array> glm_dsa_q4_qb_proj_split(
     const mx::array& x,
     const mx::array& weight,
     const mx::array& scales,

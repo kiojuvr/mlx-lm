@@ -486,6 +486,184 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(restored_from_q_a_env, "old-enabled")
         self.assertEqual(restored_kernel_env, "old-kernel")
 
+    def test_q_projection_structure_sweep_switches_env_and_restores(self):
+        prompt_cache_env = benchmark.prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV
+        envs = {
+            "preset": benchmark.glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV,
+            "dense": benchmark.glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+            "rms": benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV,
+            "qa": benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+            "qb": benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
+            "heads": benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV,
+            "nativesplit": benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV,
+            "fromqa": benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV,
+            "kernel": benchmark.glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
+            "split": benchmark.glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV,
+        }
+        saved_env = {key: os.environ.get(value) for key, value in envs.items()}
+        saved_prompt_cache_env = os.environ.get(prompt_cache_env)
+        calls = []
+
+        def fake_runner(_model, _tokenizer, _text, call_args, case_name):
+            calls.append(
+                {
+                    "case": case_name,
+                    "dense_arg": call_args.q_a_dense_cache,
+                    "rms_arg": call_args.native_q_a_rms_norm,
+                    "qa_arg": call_args.native_q4_qa,
+                    "qb_arg": call_args.native_q4_qb,
+                    "heads_arg": call_args.native_q4_qb_head_layout,
+                    "nativesplit_arg": call_args.native_q4_qb_split,
+                    "fromqa_arg": call_args.native_q4_qb_from_q_a,
+                    "kernel_arg": call_args.native_q4_qb_from_q_a_kernel,
+                    "split_arg": call_args.q_b_split_strategy,
+                    "preset_env": os.environ.get(envs["preset"]),
+                    "dense_env": os.environ.get(envs["dense"]),
+                    "rms_env": os.environ.get(envs["rms"]),
+                    "qa_env": os.environ.get(envs["qa"]),
+                    "qb_env": os.environ.get(envs["qb"]),
+                    "heads_env": os.environ.get(envs["heads"]),
+                    "nativesplit_env": os.environ.get(envs["nativesplit"]),
+                    "fromqa_env": os.environ.get(envs["fromqa"]),
+                    "kernel_env": os.environ.get(envs["kernel"]),
+                    "split_env": os.environ.get(envs["split"]),
+                    "cache_env": os.environ.get(prompt_cache_env),
+                    "resolved_cache_dir": call_args.resolved_checkpoint_cache_dir,
+                }
+            )
+            return {"case": case_name}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                args = Namespace(
+                    q_projection_preset="default",
+                    q_a_dense_cache="default",
+                    native_q_a_rms_norm="default",
+                    native_q4_qa="default",
+                    native_q4_qb="default",
+                    native_q4_qb_head_layout="default",
+                    native_q4_qb_split="default",
+                    native_q4_qb_from_q_a="default",
+                    native_q4_qb_from_q_a_kernel="default",
+                    q_b_split_strategy="default",
+                    no_prompt_checkpoint=False,
+                    resolved_checkpoint_cache_dir=tmpdir,
+                    q_projection_structure_sweep=[
+                        "baseline",
+                        "native-qa-qb-flat-split",
+                        "native-qa-qb-native-split",
+                        "native-qa-rms-qb-heads",
+                        "fromqa-wscaled",
+                    ],
+                )
+                for value in envs.values():
+                    os.environ[value] = "old"
+                os.environ[prompt_cache_env] = "old-cache"
+                rows = benchmark.run_with_q_projection_structure_sweep(
+                    fake_runner,
+                    None,
+                    None,
+                    "prompt",
+                    args,
+                    "case",
+                )
+                restored_env = {
+                    key: os.environ.get(value) for key, value in envs.items()
+                }
+                restored_prompt_cache_env = os.environ.get(prompt_cache_env)
+                restored_resolved_cache_dir = args.resolved_checkpoint_cache_dir
+                expected_cache_dirs = [
+                    str(Path(tmpdir) / "00-baseline"),
+                    str(Path(tmpdir) / "01-native-qa-qb-flat-split"),
+                    str(Path(tmpdir) / "02-native-qa-qb-native-split"),
+                    str(Path(tmpdir) / "03-native-qa-rms-qb-heads"),
+                    str(Path(tmpdir) / "04-fromqa-wscaled"),
+                ]
+        finally:
+            for key, value in envs.items():
+                if saved_env[key] is None:
+                    os.environ.pop(value, None)
+                else:
+                    os.environ[value] = saved_env[key]
+            if saved_prompt_cache_env is None:
+                os.environ.pop(prompt_cache_env, None)
+            else:
+                os.environ[prompt_cache_env] = saved_prompt_cache_env
+
+        self.assertEqual(
+            [row["q_projection_structure_sweep_name"] for row in rows],
+            [
+                "baseline",
+                "native-qa-qb-flat-split",
+                "native-qa-qb-native-split",
+                "native-qa-rms-qb-heads",
+                "fromqa-wscaled",
+            ],
+        )
+        self.assertEqual(
+            [call["case"] for call in calls],
+            [
+                "case-qproj-baseline",
+                "case-qproj-native-qa-qb-flat-split",
+                "case-qproj-native-qa-qb-native-split",
+                "case-qproj-native-qa-rms-qb-heads",
+                "case-qproj-fromqa-wscaled",
+            ],
+        )
+        self.assertEqual(calls[0]["preset_env"], "baseline")
+        self.assertEqual(calls[0]["dense_env"], "0")
+        self.assertEqual(calls[0]["rms_env"], "0")
+        self.assertEqual(calls[0]["qa_env"], "0")
+        self.assertEqual(calls[0]["qb_env"], "0")
+        self.assertEqual(calls[0]["heads_env"], "0")
+        self.assertEqual(calls[0]["nativesplit_env"], "0")
+        self.assertEqual(calls[0]["fromqa_env"], "0")
+        self.assertIsNone(calls[0]["kernel_env"])
+        self.assertEqual(calls[0]["split_env"], "heads")
+        self.assertEqual(calls[1]["preset_env"], "native-qa-qb-flat-split")
+        self.assertEqual(calls[1]["rms_env"], "0")
+        self.assertEqual(calls[1]["qa_env"], "1")
+        self.assertEqual(calls[1]["qb_env"], "1")
+        self.assertEqual(calls[1]["heads_env"], "0")
+        self.assertEqual(calls[1]["nativesplit_env"], "0")
+        self.assertEqual(calls[1]["fromqa_env"], "0")
+        self.assertIsNone(calls[1]["kernel_env"])
+        self.assertEqual(calls[1]["split_env"], "flat-before-transpose")
+        self.assertEqual(calls[2]["preset_env"], "native-qa-qb-native-split")
+        self.assertEqual(calls[2]["rms_env"], "0")
+        self.assertEqual(calls[2]["qa_env"], "1")
+        self.assertEqual(calls[2]["qb_env"], "1")
+        self.assertEqual(calls[2]["heads_env"], "0")
+        self.assertEqual(calls[2]["nativesplit_env"], "1")
+        self.assertEqual(calls[2]["fromqa_env"], "0")
+        self.assertIsNone(calls[2]["kernel_env"])
+        self.assertEqual(calls[2]["split_env"], "heads")
+        self.assertEqual(calls[3]["preset_env"], "native-qa-rms-qb-heads")
+        self.assertEqual(calls[3]["rms_env"], "1")
+        self.assertEqual(calls[3]["qa_env"], "1")
+        self.assertEqual(calls[3]["qb_env"], "1")
+        self.assertEqual(calls[3]["heads_env"], "1")
+        self.assertEqual(calls[3]["nativesplit_env"], "0")
+        self.assertEqual(calls[3]["fromqa_env"], "0")
+        self.assertIsNone(calls[3]["kernel_env"])
+        self.assertEqual(calls[3]["split_env"], "heads")
+        self.assertEqual(calls[4]["preset_env"], "fromqa-wscaled")
+        self.assertEqual(calls[4]["qa_env"], "1")
+        self.assertEqual(calls[4]["qb_env"], "1")
+        self.assertEqual(calls[4]["heads_env"], "0")
+        self.assertEqual(calls[4]["nativesplit_env"], "0")
+        self.assertEqual(calls[4]["fromqa_env"], "1")
+        self.assertEqual(calls[4]["kernel_env"], "wscaled")
+        self.assertEqual(calls[4]["split_env"], "heads")
+        self.assertEqual([call["cache_env"] for call in calls], expected_cache_dirs)
+        self.assertEqual(
+            [call["resolved_cache_dir"] for call in calls],
+            expected_cache_dirs,
+        )
+        self.assertEqual(restored_env, {key: "old" for key in envs})
+        self.assertEqual(restored_prompt_cache_env, "old-cache")
+        self.assertEqual(restored_resolved_cache_dir, tmpdir)
+
     def test_prefill_sweep_writes_partial_json_output(self):
         old_build_prompt_text = benchmark.build_prompt_text
         old_run_once = benchmark.run_once
@@ -622,6 +800,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "native_q4_qa_fallback_reasons": {"missing_symbol": 1},
                 "native_q4_qb_hits": 6,
                 "native_q4_qb_fallback_reasons": {"disabled": 1},
+                "native_q4_qb_split_hits": 5,
+                "native_q4_qb_split_fallback_reasons": {"missing_split_symbol": 1},
             }
 
         def fake_status():
@@ -666,6 +846,11 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "available": True,
                 "source": "q4-test",
                 "import_error": None,
+                "split_available": True,
+                "split_source": "q4-split-test",
+                "split_import_error": None,
+                "q_b_split_strategy": "heads",
+                "q_b_split_strategy_env": "default",
             }
 
         def fake_q4_qa_status():
@@ -717,6 +902,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
 
         self.assertEqual(profile["glm_dsa_native_sparse_prefill"], "enabled")
         self.assertTrue(profile["glm_dsa_native_sparse_prefill_available"])
+        self.assertEqual(profile["glm_dsa_q_b_split_strategy"], "heads")
+        self.assertTrue(profile["glm_dsa_native_q4_qb_split_available"])
+        self.assertEqual(profile["glm_dsa_native_q4_qb_split_hits"], 5)
         self.assertEqual(profile["glm_dsa_native_sparse_prefill_source"], "test")
         self.assertEqual(profile["glm_dsa_native_sparse_prefill_hits"], 2)
         self.assertEqual(
@@ -817,6 +1005,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "native_q4_qa_fallback_reasons": {},
                 "native_q4_qb_hits": 0,
                 "native_q4_qb_fallback_reasons": {},
+                "native_q4_qb_split_hits": 0,
+                "native_q4_qb_split_fallback_reasons": {},
             }
 
         def fake_status():
@@ -861,6 +1051,11 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "available": True,
                 "source": "q4-test",
                 "import_error": None,
+                "split_available": False,
+                "split_source": None,
+                "split_import_error": None,
+                "q_b_split_strategy": "heads",
+                "q_b_split_strategy_env": "default",
             }
 
         def fake_q4_qa_status():

@@ -29,10 +29,13 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.server import (
     APIHandler,
+    DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
@@ -113,6 +116,12 @@ class DummyModelProvider:
                 "checkpoint_shutdown_max_tokens": (
                     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS
                 ),
+                "checkpoint_async_save_shutdown_timeout": (
+                    DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS
+                ),
+                "generation_shutdown_timeout": (
+                    DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS
+                ),
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
@@ -127,6 +136,11 @@ class DummyModelProvider:
                 "decode_progress_interval_tokens": 0,
                 "prefill_progress_interval_tokens": 0,
                 "checkpoint_save_exact": "enabled",
+                "checkpoint_save_delta": "enabled",
+                "checkpoint_save_delta_mode": "async",
+                "checkpoint_delta_max_tokens": (
+                    DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS
+                ),
             },
         )
 
@@ -267,6 +281,15 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
                 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
             ),
             "checkpoint_max_age_seconds": DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+            "checkpoint_save_delta": "enabled",
+            "checkpoint_save_delta_mode": "async",
+            "checkpoint_delta_max_tokens": (
+                DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS
+            ),
+            "checkpoint_async_save_shutdown_timeout": (
+                DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS
+            ),
+            "generation_shutdown_timeout": DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
             "checkpoint_shutdown_save_limit": (
                 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT
             ),
@@ -509,6 +532,70 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(update_manifest.call_args.kwargs["kind"], "delta")
         prune.assert_called_once()
 
+    def test_save_delta_prompt_checkpoint_can_be_disabled(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=self._args(checkpoint_save_delta="disabled"),
+        )
+        base_checkpoint = RenderedPromptCheckpoint(
+            prompt_cache=[],
+            prefix_tokens=[1, 2, 3],
+            suffix_tokens=[],
+            kind="frontier",
+            rendered_prefix_bytes=0,
+            checkpoint_path="/tmp/base-3.safetensors",
+        )
+
+        with mock.patch("mlx_lm.server.save_prompt_checkpoint") as save:
+            saved = generator._save_delta_prompt_checkpoint(
+                types.SimpleNamespace(),
+                [KVCache()],
+                [1, 2, 3, 4, 5],
+                base_checkpoint=base_checkpoint,
+            )
+
+        self.assertFalse(saved)
+        save.assert_not_called()
+
+    def test_save_delta_prompt_checkpoint_respects_max_tokens(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=self._args(checkpoint_delta_max_tokens=1),
+        )
+        base_checkpoint = RenderedPromptCheckpoint(
+            prompt_cache=[],
+            prefix_tokens=[1, 2, 3],
+            suffix_tokens=[],
+            kind="frontier",
+            rendered_prefix_bytes=0,
+            checkpoint_path="/tmp/base-3.safetensors",
+        )
+
+        with mock.patch("mlx_lm.server.save_prompt_checkpoint") as save:
+            saved = generator._save_delta_prompt_checkpoint(
+                types.SimpleNamespace(),
+                [KVCache()],
+                [1, 2, 3, 4, 5],
+                base_checkpoint=base_checkpoint,
+            )
+
+        self.assertFalse(saved)
+        save.assert_not_called()
+
+    def test_enqueue_checkpoint_save_queues_job(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._checkpoint_save_queue = Queue()
+
+        generator._enqueue_checkpoint_save("delta", lambda: True)
+
+        job = generator._checkpoint_save_queue.get_nowait()
+        self.assertEqual(job.label, "delta")
+        self.assertTrue(job.save())
+
     def test_load_delta_prompt_checkpoint_concatenates_base_and_delta(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
@@ -670,6 +757,29 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         logs = "\n".join(captured.output)
         self.assertIn("Shutdown requested", logs)
         self.assertIn("Shutdown sequence started", logs)
+        self.assertIn("Shutdown sequence complete", logs)
+
+    def test_stop_and_join_does_not_block_on_active_generation_thread(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._stop = False
+        generator._shutdown_complete = False
+        generator.requests = Queue()
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=self._args(generation_shutdown_timeout=0)
+        )
+        generator._generation_thread = types.SimpleNamespace(
+            join=mock.Mock(),
+            is_alive=mock.Mock(return_value=True),
+        )
+        generator.flush_shutdown_prompt_checkpoints = mock.Mock(return_value={})
+        generator.prune_shutdown_prompt_checkpoints = mock.Mock(return_value={})
+
+        with self.assertLogs(level="INFO") as captured:
+            generator.stop_and_join()
+
+        generator._generation_thread.join.assert_called_once_with(timeout=0.0)
+        logs = "\n".join(captured.output)
+        self.assertIn("Generation worker still active; not blocking shutdown", logs)
         self.assertIn("Shutdown sequence complete", logs)
 
     def test_run_http_server_logs_keyboard_interrupt_shutdown(self):
@@ -900,6 +1010,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.glm_dsa_adaptive_prefill_step_size, 0)
         self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 0)
         self.assertEqual(args.glm_dsa_adaptive_prefill_min_remaining_tokens, 0)
+        self.assertEqual(args.glm_dsa_q_b_split_strategy, "default")
         self.assertIsNone(args.checkpoint_cache_dir)
         self.assertEqual(
             args.checkpoint_min_tokens, DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS
@@ -939,6 +1050,20 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.prefill_progress_interval_tokens, 0)
         self.assertEqual(args.request_max_tokens_floor, 0)
         self.assertEqual(args.checkpoint_save_exact, "enabled")
+        self.assertEqual(args.checkpoint_save_delta, "enabled")
+        self.assertEqual(args.checkpoint_save_delta_mode, "async")
+        self.assertEqual(
+            args.checkpoint_delta_max_tokens,
+            DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS,
+        )
+        self.assertEqual(
+            args.checkpoint_async_save_shutdown_timeout,
+            DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            args.generation_shutdown_timeout,
+            DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
+        )
 
     def test_setup_arg_parser_disable_batching(self):
         args = setup_arg_parser().parse_args(["--disable-batching"])
@@ -1005,6 +1130,13 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 4096)
         self.assertEqual(args.glm_dsa_adaptive_prefill_min_remaining_tokens, 2048)
 
+    def test_setup_arg_parser_glm_dsa_q_b_split_strategy(self):
+        args = setup_arg_parser().parse_args(
+            ["--glm-dsa-q-b-split-strategy", "flat-before-transpose"]
+        )
+
+        self.assertEqual(args.glm_dsa_q_b_split_strategy, "flat-before-transpose")
+
     def test_setup_arg_parser_checkpoint_cache_dir(self):
         args = setup_arg_parser().parse_args(
             ["--checkpoint-cache-dir", "/tmp/glm52-checkpoints"]
@@ -1029,6 +1161,16 @@ class TestServerCLI(unittest.TestCase):
                 "3600",
                 "--checkpoint-save-exact",
                 "disabled",
+                "--checkpoint-save-delta",
+                "disabled",
+                "--checkpoint-post-response-save-mode",
+                "sync",
+                "--checkpoint-delta-max-tokens",
+                "32768",
+                "--checkpoint-async-save-shutdown-timeout",
+                "1.5",
+                "--generation-shutdown-timeout",
+                "2.5",
                 "--checkpoint-shutdown-save-limit",
                 "2",
                 "--checkpoint-shutdown-max-tokens",
@@ -1043,13 +1185,30 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.checkpoint_continued_interval_tokens, 8192)
         self.assertEqual(args.checkpoint_max_age_seconds, 3600)
         self.assertEqual(args.checkpoint_save_exact, "disabled")
+        self.assertEqual(args.checkpoint_save_delta, "disabled")
+        self.assertEqual(args.checkpoint_save_delta_mode, "sync")
+        self.assertEqual(args.checkpoint_delta_max_tokens, 32768)
+        self.assertEqual(args.checkpoint_async_save_shutdown_timeout, 1.5)
+        self.assertEqual(args.generation_shutdown_timeout, 2.5)
         self.assertEqual(args.checkpoint_shutdown_save_limit, 2)
         self.assertEqual(args.checkpoint_shutdown_max_tokens, 32768)
+
+    def test_setup_arg_parser_checkpoint_save_delta_mode_alias(self):
+        args = setup_arg_parser().parse_args(
+            ["--checkpoint-save-delta-mode", "sync"]
+        )
+
+        self.assertEqual(args.checkpoint_save_delta_mode, "sync")
 
     def test_setup_arg_parser_no_save_exact_checkpoint_alias(self):
         args = setup_arg_parser().parse_args(["--no-save-exact-checkpoint"])
 
         self.assertEqual(args.checkpoint_save_exact, "disabled")
+
+    def test_setup_arg_parser_no_save_delta_checkpoint_alias(self):
+        args = setup_arg_parser().parse_args(["--no-save-delta-checkpoint"])
+
+        self.assertEqual(args.checkpoint_save_delta, "disabled")
 
     def test_configure_checkpoint_cache_dir_sets_env(self):
         old_value = os.environ.get(PROMPT_CHECKPOINT_CACHE_DIR_ENV)

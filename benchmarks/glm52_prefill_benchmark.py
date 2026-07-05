@@ -84,6 +84,129 @@ def parse_from_q_a_kernel_sweep(value):
     return candidates
 
 
+Q_PROJECTION_STRUCTURE_SWEEP_CANDIDATES = {
+    "baseline": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "disabled",
+        "native_q4_qb": "disabled",
+        "native_q4_qb_head_layout": "disabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "disabled",
+        "native_q4_qb_from_q_a_kernel": "default",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "disabled",
+        "native_q4_qb_head_layout": "disabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "disabled",
+        "native_q4_qb_from_q_a_kernel": "default",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-qb-flat": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "enabled",
+        "native_q4_qb_head_layout": "disabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "disabled",
+        "native_q4_qb_from_q_a_kernel": "default",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-qb-flat-split": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "enabled",
+        "native_q4_qb_head_layout": "disabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "disabled",
+        "native_q4_qb_from_q_a_kernel": "default",
+        "q_b_split_strategy": "flat-before-transpose",
+    },
+    "native-qa-qb-heads": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "enabled",
+        "native_q4_qb_head_layout": "enabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "disabled",
+        "native_q4_qb_from_q_a_kernel": "default",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-rms-qb-heads": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "enabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "enabled",
+        "native_q4_qb_head_layout": "enabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "disabled",
+        "native_q4_qb_from_q_a_kernel": "default",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-qb-native-split": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "enabled",
+        "native_q4_qb_head_layout": "disabled",
+        "native_q4_qb_split": "enabled",
+        "native_q4_qb_from_q_a": "disabled",
+        "native_q4_qb_from_q_a_kernel": "default",
+        "q_b_split_strategy": "heads",
+    },
+    "fromqa-scaled": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "enabled",
+        "native_q4_qb_head_layout": "disabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "enabled",
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "fromqa-wscaled": {
+        "q_a_dense_cache": "disabled",
+        "native_q_a_rms_norm": "disabled",
+        "native_q4_qa": "enabled",
+        "native_q4_qb": "enabled",
+        "native_q4_qb_head_layout": "disabled",
+        "native_q4_qb_split": "disabled",
+        "native_q4_qb_from_q_a": "enabled",
+        "native_q4_qb_from_q_a_kernel": "wscaled",
+        "q_b_split_strategy": "heads",
+    },
+}
+
+
+def parse_q_projection_structure_sweep(value):
+    candidates = [v.strip().lower() for v in value.split(",") if v.strip()]
+    if not candidates:
+        raise argparse.ArgumentTypeError(
+            "q_projection structure sweep must include at least one candidate"
+        )
+    invalid = [
+        candidate
+        for candidate in candidates
+        if candidate not in Q_PROJECTION_STRUCTURE_SWEEP_CANDIDATES
+    ]
+    if invalid:
+        expected = ", ".join(sorted(Q_PROJECTION_STRUCTURE_SWEEP_CANDIDATES))
+        raise argparse.ArgumentTypeError(
+            "unsupported q_projection structure sweep candidate(s): "
+            f"{','.join(invalid)}; expected one or more of {expected}"
+        )
+    return candidates
+
+
 def parse_policy_candidates(value):
     candidates = []
     for raw in value.split(","):
@@ -514,6 +637,14 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
     elif args.fast_prefill == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+    q_projection_preset = getattr(args, "q_projection_preset", "default")
+    if q_projection_preset != "default":
+        os.environ[
+            glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV
+        ] = q_projection_preset
+    q_b_split_strategy = getattr(args, "q_b_split_strategy", "default")
+    if q_b_split_strategy != "default":
+        os.environ[glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV] = q_b_split_strategy
     native_sparse_prefill = getattr(args, "native_sparse_prefill", "default")
     if native_sparse_prefill == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_SPARSE_PREFILL_ENV] = "1"
@@ -599,6 +730,11 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV] = "1"
     elif native_q4_qb_head_layout == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV] = "0"
+    native_q4_qb_split = getattr(args, "native_q4_qb_split", "default")
+    if native_q4_qb_split == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV] = "1"
+    elif native_q4_qb_split == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV] = "0"
     native_q4_qb_from_q_a = getattr(args, "native_q4_qb_from_q_a", "default")
     if native_q4_qb_from_q_a == "enabled":
         os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV] = "1"
@@ -822,6 +958,24 @@ def collect_glm_dsa_profile(args, case_name=None):
         "glm_dsa_native_q4_vup_fallback_reasons": profile[
             "native_q4_vup_fallback_reasons"
         ],
+        "glm_dsa_q_projection_preset": getattr(
+            args, "q_projection_preset", "default"
+        ),
+        "glm_dsa_q_projection_preset_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV,
+            "default",
+        ),
+        "glm_dsa_q_projection_preset_effective": (
+            glm_moe_dsa.get_glm_dsa_q_projection_preset()
+        ),
+        "glm_dsa_q_b_split_strategy": native_q4_qb_status.get(
+            "q_b_split_strategy",
+            glm_moe_dsa.get_glm_dsa_q_b_split_strategy(),
+        ),
+        "glm_dsa_q_b_split_strategy_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV,
+            "default",
+        ),
         "glm_dsa_q_a_dense_cache": getattr(args, "q_a_dense_cache", "default"),
         "glm_dsa_q_a_dense_cache_env": os.environ.get(
             glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
@@ -902,6 +1056,22 @@ def collect_glm_dsa_profile(args, case_name=None):
         "glm_dsa_native_q4_qb_head_layout_import_error": native_q4_qb_status.get(
             "head_layout_import_error"
         ),
+        "glm_dsa_native_q4_qb_split": getattr(
+            args, "native_q4_qb_split", "default"
+        ),
+        "glm_dsa_native_q4_qb_split_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV,
+            "default-off",
+        ),
+        "glm_dsa_native_q4_qb_split_available": native_q4_qb_status.get(
+            "split_available", False
+        ),
+        "glm_dsa_native_q4_qb_split_source": native_q4_qb_status.get(
+            "split_source"
+        ),
+        "glm_dsa_native_q4_qb_split_import_error": native_q4_qb_status.get(
+            "split_import_error"
+        ),
         "glm_dsa_native_q4_qb_from_q_a": getattr(
             args, "native_q4_qb_from_q_a", "default"
         ),
@@ -941,6 +1111,12 @@ def collect_glm_dsa_profile(args, case_name=None):
         "glm_dsa_native_q4_qb_fallback_reasons": profile[
             "native_q4_qb_fallback_reasons"
         ],
+        "glm_dsa_native_q4_qb_split_hits": profile.get(
+            "native_q4_qb_split_hits", 0
+        ),
+        "glm_dsa_native_q4_qb_split_fallback_reasons": profile.get(
+            "native_q4_qb_split_fallback_reasons", {}
+        ),
         "glm_dsa_native_q4_qb_from_q_a_hits": profile.get(
             "native_q4_qb_from_q_a_hits", 0
         ),
@@ -1940,6 +2116,8 @@ def print_table(rows, output_format):
         "prefill_sweep_candidate_index",
         "prefill_sweep_use_checkpoints",
         "prefill_sweep_fast_prefill_min_context",
+        "q_projection_structure_sweep_name",
+        "q_projection_structure_sweep_candidate_index",
         "from_q_a_kernel_sweep_name",
         "from_q_a_kernel_sweep_candidate_index",
         "batch_size",
@@ -2066,6 +2244,11 @@ def print_table(rows, output_format):
         "glm_dsa_native_q4_vup_import_error",
         "glm_dsa_native_q4_vup_hits",
         "glm_dsa_native_q4_vup_fallback_reasons",
+        "glm_dsa_q_projection_preset",
+        "glm_dsa_q_projection_preset_env",
+        "glm_dsa_q_projection_preset_effective",
+        "glm_dsa_q_b_split_strategy",
+        "glm_dsa_q_b_split_strategy_env",
         "glm_dsa_q_a_dense_cache",
         "glm_dsa_q_a_dense_cache_env",
         "glm_dsa_q_a_dense_cache_hits",
@@ -2098,6 +2281,11 @@ def print_table(rows, output_format):
         "glm_dsa_native_q4_qb_head_layout_available",
         "glm_dsa_native_q4_qb_head_layout_source",
         "glm_dsa_native_q4_qb_head_layout_import_error",
+        "glm_dsa_native_q4_qb_split",
+        "glm_dsa_native_q4_qb_split_env",
+        "glm_dsa_native_q4_qb_split_available",
+        "glm_dsa_native_q4_qb_split_source",
+        "glm_dsa_native_q4_qb_split_import_error",
         "glm_dsa_native_q4_qb_from_q_a",
         "glm_dsa_native_q4_qb_from_q_a_env",
         "glm_dsa_native_q4_qb_from_q_a_kernel",
@@ -2113,6 +2301,8 @@ def print_table(rows, output_format):
         "glm_dsa_native_q4_qb_import_error",
         "glm_dsa_native_q4_qb_hits",
         "glm_dsa_native_q4_qb_fallback_reasons",
+        "glm_dsa_native_q4_qb_split_hits",
+        "glm_dsa_native_q4_qb_split_fallback_reasons",
         "glm_dsa_native_q4_qb_from_q_a_hits",
         "glm_dsa_native_q4_qb_from_q_a_fallback_reasons",
         "native_smoke_available",
@@ -2165,8 +2355,10 @@ def print_table(rows, output_format):
         "glm_dsa_q_a_layernorm_seconds",
         "glm_dsa_native_q_a_rms_norm_seconds",
         "glm_dsa_q_b_projection_seconds",
+        "glm_dsa_q_b_split_seconds",
         "glm_dsa_native_q4_qb_projection_seconds",
         "glm_dsa_native_q4_qb_head_layout_projection_seconds",
+        "glm_dsa_native_q4_qb_split_projection_seconds",
         "glm_dsa_native_q_a_rms_scale_seconds",
         "glm_dsa_native_q4_qb_from_q_a_projection_seconds",
         "glm_dsa_kv_cache_update_seconds",
@@ -2242,6 +2434,15 @@ def configure_checkpoint_cache_dir(args):
     ):
         args.checkpoint_cache_dir = Path(
             tempfile.mkdtemp(prefix="glm52-prefill-sweep-checkpoints-")
+        )
+    if (
+        args.mode == "single"
+        and getattr(args, "q_projection_structure_sweep", None)
+        and not getattr(args, "no_prompt_checkpoint", False)
+        and args.checkpoint_cache_dir is None
+    ):
+        args.checkpoint_cache_dir = Path(
+            tempfile.mkdtemp(prefix="glm52-qproj-sweep-checkpoints-")
         )
 
     old_cache_dir = os.environ.get(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV)
@@ -2667,6 +2868,172 @@ def run_with_from_q_a_kernel_sweep(
             )
 
 
+def _set_binary_q_projection_arg(args, arg_name, env_name, value):
+    setattr(args, arg_name, value)
+    if value == "enabled":
+        os.environ[env_name] = "1"
+    elif value == "disabled":
+        os.environ[env_name] = "0"
+
+
+def _set_q_projection_candidate(args, candidate):
+    settings = Q_PROJECTION_STRUCTURE_SWEEP_CANDIDATES[candidate]
+    args.q_projection_preset = candidate
+    os.environ[glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV] = candidate
+    _set_binary_q_projection_arg(
+        args,
+        "q_a_dense_cache",
+        glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+        settings["q_a_dense_cache"],
+    )
+    _set_binary_q_projection_arg(
+        args,
+        "native_q_a_rms_norm",
+        glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV,
+        settings["native_q_a_rms_norm"],
+    )
+    _set_binary_q_projection_arg(
+        args,
+        "native_q4_qa",
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+        settings["native_q4_qa"],
+    )
+    _set_binary_q_projection_arg(
+        args,
+        "native_q4_qb",
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
+        settings["native_q4_qb"],
+    )
+    _set_binary_q_projection_arg(
+        args,
+        "native_q4_qb_head_layout",
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV,
+        settings["native_q4_qb_head_layout"],
+    )
+    _set_binary_q_projection_arg(
+        args,
+        "native_q4_qb_split",
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV,
+        settings["native_q4_qb_split"],
+    )
+    _set_binary_q_projection_arg(
+        args,
+        "native_q4_qb_from_q_a",
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV,
+        settings["native_q4_qb_from_q_a"],
+    )
+
+    kernel = settings["native_q4_qb_from_q_a_kernel"]
+    args.native_q4_qb_from_q_a_kernel = kernel
+    if kernel == "default":
+        os.environ.pop(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV, None)
+    else:
+        os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV] = kernel
+
+    q_b_split_strategy = settings["q_b_split_strategy"]
+    args.q_b_split_strategy = q_b_split_strategy
+    if q_b_split_strategy == "default":
+        os.environ.pop(glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV, None)
+    else:
+        os.environ[glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV] = q_b_split_strategy
+
+
+def run_with_q_projection_structure_sweep(
+    runner,
+    model,
+    tokenizer,
+    text,
+    args,
+    case_name,
+):
+    candidates = getattr(args, "q_projection_structure_sweep", None)
+    if not candidates:
+        return run_with_from_q_a_kernel_sweep(
+            runner,
+            model,
+            tokenizer,
+            text,
+            args,
+            case_name,
+        )
+
+    q_projection_arg_names = (
+        "q_projection_preset",
+        "q_a_dense_cache",
+        "native_q_a_rms_norm",
+        "native_q4_qa",
+        "native_q4_qb",
+        "native_q4_qb_head_layout",
+        "native_q4_qb_split",
+        "native_q4_qb_from_q_a",
+        "native_q4_qb_from_q_a_kernel",
+        "q_b_split_strategy",
+    )
+    q_projection_env_names = (
+        glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV,
+        glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+        glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV,
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV,
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV,
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV,
+        glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
+        glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV,
+    )
+    old_args = {name: getattr(args, name, "default") for name in q_projection_arg_names}
+    old_env = {name: os.environ.get(name) for name in q_projection_env_names}
+    old_cache_dir = os.environ.get(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV)
+    old_resolved_cache_dir = getattr(args, "resolved_checkpoint_cache_dir", None)
+    base_cache_dir = (
+        Path(old_resolved_cache_dir) if old_resolved_cache_dir else None
+    )
+    rows = []
+    try:
+        for candidate_index, candidate in enumerate(candidates):
+            _set_q_projection_candidate(args, candidate)
+            if base_cache_dir is not None and not args.no_prompt_checkpoint:
+                candidate_dir = (
+                    base_cache_dir
+                    / f"{candidate_index:02d}-{safe_case_name(candidate)}"
+                )
+                candidate_dir.mkdir(parents=True, exist_ok=True)
+                os.environ[prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV] = str(
+                    candidate_dir
+                )
+                args.resolved_checkpoint_cache_dir = str(candidate_dir)
+            row = runner(
+                model,
+                tokenizer,
+                text,
+                args,
+                f"{case_name}-qproj-{candidate}",
+            )
+            row.update(
+                {
+                    "q_projection_structure_sweep_name": candidate,
+                    "q_projection_structure_sweep_candidate_index": (
+                        candidate_index
+                    ),
+                }
+            )
+            rows.append(row)
+        return rows
+    finally:
+        for name, value in old_args.items():
+            setattr(args, name, value)
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        args.resolved_checkpoint_cache_dir = old_resolved_cache_dir
+        if old_cache_dir is None:
+            os.environ.pop(prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV, None)
+        else:
+            os.environ[prompt_cache.PROMPT_CHECKPOINT_CACHE_DIR_ENV] = old_cache_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2991,6 +3358,29 @@ def main():
         ),
     )
     parser.add_argument(
+        "--q-projection-preset",
+        choices=("default", *glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESETS.keys()),
+        default="default",
+        help=(
+            "Apply a GLM DSA q_projection structure preset by setting "
+            "MLX_LM_GLM_DSA_Q_PROJECTION_PRESET. Individual q_projection "
+            "flags still override the preset. The default leaves the "
+            "environment unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--q-b-split-strategy",
+        choices=("default", "heads", "flat-before-transpose"),
+        default="default",
+        help=(
+            "Select where q_b output is split into q_nope/q_pe for GLM DSA "
+            "q_projection experiments. heads keeps the previous split-after-"
+            "transpose path; flat-before-transpose splits the flat q_b output "
+            "before the head-layout transpose. The default leaves "
+            "MLX_LM_GLM_DSA_Q_B_SPLIT_STRATEGY unchanged."
+        ),
+    )
+    parser.add_argument(
         "--native-q4-qb",
         choices=("default", "enabled", "disabled"),
         default="default",
@@ -3055,6 +3445,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--native-q4-qb-split",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control the opt-in native q4 q_b projection variant that returns "
+            "q_nope and q_pe as separate [B,H,L,192] and [B,H,L,64] outputs. "
+            "This requires native q4 q_b to be enabled. The default leaves "
+            "MLX_LM_GLM_DSA_NATIVE_Q4_QB_SPLIT unchanged; unset means disabled."
+        ),
+    )
+    parser.add_argument(
         "--native-q4-qb-from-q-a",
         choices=("default", "enabled", "disabled"),
         default="default",
@@ -3074,6 +3475,18 @@ def main():
             "Select the q_b-from-q_a projection kernel. The default leaves "
             "MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL unchanged; unset "
             "means scaled."
+        ),
+    )
+    parser.add_argument(
+        "--q-projection-structure-sweep",
+        type=parse_q_projection_structure_sweep,
+        help=(
+            "Comma-separated single-mode sweep over q_projection structure "
+            "candidates. Candidates are baseline, native-qa, "
+            "native-qa-qb-flat, native-qa-qb-flat-split, "
+            "native-qa-qb-heads, native-qa-rms-qb-heads, "
+            "native-qa-qb-native-split, fromqa-scaled, and fromqa-wscaled. "
+            "The sweep keeps the configured q_a/q_b tile environment."
         ),
     )
     parser.add_argument(
@@ -3241,6 +3654,16 @@ def main():
         parser.error("--prefill-stop-after-tokens must be positive when set.")
     if args.native_q4_qb_from_q_a_kernel_sweep and args.mode != "single":
         parser.error("--native-q4-qb-from-q-a-kernel-sweep requires --mode single")
+    if args.q_projection_structure_sweep and args.mode != "single":
+        parser.error("--q-projection-structure-sweep requires --mode single")
+    if (
+        args.q_projection_structure_sweep
+        and args.native_q4_qb_from_q_a_kernel_sweep
+    ):
+        parser.error(
+            "--q-projection-structure-sweep cannot be combined with "
+            "--native-q4-qb-from-q-a-kernel-sweep"
+        )
     if args.mode == "native-smoke":
         if args.native_smoke_q_len <= 1:
             parser.error("--native-smoke-q-len must be greater than 1.")
@@ -3302,7 +3725,7 @@ def main():
                 args.target_tokens = None
                 for run in range(args.repeat_runs):
                     rows.extend(
-                        run_with_from_q_a_kernel_sweep(
+                        run_with_q_projection_structure_sweep(
                             runner,
                             model,
                             tokenizer,
@@ -3322,7 +3745,7 @@ def main():
                     text = build_prompt_text(tokenizer, length)
                     for run in range(args.repeat_runs):
                         rows.extend(
-                            run_with_from_q_a_kernel_sweep(
+                            run_with_q_projection_structure_sweep(
                                 runner,
                                 model,
                                 tokenizer,
@@ -3349,7 +3772,7 @@ def main():
                             snippet_id = f"{snippet_id}-next"
                         for run in range(args.repeat_runs):
                             rows.extend(
-                                run_with_from_q_a_kernel_sweep(
+                                run_with_q_projection_structure_sweep(
                                     runner,
                                     model,
                                     tokenizer,

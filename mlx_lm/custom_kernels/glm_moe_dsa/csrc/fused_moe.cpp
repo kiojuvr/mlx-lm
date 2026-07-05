@@ -762,6 +762,116 @@ class GlmDsaQ4QbProjHeadsPrimitive : public Primitive {
   Q4QbTileConfig tile_;
 };
 
+class GlmDsaQ4QbProjSplitPrimitive : public Primitive {
+ public:
+  GlmDsaQ4QbProjSplitPrimitive(Stream stream, Q4QbTileConfig tile)
+      : Primitive(stream), tile_(tile) {}
+
+  static bool unsupported(
+      const array& x,
+      const array& weight,
+      const array& scales,
+      const array& biases,
+      Stream s) {
+    return GlmDsaQ4QbProjFlatPrimitive::unsupported(
+        x, weight, scales, biases, s);
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("GlmDsaQ4QbProjSplitPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& q_nope = outputs[0];
+    auto& q_pe = outputs[1];
+
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scales = inputs[2];
+    const auto& biases = inputs[3];
+
+    q_nope.set_data(allocator::malloc(q_nope.nbytes()));
+    q_pe.set_data(allocator::malloc(q_pe.nbytes()));
+
+    constexpr int group_size = 64;
+    constexpr int bits = 4;
+    constexpr int H = 64;
+    constexpr int N = 256;
+    const auto& tile = tile_;
+
+    const int B = x.shape(0);
+    const int M = x.shape(1);
+    const int K = x.shape(2);
+    (void)B;
+
+    std::string kname;
+    concatenate(
+        kname,
+        "affine_qmm_t_head_broadcast_split_",
+        glm_type_name(x.dtype()),
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        "_alN_true");
+    if (!(tile.bm == 32 && tile.bk == 32 && tile.bn == 32)) {
+      concatenate(
+          kname,
+          "_bm_",
+          tile.bm,
+          "_bk_",
+          tile.bk,
+          "_bn_",
+          tile.bn);
+    }
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(kname, lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(weight, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_input_array(biases, 2);
+    compute_encoder.set_input_array(x, 3);
+    compute_encoder.set_output_array(q_nope, 4);
+    compute_encoder.set_output_array(q_pe, 5);
+    compute_encoder.set_bytes(K, 6);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(M, 8);
+    compute_encoder.set_bytes(H, 9);
+
+    MTL::Size grid_dims(
+        (N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm, B * H);
+    MTL::Size group_dims(32, 2, 2);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(GlmDsaQ4QbProjSplitPrimitive)
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {
+        Shape{inputs[0].shape(0), 64, inputs[0].shape(1), 192},
+        Shape{inputs[0].shape(0), 64, inputs[0].shape(1), 64},
+    };
+  }
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const GlmDsaQ4QbProjSplitPrimitive&>(other);
+    return tile_.bm == rhs.tile_.bm && tile_.bk == rhs.tile_.bk &&
+        tile_.bn == rhs.tile_.bn;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, tile_.bm, tile_.bk, tile_.bn);
+  }
+
+ private:
+  Q4QbTileConfig tile_;
+};
+
 class GlmDsaQ4QbProjScaledHeadsPrimitive : public Primitive {
  public:
   GlmDsaQ4QbProjScaledHeadsPrimitive(Stream stream, Q4QbTileConfig tile)
@@ -1599,6 +1709,77 @@ array glm_dsa_q4_qb_proj_heads(
       std::make_shared<GlmDsaQ4QbProjHeadsPrimitive>(
           stream, q4_qb_tile_config()),
       std::move(inputs));
+}
+
+std::vector<array> glm_dsa_q4_qb_proj_split(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s /* = {} */) {
+  if (x.ndim() != 3 || weight.ndim() != 2 || scales.ndim() != 2 ||
+      biases.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_split] expected x rank 3 and "
+        << "quantized weights rank 2, got " << x.shape() << ", "
+        << weight.shape() << ", " << scales.shape() << ", " << biases.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  const int B = x.shape(0);
+  const int L = x.shape(1);
+  constexpr int H = 64;
+  constexpr int N = 256;
+  constexpr int nope_N = 192;
+  constexpr int pe_N = 64;
+  constexpr int bits = 4;
+  constexpr int group_size = 64;
+  constexpr int pack_factor = 32 / bits;
+  const int K = weight.shape(1) * pack_factor;
+  if (weight.shape(0) != H * N || x.shape(2) != K ||
+      scales.shape(0) != H * N || biases.shape(0) != H * N ||
+      scales.shape(1) != K / group_size ||
+      biases.shape(1) != K / group_size) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_split] incompatible shapes: "
+        << x.shape() << ", " << weight.shape() << ", " << scales.shape()
+        << ", " << biases.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.dtype() != float16 && x.dtype() != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_split] expected float16 or "
+        << "bfloat16 input, got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (weight.dtype() != uint32 || scales.dtype() != x.dtype() ||
+      biases.dtype() != x.dtype()) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.glm_dsa_q4_qb_proj_split] expected uint32 "
+        << "weight and scale/bias dtype " << x.dtype() << ", got "
+        << weight.dtype() << ", " << scales.dtype() << ", " << biases.dtype()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {x, weight, scales, biases};
+  if (GlmDsaQ4QbProjSplitPrimitive::unsupported(
+          x, weight, scales, biases, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.glm_dsa_q4_qb_proj_split] unsupported M3 GLM shape.");
+  }
+
+  auto primitive = std::make_shared<GlmDsaQ4QbProjSplitPrimitive>(
+      stream, q4_qb_tile_config());
+  Shape q_nope_shape{B, H, L, nope_N};
+  Shape q_pe_shape{B, H, L, pe_N};
+  array q_nope(q_nope_shape, x.dtype(), primitive, inputs);
+  array q_pe(q_pe_shape, x.dtype(), primitive, std::move(inputs));
+  q_nope.set_siblings({q_pe}, 0);
+  q_pe.set_siblings({q_nope}, 1);
+  return {q_nope, q_pe};
 }
 
 array glm_dsa_q4_qb_proj_scaled_heads(

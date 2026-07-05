@@ -904,13 +904,14 @@ def generate_step(
                         f"load_seconds={load_seconds:.6f}"
                     )
                     try:
-                        manifest_report = cache.update_prompt_checkpoint_manifest(
-                            candidate_path,
-                            prefix_length=candidate_length,
-                            kind=prompt_checkpoint_hit_kind,
-                            metadata=checkpoint_metadata,
-                            hit=True,
-                        )
+                        with cache.prompt_checkpoint_io_lock():
+                            manifest_report = cache.update_prompt_checkpoint_manifest(
+                                candidate_path,
+                                prefix_length=candidate_length,
+                                kind=prompt_checkpoint_hit_kind,
+                                metadata=checkpoint_metadata,
+                                hit=True,
+                            )
                         _prompt_checkpoint_debug(
                             "manifest hit update "
                             f"file={candidate_basename} "
@@ -1079,13 +1080,14 @@ def generate_step(
     ):
         basename = os.path.basename(checkpoint_path)
         try:
-            manifest_report = cache.update_prompt_checkpoint_manifest(
-                checkpoint_path,
-                prefix_length=prefix_length,
-                kind=label,
-                metadata=checkpoint_metadata,
-                hit=hit,
-            )
+            with cache.prompt_checkpoint_io_lock():
+                manifest_report = cache.update_prompt_checkpoint_manifest(
+                    checkpoint_path,
+                    prefix_length=prefix_length,
+                    kind=label,
+                    metadata=checkpoint_metadata,
+                    hit=hit,
+                )
             _prompt_checkpoint_debug(
                 "manifest update "
                 f"file={basename} "
@@ -1108,9 +1110,10 @@ def generate_step(
             [basename] if label in ("frontier", "prefix", "continued") else []
         )
         try:
-            prune_report = cache.prune_prompt_checkpoints(
-                protected_files=protected_files
-            )
+            with cache.prompt_checkpoint_io_lock():
+                prune_report = cache.prune_prompt_checkpoints(
+                    protected_files=protected_files
+                )
             removed = prune_report["removed"]
             _prompt_checkpoint_debug(
                 "manifest prune "
@@ -1235,18 +1238,26 @@ def generate_step(
             return True
         save_t0 = time.perf_counter()
         try:
-            cache.ensure_glm52_local_cache_dirs()
-            checkpoint_metadata = cache.save_prompt_checkpoint(
-                checkpoint_path,
-                prompt_cache,
-                prefix_tokens=prefix_tokens,
-                checkpoint_namespace=cache.DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
-                model=model,
-                kv_bits=kv_bits,
-                kv_group_size=kv_group_size,
-                quantized_kv_start=quantized_kv_start,
-                metadata=_checkpoint_save_metadata(prefix_tokens, label),
-            )
+            with cache.prompt_checkpoint_io_lock():
+                cache.ensure_glm52_local_cache_dirs()
+                checkpoint_metadata = cache.save_prompt_checkpoint(
+                    checkpoint_path,
+                    prompt_cache,
+                    prefix_tokens=prefix_tokens,
+                    checkpoint_namespace=cache.DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                    model=model,
+                    kv_bits=kv_bits,
+                    kv_group_size=kv_group_size,
+                    quantized_kv_start=quantized_kv_start,
+                    metadata=_checkpoint_save_metadata(prefix_tokens, label),
+                )
+                _update_manifest_for_checkpoint(
+                    checkpoint_path,
+                    len(prefix_tokens),
+                    label,
+                    checkpoint_metadata,
+                )
+                _prune_prompt_checkpoints(checkpoint_path, label)
             save_seconds = time.perf_counter() - save_t0
             _prompt_checkpoint_debug(
                 f"save {label} success "
@@ -1254,13 +1265,6 @@ def generate_step(
                 f"prefix_length={len(prefix_tokens)} "
                 f"save_seconds={save_seconds:.6f}"
             )
-            _update_manifest_for_checkpoint(
-                checkpoint_path,
-                len(prefix_tokens),
-                label,
-                checkpoint_metadata,
-            )
-            _prune_prompt_checkpoints(checkpoint_path, label)
             return True
         except Exception as exc:
             save_seconds = time.perf_counter() - save_t0

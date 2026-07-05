@@ -343,6 +343,126 @@ about equal to the flat kernel at 2048 and 8192 synthetic lengths, so this knob
 should be evaluated as a graph-layout PoC rather than a raw q_b arithmetic
 speedup.
 
+For a model-free whole-q_projection structure sweep, use:
+
+```sh
+python benchmarks/glm52_q_projection_microbench.py \
+  --q-len 8192 \
+  --runs 3 \
+  --warmup-runs 1 \
+  --json-output /path/to/glm52-qproj-microbench-8192.json
+```
+
+The benchmark composes q_a projection, q_a RMSNorm, q_b projection, q_b layout
+conversion, and q_nope/q_pe split using fixed GLM-5.2 M3 synthetic q4 affine
+weights. On the first local 8K run, `native_qa_native_qb_flat` measured about
+0.03064s mean versus about 0.03173s for the MLX baseline, and
+`native_qa_native_rms_native_qb_heads` measured about 0.03070s. The
+q_b-from-q_a variants were slower in this synthetic setup, so keep using the
+full-model prefill profile for final decisions; this microbench is mainly a
+cheap filter before loading the model.
+
+To confirm candidates in one full-model load, use the single-mode structure
+sweep:
+
+```sh
+python benchmarks/glm52_prefill_benchmark.py \
+  --model /path/to/GLM-5.2-Alis-MLX-Dynamic-3.5bpw \
+  --lengths 8192 \
+  --max-tokens 1 \
+  --prefill-step-size 8192 \
+  --prefill-max-qk-tokens 67108864 \
+  --glm-dsa-adaptive-prefill-step-size 0 \
+  --native-sparse-quantized-kv enabled \
+  --native-sparse-quantized-kv-max-context 262144 \
+  --prefill-profile \
+  --prefill-profile-isolate enabled \
+  --no-prompt-checkpoint \
+  --repeat-prefix-tokens 0 \
+  --q-projection-structure-sweep baseline,native-qa-qb-flat,native-qa-qb-flat-split,native-qa-qb-native-split,native-qa-rms-qb-heads,fromqa-wscaled \
+  --json-output /path/to/glm52-qproj-structure-sweep-8192.json
+```
+
+The sweep candidates are `baseline`, `native-qa`, `native-qa-qb-flat`,
+`native-qa-qb-flat-split`, `native-qa-qb-native-split`,
+`native-qa-qb-heads`, `native-qa-rms-qb-heads`, `fromqa-scaled`, and
+`fromqa-wscaled`.
+The candidate rows are labeled with
+`q_projection_structure_sweep_name` and reuse the configured q_a/q_b tile
+environment. When prompt checkpointing is enabled, the sweep creates or uses a
+base checkpoint directory and then assigns each q_projection candidate its own
+subdirectory. This preserves frontier checkpoint save behavior inside each
+candidate while preventing earlier candidates from warming later candidates
+through disk checkpoint reuse.
+
+After a candidate is selected, use `MLX_LM_GLM_DSA_Q_PROJECTION_PRESET` to apply
+the same structure outside the sweep. For the current preferred candidate:
+
+```sh
+MLX_LM_GLM_DSA_Q_PROJECTION_PRESET=native-qa-qb-flat \
+python -m mlx_lm server ...
+```
+
+The benchmark also accepts `--q-projection-preset native-qa-qb-flat`, and the
+server accepts `--glm-dsa-q-projection-preset native-qa-qb-flat`. The preset
+only supplies defaults; explicit q_projection environment flags such as
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB=0` still override it. Benchmark rows include
+`glm_dsa_q_projection_preset`, `glm_dsa_q_projection_preset_env`, and
+`glm_dsa_q_projection_preset_effective` to make this visible in JSON/CSV output.
+`native-qa-qb-flat-split` keeps the flat q_b kernel and splits q_nope/q_pe before
+the head-layout transpose. The split point can be forced with
+`MLX_LM_GLM_DSA_Q_B_SPLIT_STRATEGY=flat-before-transpose`,
+`--q-b-split-strategy flat-before-transpose`, or
+`--glm-dsa-q-b-split-strategy flat-before-transpose`; rows report
+`glm_dsa_q_b_split_strategy`, `glm_dsa_q_b_split_strategy_env`, and
+`glm_dsa_q_b_split_seconds`.
+`native-qa-qb-native-split` is a deeper split-elimination probe: the q_b native
+kernel returns q_nope and q_pe as separate `[B,H,L,192]` and `[B,H,L,64]`
+outputs so the Python split/transpose sequence can be bypassed. It is
+controlled by
+`MLX_LM_GLM_DSA_NATIVE_Q4_QB_SPLIT=1` or `--native-q4-qb-split enabled` and
+should stay in measurement sweeps until full-model profiles show a clear win.
+After correcting the split shape to GLM-5.2's 192/64 q_nope/q_pe layout, the
+8K full-model check confirmed 234 native split hits, but measured
+q_projection at about 2.90s versus about 2.84s for `native-qa-qb-flat-split`.
+The result keeps direct split useful as a kernel-structure probe, not a current
+serving preset.
+
+On a local 8K full-model forward/reverse sweep with int8 KV and native sparse
+MLA enabled, q_projection averaged about 2.909s for `baseline`, 2.840s for
+`native-qa-qb-flat`, 2.848s for `native-qa-rms-qb-heads`, and 2.922s for
+`fromqa-wscaled`. Total prefill was order-sensitive because the first candidate
+in each process paid more warm-state cost, so use the isolated q_projection
+stage for this comparison. The current read is that native q_a + native q_b
+flat is the cleanest small improvement, native RMS/head-layout is roughly
+equivalent, and q_b-from-q_a still does not justify promotion.
+
+A follow-up 32K forward/reverse sweep narrowed the comparison to `baseline` and
+`native-qa-qb-flat`. Isolated q_projection averaged about 11.951s for
+`baseline` and 11.608s for `native-qa-qb-flat`; q_b projection improved from
+about 8.042s to 7.695s while q_a projection stayed essentially flat. Native
+sparse attention and indexer timings were unchanged within noise. This keeps
+`native-qa-qb-flat` as the preferred q_projection structure candidate, but the
+end-to-end gain remains small relative to sparse MLA attention and indexer cost.
+
+The same narrowed 64K forward/reverse sweep showed the same q_projection
+direction with larger absolute totals: q_projection averaged about 25.515s for
+`baseline` and 24.979s for `native-qa-qb-flat`, mostly from q_b projection
+moving from about 16.584s to 16.005s. q_a projection remained flat. TTFT,
+checkpoint prefill total, and full prefill total were dominated by process-order
+and warm-state effects at this length, and native sparse attention moved within
+about 0.36s of noise. Treat the 64K result as confirmation of the q_projection
+stage improvement, not as evidence of a reliable end-to-end 64K win yet.
+
+After candidate-local checkpoint cache directories were added to the
+q_projection sweep, a 32K cold check with frontier checkpoint saving compared
+`native-qa-qb-flat` and `native-qa-qb-flat-split` without cross-candidate
+checkpoint reuse. Both rows were checkpoint misses with 32767 fresh prefill
+tokens. `native-qa-qb-flat` measured about 216.93s TTFT, 212.47s summed prefill
+chunks, and 11.72s q_projection. `native-qa-qb-flat-split` measured about
+217.16s TTFT, 212.69s summed prefill chunks, and 11.73s q_projection. This does
+not justify promoting flat-split over `native-qa-qb-flat`.
+
 `MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A=1` or
 `--native-q4-qb-from-q-a enabled` is a shared-layer q_projection structure PoC.
 Shared-indexer layers do not need to return `qr` to the DSA indexer, so this
@@ -421,6 +541,11 @@ Benchmark rows report:
 - `glm_dsa_native_q4_qb_head_layout_available`
 - `glm_dsa_native_q4_qb_head_layout_source`
 - `glm_dsa_native_q4_qb_head_layout_import_error`
+- `glm_dsa_native_q4_qb_split`
+- `glm_dsa_native_q4_qb_split_env`
+- `glm_dsa_native_q4_qb_split_available`
+- `glm_dsa_native_q4_qb_split_source`
+- `glm_dsa_native_q4_qb_split_import_error`
 - `glm_dsa_native_q4_qb_from_q_a`
 - `glm_dsa_native_q4_qb_from_q_a_env`
 - `glm_dsa_native_q4_qb_from_q_a_kernel`
@@ -433,6 +558,8 @@ Benchmark rows report:
 - `glm_dsa_native_q4_qb_from_q_a_import_error`
 - `glm_dsa_native_q4_qb_hits`
 - `glm_dsa_native_q4_qb_fallback_reasons`
+- `glm_dsa_native_q4_qb_split_hits`
+- `glm_dsa_native_q4_qb_split_fallback_reasons`
 - `glm_dsa_native_q4_qb_from_q_a_hits`
 - `glm_dsa_native_q4_qb_from_q_a_fallback_reasons`
 - `from_q_a_kernel_sweep_name`
@@ -557,6 +684,11 @@ Benchmark rows report:
 - `glm_dsa_expert_hotlist_top16`
 - `glm_dsa_expert_hotlist_output`
 - `glm_dsa_expert_profile_summary`
+- `glm_dsa_q_projection_preset`
+- `glm_dsa_q_projection_preset_env`
+- `glm_dsa_q_projection_preset_effective`
+- `glm_dsa_q_b_split_strategy`
+- `glm_dsa_q_b_split_strategy_env`
 - `glm_dsa_q_projection_seconds`
 - `glm_dsa_q_a_projection_seconds`
 - `glm_dsa_q_a_dense_cache_dequantization_seconds`
@@ -565,8 +697,10 @@ Benchmark rows report:
 - `glm_dsa_q_a_layernorm_seconds`
 - `glm_dsa_native_q_a_rms_norm_seconds`
 - `glm_dsa_q_b_projection_seconds`
+- `glm_dsa_q_b_split_seconds`
 - `glm_dsa_native_q4_qb_projection_seconds`
 - `glm_dsa_native_q4_qb_head_layout_projection_seconds`
+- `glm_dsa_native_q4_qb_split_projection_seconds`
 - `glm_dsa_native_q_a_rms_scale_seconds`
 - `glm_dsa_native_q4_qb_from_q_a_projection_seconds`
 - `glm_dsa_kv_cache_update_seconds`
@@ -938,7 +1072,17 @@ boundaries rather than unstable tails, round continued checkpoints to a roughly
 10K-token interval, and skip shutdown-time RAM checkpoint flushes by default. For
 long-running coding-agent sessions, `--checkpoint-save-exact disabled` avoids
 writing large exact full-prompt checkpoints that are often immediately superseded
-by RAM/server cache or pruned by the byte budget. The progress intervals keep
+by RAM/server cache or pruned by the byte budget. For interactive server runs
+with `--disable-batching`, keep delta checkpointing enabled but use
+`--checkpoint-post-response-save-mode async` so post-response continued and
+suffix checkpoints are serialized by the background checkpoint worker instead of
+blocking the single generation worker before the next request can enter prefill.
+Keep `--checkpoint-async-save-shutdown-timeout 0` when Ctrl+C should not wait on
+an in-flight checkpoint write, and keep `--generation-shutdown-timeout 0` when
+Ctrl+C should not wait on startup model loading or an active generation thread.
+If needed, cap large deltas with `--checkpoint-delta-max-tokens`; async writes
+log `async checkpoint save queued`, `save delta start`, and
+`async checkpoint save complete` so this work is visible. The progress intervals keep
 long prefill/decode phases visible without requiring checkpoint debug logging. Set
 `--checkpoint-max-age-seconds` only after measuring real cache hit windows; the
 default keeps age eviction off and lets file/byte budgets control pruning.

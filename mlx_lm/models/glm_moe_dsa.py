@@ -51,6 +51,7 @@ GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
 GLM_DSA_NATIVE_Q4_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_VUP"
 GLM_DSA_Q_A_DENSE_CACHE_ENV = "MLX_LM_GLM_DSA_Q_A_DENSE_CACHE"
+GLM_DSA_Q_PROJECTION_PRESET_ENV = "MLX_LM_GLM_DSA_Q_PROJECTION_PRESET"
 GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV = "MLX_LM_GLM_DSA_NATIVE_Q_A_RMS_NORM"
 GLM_DSA_NATIVE_Q4_QA_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA"
 GLM_DSA_NATIVE_Q4_QA_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QA_TILE"
@@ -62,10 +63,12 @@ GLM_DSA_NATIVE_Q4_QB_SCALED_TILE_ENV = (
 GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV = (
     "MLX_LM_GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT"
 )
+GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_SPLIT"
 GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A"
 GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV = (
     "MLX_LM_GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL"
 )
+GLM_DSA_Q_B_SPLIT_STRATEGY_ENV = "MLX_LM_GLM_DSA_Q_B_SPLIT_STRATEGY"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
 GLM_DSA_EXPERT_PROFILE_ENV = "MLX_LM_GLM_DSA_EXPERT_PROFILE"
@@ -79,8 +82,10 @@ _PROFILE_STAGES = (
     "q_a_layernorm",
     "native_q_a_rms_norm",
     "q_b_projection",
+    "q_b_split",
     "native_q4_qb_projection",
     "native_q4_qb_head_layout_projection",
+    "native_q4_qb_split_projection",
     "native_q_a_rms_scale",
     "native_q4_qb_from_q_a_projection",
     "kv_cache_update",
@@ -135,6 +140,10 @@ _NATIVE_Q4_QB_HEADS_LOOKUP_DONE = False
 _NATIVE_Q4_QB_HEADS_KERNEL = None
 _NATIVE_Q4_QB_HEADS_SOURCE = None
 _NATIVE_Q4_QB_HEADS_IMPORT_ERROR = None
+_NATIVE_Q4_QB_SPLIT_LOOKUP_DONE = False
+_NATIVE_Q4_QB_SPLIT_KERNEL = None
+_NATIVE_Q4_QB_SPLIT_SOURCE = None
+_NATIVE_Q4_QB_SPLIT_IMPORT_ERROR = None
 _NATIVE_Q_A_RMS_SCALE_LOOKUP_DONE = False
 _NATIVE_Q_A_RMS_SCALE_KERNEL = None
 _NATIVE_Q_A_RMS_SCALE_SOURCE = None
@@ -148,12 +157,135 @@ _NATIVE_Q4_QB_WSCALED_HEADS_KERNEL = None
 _NATIVE_Q4_QB_WSCALED_HEADS_SOURCE = None
 _NATIVE_Q4_QB_WSCALED_HEADS_IMPORT_ERROR = None
 
+GLM_DSA_Q_PROJECTION_PRESETS = {
+    "baseline": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": False,
+        "native_q4_qb": False,
+        "native_q4_qb_head_layout": False,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": False,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": True,
+        "native_q4_qb": False,
+        "native_q4_qb_head_layout": False,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": False,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-qb-flat": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": True,
+        "native_q4_qb": True,
+        "native_q4_qb_head_layout": False,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": False,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-qb-flat-split": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": True,
+        "native_q4_qb": True,
+        "native_q4_qb_head_layout": False,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": False,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "flat-before-transpose",
+    },
+    "native-qa-qb-heads": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": True,
+        "native_q4_qb": True,
+        "native_q4_qb_head_layout": True,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": False,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-rms-qb-heads": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": True,
+        "native_q4_qa": True,
+        "native_q4_qb": True,
+        "native_q4_qb_head_layout": True,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": False,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "native-qa-qb-native-split": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": True,
+        "native_q4_qb": True,
+        "native_q4_qb_head_layout": False,
+        "native_q4_qb_split": True,
+        "native_q4_qb_from_q_a": False,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "fromqa-scaled": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": True,
+        "native_q4_qb": True,
+        "native_q4_qb_head_layout": False,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": True,
+        "native_q4_qb_from_q_a_kernel": "scaled",
+        "q_b_split_strategy": "heads",
+    },
+    "fromqa-wscaled": {
+        "q_a_dense_cache": False,
+        "native_q_a_rms_norm": False,
+        "native_q4_qa": True,
+        "native_q4_qb": True,
+        "native_q4_qb_head_layout": False,
+        "native_q4_qb_split": False,
+        "native_q4_qb_from_q_a": True,
+        "native_q4_qb_from_q_a_kernel": "wscaled",
+        "q_b_split_strategy": "heads",
+    },
+}
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _q_projection_preset_name() -> str:
+    value = os.environ.get(GLM_DSA_Q_PROJECTION_PRESET_ENV, "")
+    preset = value.strip().lower()
+    if preset in ("", "default", "none", "disabled", "off"):
+        return ""
+    if preset in GLM_DSA_Q_PROJECTION_PRESETS:
+        return preset
+    return ""
+
+
+def _q_projection_preset_default(name: str, default=False):
+    preset = _q_projection_preset_name()
+    if not preset:
+        return default
+    return GLM_DSA_Q_PROJECTION_PRESETS[preset].get(name, default)
+
+
+def get_glm_dsa_q_projection_preset() -> str:
+    return _q_projection_preset_name() or "default"
 
 
 def _fast_prefill_enabled() -> bool:
@@ -181,39 +313,86 @@ def _native_q4_vup_enabled() -> bool:
 
 
 def _q_a_dense_cache_enabled() -> bool:
-    return _env_flag(GLM_DSA_Q_A_DENSE_CACHE_ENV, False)
+    return _env_flag(
+        GLM_DSA_Q_A_DENSE_CACHE_ENV,
+        bool(_q_projection_preset_default("q_a_dense_cache", False)),
+    )
 
 
 def _native_q_a_rms_norm_enabled() -> bool:
-    return _env_flag(GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV, False)
+    return _env_flag(
+        GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV,
+        bool(_q_projection_preset_default("native_q_a_rms_norm", False)),
+    )
 
 
 def _native_q4_qa_enabled() -> bool:
-    return _env_flag(GLM_DSA_NATIVE_Q4_QA_ENV, False)
+    return _env_flag(
+        GLM_DSA_NATIVE_Q4_QA_ENV,
+        bool(_q_projection_preset_default("native_q4_qa", False)),
+    )
 
 
 def _native_q4_qb_enabled() -> bool:
-    return _env_flag(GLM_DSA_NATIVE_Q4_QB_ENV, False)
+    return _env_flag(
+        GLM_DSA_NATIVE_Q4_QB_ENV,
+        bool(_q_projection_preset_default("native_q4_qb", False)),
+    )
 
 
 def _native_q4_qb_head_layout_enabled() -> bool:
-    return _env_flag(GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV, False)
+    return _env_flag(
+        GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV,
+        bool(_q_projection_preset_default("native_q4_qb_head_layout", False)),
+    )
+
+
+def _native_q4_qb_split_enabled() -> bool:
+    return _env_flag(
+        GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV,
+        bool(_q_projection_preset_default("native_q4_qb_split", False)),
+    )
 
 
 def _native_q4_qb_from_q_a_enabled() -> bool:
-    return _env_flag(GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV, False)
+    return _env_flag(
+        GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV,
+        bool(_q_projection_preset_default("native_q4_qb_from_q_a", False)),
+    )
 
 
 def _native_q4_qb_from_q_a_kernel_preference() -> str:
     value = os.environ.get(
         GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
-        "scaled",
+        str(_q_projection_preset_default("native_q4_qb_from_q_a_kernel", "scaled")),
     ).strip().lower()
     if value in ("", "default"):
         return "scaled"
     if value in ("scaled", "wscaled", "auto"):
         return value
     return "scaled"
+
+
+def _q_b_split_strategy() -> str:
+    value = os.environ.get(
+        GLM_DSA_Q_B_SPLIT_STRATEGY_ENV,
+        str(_q_projection_preset_default("q_b_split_strategy", "heads")),
+    ).strip().lower()
+    if value in ("", "default", "none", "heads"):
+        return "heads"
+    if value in (
+        "flat",
+        "flat-before-transpose",
+        "flat_before_transpose",
+        "pretranspose",
+        "pre-transpose",
+    ):
+        return "flat-before-transpose"
+    return "heads"
+
+
+def get_glm_dsa_q_b_split_strategy() -> str:
+    return _q_b_split_strategy()
 
 
 def _prefill_profile_enabled() -> bool:
@@ -319,6 +498,8 @@ def _new_profile():
         "native_q4_qa_fallback_reasons": Counter(),
         "native_q4_qb_hits": 0,
         "native_q4_qb_fallback_reasons": Counter(),
+        "native_q4_qb_split_hits": 0,
+        "native_q4_qb_split_fallback_reasons": Counter(),
         "native_q4_qb_from_q_a_hits": 0,
         "native_q4_qb_from_q_a_fallback_reasons": Counter(),
     }
@@ -378,6 +559,12 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
         "native_q4_qb_hits": _GLM_DSA_PREFILL_PROFILE["native_q4_qb_hits"],
         "native_q4_qb_fallback_reasons": dict(
             _GLM_DSA_PREFILL_PROFILE["native_q4_qb_fallback_reasons"]
+        ),
+        "native_q4_qb_split_hits": _GLM_DSA_PREFILL_PROFILE[
+            "native_q4_qb_split_hits"
+        ],
+        "native_q4_qb_split_fallback_reasons": dict(
+            _GLM_DSA_PREFILL_PROFILE["native_q4_qb_split_fallback_reasons"]
         ),
         "native_q4_qb_from_q_a_hits": _GLM_DSA_PREFILL_PROFILE[
             "native_q4_qb_from_q_a_hits"
@@ -792,6 +979,23 @@ def _record_native_q4_qb_decision(used: bool, reason: str):
             _LOGGER.info("GLM DSA native q4 q_b fallback: %s", reason)
 
 
+def _record_native_q4_qb_split_decision(used: bool, reason: str):
+    if _GLM_DSA_PREFILL_PROFILE is None:
+        reset_glm_dsa_prefill_profile()
+    if used:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qb_split_hits"] += 1
+    else:
+        _GLM_DSA_PREFILL_PROFILE["native_q4_qb_split_fallback_reasons"][reason] += 1
+    if _fast_prefill_debug_enabled():
+        if used:
+            _LOGGER.info(
+                "GLM DSA native q4 q_b split projection enabled: source=%s",
+                _NATIVE_Q4_QB_SPLIT_SOURCE or "unknown",
+            )
+        else:
+            _LOGGER.info("GLM DSA native q4 q_b split fallback: %s", reason)
+
+
 def _record_native_q4_qb_from_q_a_decision(used: bool, reason: str):
     if _GLM_DSA_PREFILL_PROFILE is None:
         reset_glm_dsa_prefill_profile()
@@ -1123,6 +1327,49 @@ def _native_q4_qb_heads_kernel():
         _NATIVE_Q4_QB_HEADS_SOURCE = "mlx.core.fast"
 
     return _NATIVE_Q4_QB_HEADS_KERNEL
+
+
+def _native_q4_qb_split_kernel():
+    global _NATIVE_Q4_QB_SPLIT_LOOKUP_DONE
+    global _NATIVE_Q4_QB_SPLIT_KERNEL
+    global _NATIVE_Q4_QB_SPLIT_SOURCE
+    global _NATIVE_Q4_QB_SPLIT_IMPORT_ERROR
+    if _NATIVE_Q4_QB_SPLIT_LOOKUP_DONE:
+        return _NATIVE_Q4_QB_SPLIT_KERNEL
+
+    _NATIVE_Q4_QB_SPLIT_LOOKUP_DONE = True
+    _NATIVE_Q4_QB_SPLIT_KERNEL = None
+    _NATIVE_Q4_QB_SPLIT_SOURCE = None
+    _NATIVE_Q4_QB_SPLIT_IMPORT_ERROR = None
+
+    for module_name in (
+        "mlx_lm.custom_kernels.glm_moe_dsa",
+        "omlx.custom_kernels.glm_moe_dsa",
+    ):
+        try:
+            fast = __import__(module_name, fromlist=["fast"]).fast
+            has_symbol = getattr(fast, "has_symbol", None)
+            if (
+                has_symbol is not None
+                and has_symbol("glm_dsa_q4_qb_proj_split")
+                and hasattr(fast, "glm_dsa_q4_qb_proj_split")
+            ):
+                _NATIVE_Q4_QB_SPLIT_KERNEL = fast.glm_dsa_q4_qb_proj_split
+                _NATIVE_Q4_QB_SPLIT_SOURCE = module_name
+                return _NATIVE_Q4_QB_SPLIT_KERNEL
+            if _NATIVE_Q4_QB_SPLIT_IMPORT_ERROR is None and hasattr(
+                fast, "import_error"
+            ):
+                _NATIVE_Q4_QB_SPLIT_IMPORT_ERROR = fast.import_error()
+        except Exception as exc:
+            if _NATIVE_Q4_QB_SPLIT_IMPORT_ERROR is None:
+                _NATIVE_Q4_QB_SPLIT_IMPORT_ERROR = exc
+
+    if hasattr(mx.fast, "glm_dsa_q4_qb_proj_split"):
+        _NATIVE_Q4_QB_SPLIT_KERNEL = mx.fast.glm_dsa_q4_qb_proj_split
+        _NATIVE_Q4_QB_SPLIT_SOURCE = "mlx.core.fast"
+
+    return _NATIVE_Q4_QB_SPLIT_KERNEL
 
 
 def _native_q_a_rms_scale_kernel():
@@ -1492,6 +1739,7 @@ def get_glm_dsa_native_q4_vup_status():
 def get_glm_dsa_native_q4_qb_status():
     kernel = _native_q4_qb_kernel()
     heads_kernel = _native_q4_qb_heads_kernel()
+    split_kernel = _native_q4_qb_split_kernel()
     rms_scale_kernel = _native_q_a_rms_scale_kernel()
     wscaled_heads_kernel = _native_q4_qb_wscaled_heads_kernel()
     scaled_heads_kernel = _native_q4_qb_scaled_heads_kernel()
@@ -1525,6 +1773,14 @@ def get_glm_dsa_native_q4_qb_status():
             if _NATIVE_Q4_QB_HEADS_IMPORT_ERROR is not None
             else None
         ),
+        "split_enabled": _native_q4_qb_split_enabled(),
+        "split_available": split_kernel is not None,
+        "split_source": _NATIVE_Q4_QB_SPLIT_SOURCE,
+        "split_import_error": (
+            repr(_NATIVE_Q4_QB_SPLIT_IMPORT_ERROR)
+            if _NATIVE_Q4_QB_SPLIT_IMPORT_ERROR is not None
+            else None
+        ),
         "from_q_a_enabled": _native_q4_qb_from_q_a_enabled(),
         "from_q_a_kernel": from_q_a_kernel_preference,
         "from_q_a_available": (rms_scale_kernel is not None and from_q_a_kernel is not None),
@@ -1536,6 +1792,11 @@ def get_glm_dsa_native_q4_qb_status():
             repr(from_q_a_import_error)
             if from_q_a_import_error is not None
             else None
+        ),
+        "q_b_split_strategy": _q_b_split_strategy(),
+        "q_b_split_strategy_env": os.environ.get(
+            GLM_DSA_Q_B_SPLIT_STRATEGY_ENV,
+            "default",
         ),
     }
 
@@ -2525,6 +2786,44 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             _record_native_q4_qb_decision(False, reason)
         return None
 
+    def _native_q4_qb_split_decision(self, x: mx.array):
+        if not _native_q4_qb_split_enabled():
+            return False, "split_disabled"
+        use_native, reason = self._native_q4_qb_decision(x)
+        if not use_native:
+            return False, reason
+        if _native_q4_qb_split_kernel() is None:
+            return False, "missing_split_symbol"
+        if self.qk_nope_head_dim != 192:
+            return False, f"unsupported_qk_nope_head_dim:{self.qk_nope_head_dim}"
+        if self.q_head_dim - self.qk_nope_head_dim != 64:
+            return False, "unsupported_q_pe_head_dim"
+        return True, "native_q4_qb_split"
+
+    def _q_b_project_split(self, x: mx.array):
+        use_native, reason = self._native_q4_qb_split_decision(x)
+        if use_native:
+            try:
+                kernel = _native_q4_qb_split_kernel()
+                output = _profile_stage(
+                    "native_q4_qb_split_projection",
+                    lambda: kernel(
+                        x,
+                        self.q_b_proj["weight"],
+                        self.q_b_proj["scales"],
+                        self.q_b_proj["biases"],
+                    ),
+                    inputs=x,
+                )
+                _record_native_q4_qb_split_decision(True, reason)
+                return output
+            except Exception as exc:
+                reason = f"runtime_error:{type(exc).__name__}"
+
+        if _native_q4_qb_split_enabled() and hasattr(self.q_b_proj, "bits"):
+            _record_native_q4_qb_split_decision(False, reason)
+        return None
+
     def _native_q4_qb_from_q_a_decision(self, x: mx.array):
         if not _native_q4_qb_from_q_a_enabled():
             return False, "disabled"
@@ -2854,23 +3153,47 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     inputs=q_a,
                 )
 
+            def split_q_heads(q_heads):
+                return mx.split(q_heads, [self.qk_nope_head_dim], axis=-1)
+
+            def split_q_flat_before_transpose(q_flat):
+                q_view = q_flat.reshape(B, L, self.num_heads, self.q_head_dim)
+                q_nope = q_view[..., : self.qk_nope_head_dim].transpose(
+                    0, 2, 1, 3
+                )
+                q_pe = q_view[..., self.qk_nope_head_dim :].transpose(0, 2, 1, 3)
+                return q_nope, q_pe
+
             def project_q_b():
                 if q is not None:
-                    return q
-                q_heads = self._q_b_project_heads(qr)
-                if q_heads is not None:
-                    return q_heads
-                q_flat = self._q_b_project(qr)
-                return q_flat.reshape(
-                    B, L, self.num_heads, self.q_head_dim
-                ).transpose(0, 2, 1, 3)
+                    q_heads = q
+                elif (q_split := self._q_b_project_split(qr)) is not None:
+                    return q_split
+                elif _q_b_split_strategy() == "flat-before-transpose":
+                    q_flat = self._q_b_project(qr)
+                    return _profile_stage(
+                        "q_b_split",
+                        lambda: split_q_flat_before_transpose(q_flat),
+                        inputs=q_flat,
+                    )
+                else:
+                    q_heads = self._q_b_project_heads(qr)
+                    if q_heads is None:
+                        q_flat = self._q_b_project(qr)
+                        q_heads = q_flat.reshape(
+                            B, L, self.num_heads, self.q_head_dim
+                        ).transpose(0, 2, 1, 3)
+                return _profile_stage(
+                    "q_b_split",
+                    lambda: split_q_heads(q_heads),
+                    inputs=q_heads,
+                )
 
-            q = _profile_stage(
+            q_nope, q_pe = _profile_stage(
                 "q_b_projection",
                 project_q_b,
                 inputs=qr,
             )
-            q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
             return qr, q_nope, q_pe
 
         qr, q_nope, q_pe = _profile_stage("q_projection", project_q, inputs=x)

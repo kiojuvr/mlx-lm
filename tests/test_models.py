@@ -430,6 +430,91 @@ class TestModels(unittest.TestCase):
             else:
                 os.environ[key] = value
 
+    def test_glm_moe_dsa_q_projection_preset_defaults_and_overrides(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV,
+            glm_moe_dsa.GLM_DSA_Q_A_DENSE_CACHE_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q_A_RMS_NORM_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV,
+            glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            for key in env_keys:
+                os.environ.pop(key, None)
+
+            self.assertEqual(glm_moe_dsa.get_glm_dsa_q_projection_preset(), "default")
+            self.assertFalse(glm_moe_dsa._native_q4_qa_enabled())
+            self.assertFalse(glm_moe_dsa._native_q4_qb_enabled())
+            self.assertEqual(glm_moe_dsa._q_b_split_strategy(), "heads")
+
+            os.environ[
+                glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV
+            ] = "native-qa-qb-flat"
+            self.assertEqual(
+                glm_moe_dsa.get_glm_dsa_q_projection_preset(),
+                "native-qa-qb-flat",
+            )
+            self.assertFalse(glm_moe_dsa._q_a_dense_cache_enabled())
+            self.assertFalse(glm_moe_dsa._native_q_a_rms_norm_enabled())
+            self.assertTrue(glm_moe_dsa._native_q4_qa_enabled())
+            self.assertTrue(glm_moe_dsa._native_q4_qb_enabled())
+            self.assertFalse(glm_moe_dsa._native_q4_qb_head_layout_enabled())
+            self.assertFalse(glm_moe_dsa._native_q4_qb_split_enabled())
+            self.assertFalse(glm_moe_dsa._native_q4_qb_from_q_a_enabled())
+            self.assertEqual(glm_moe_dsa._q_b_split_strategy(), "heads")
+
+            os.environ[
+                glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV
+            ] = "native-qa-qb-native-split"
+            self.assertTrue(glm_moe_dsa._native_q4_qb_split_enabled())
+
+            os.environ[
+                glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV
+            ] = "native-qa-qb-flat-split"
+            self.assertEqual(
+                glm_moe_dsa._q_b_split_strategy(),
+                "flat-before-transpose",
+            )
+            os.environ[glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV] = "heads"
+            self.assertEqual(glm_moe_dsa._q_b_split_strategy(), "heads")
+            os.environ.pop(glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV, None)
+            os.environ[
+                glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV
+            ] = "native-qa-qb-flat"
+
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV] = "0"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV] = "1"
+            self.assertFalse(glm_moe_dsa._native_q4_qa_enabled())
+            self.assertTrue(glm_moe_dsa._native_q4_qb_head_layout_enabled())
+
+            os.environ.pop(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QA_ENV, None)
+            os.environ.pop(glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_HEAD_LAYOUT_ENV, None)
+            os.environ[
+                glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV
+            ] = "fromqa-wscaled"
+            self.assertTrue(glm_moe_dsa._native_q4_qb_from_q_a_enabled())
+            self.assertEqual(
+                glm_moe_dsa._native_q4_qb_from_q_a_kernel_preference(),
+                "wscaled",
+            )
+            os.environ[
+                glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_FROM_Q_A_KERNEL_ENV
+            ] = "scaled"
+            self.assertEqual(
+                glm_moe_dsa._native_q4_qb_from_q_a_kernel_preference(),
+                "scaled",
+            )
+        finally:
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_fast_prefill_matches_fallback(self):
         from mlx_lm.models import glm_moe_dsa
 
@@ -1229,6 +1314,121 @@ class TestModels(unittest.TestCase):
                 glm_moe_dsa._NATIVE_Q4_QB_HEADS_KERNEL,
                 glm_moe_dsa._NATIVE_Q4_QB_HEADS_SOURCE,
                 glm_moe_dsa._NATIVE_Q4_QB_HEADS_IMPORT_ERROR,
+            ) = native_state
+            self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_q4_qb_split_matches_fallback(self):
+        import mlx.nn as nn
+
+        from mlx_lm.models import glm_moe_dsa
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV,
+            glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        native_state = (
+            glm_moe_dsa._NATIVE_Q4_QB_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q4_QB_KERNEL,
+            glm_moe_dsa._NATIVE_Q4_QB_SOURCE,
+            glm_moe_dsa._NATIVE_Q4_QB_IMPORT_ERROR,
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_LOOKUP_DONE,
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_KERNEL,
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_SOURCE,
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_IMPORT_ERROR,
+        )
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_NATIVE_Q4_QB_SPLIT_ENV] = "1"
+            projection = nn.QuantizedLinear(
+                input_dims=2048,
+                output_dims=64 * 256,
+                bias=False,
+                group_size=64,
+                bits=4,
+                mode="affine",
+            )
+            projection.update(
+                {
+                    "scales": projection["scales"].astype(mx.float16),
+                    "biases": projection["biases"].astype(mx.float16),
+                }
+            )
+
+            def fake_q4_qb(x, weight, scales, biases):
+                return mx.quantized_matmul(
+                    x,
+                    weight,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=64,
+                    bits=4,
+                    mode="affine",
+                )
+
+            def fake_q4_qb_split(x, weight, scales, biases):
+                flat = fake_q4_qb(x, weight, scales, biases)
+                heads = flat.reshape(flat.shape[0], flat.shape[1], 64, 256).transpose(
+                    0, 2, 1, 3
+                )
+                return mx.split(heads, [192], axis=-1)
+
+            glm_moe_dsa._NATIVE_Q4_QB_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q4_QB_KERNEL = fake_q4_qb
+            glm_moe_dsa._NATIVE_Q4_QB_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q4_QB_IMPORT_ERROR = None
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_LOOKUP_DONE = True
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_KERNEL = fake_q4_qb_split
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_SOURCE = "test"
+            glm_moe_dsa._NATIVE_Q4_QB_SPLIT_IMPORT_ERROR = None
+
+            fake_attention = type("FakeAttention", (), {})()
+            fake_attention.q_b_proj = projection
+            fake_attention.num_heads = 64
+            fake_attention.q_head_dim = 256
+            fake_attention.qk_nope_head_dim = 192
+            fake_attention._native_q4_qb_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_qb_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            fake_attention._native_q4_qb_split_decision = (
+                lambda x: glm_moe_dsa.GlmMoeDsaAttention._native_q4_qb_split_decision(
+                    fake_attention,
+                    x,
+                )
+            )
+            x = mx.random.normal((1, 2, 2048), dtype=mx.float16) * 0.02
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+
+            q_nope, q_pe = glm_moe_dsa.GlmMoeDsaAttention._q_b_project_split(
+                fake_attention,
+                x,
+            )
+            expected_heads = projection(x).reshape(1, 2, 64, 256).transpose(
+                0, 2, 1, 3
+            )
+            expected_nope, expected_pe = mx.split(expected_heads, [192], axis=-1)
+            mx.eval(q_nope, q_pe, expected_nope, expected_pe)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertEqual(profile["native_q4_qb_split_hits"], 1)
+            self.assertTrue(
+                mx.allclose(q_nope, expected_nope, rtol=1e-4, atol=1e-4)
+            )
+            self.assertTrue(mx.allclose(q_pe, expected_pe, rtol=1e-4, atol=1e-4))
+        finally:
+            (
+                glm_moe_dsa._NATIVE_Q4_QB_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q4_QB_KERNEL,
+                glm_moe_dsa._NATIVE_Q4_QB_SOURCE,
+                glm_moe_dsa._NATIVE_Q4_QB_IMPORT_ERROR,
+                glm_moe_dsa._NATIVE_Q4_QB_SPLIT_LOOKUP_DONE,
+                glm_moe_dsa._NATIVE_Q4_QB_SPLIT_KERNEL,
+                glm_moe_dsa._NATIVE_Q4_QB_SPLIT_SOURCE,
+                glm_moe_dsa._NATIVE_Q4_QB_SPLIT_IMPORT_ERROR,
             ) = native_state
             self._restore_env(saved_env)
 

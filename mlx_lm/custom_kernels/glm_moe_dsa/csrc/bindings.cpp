@@ -2,6 +2,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
+#include <nanobind/stl/vector.h>
 
 #include "dsa_indexer.h"
 #include "exact_block_attention.h"
@@ -94,6 +95,14 @@ NB_MODULE(_ext, m) {
   m.def(
       "glm_dsa_q4_qb_proj_heads",
       &omlx::glm_kernels::glm_dsa_q4_qb_proj_heads,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "biases"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "glm_dsa_q4_qb_proj_split",
+      &omlx::glm_kernels::glm_dsa_q4_qb_proj_split,
       "x"_a,
       "weight"_a,
       "scales"_a,

@@ -66,6 +66,7 @@ from .models.cache import (
     prompt_prefix_hash,
     prompt_cache_token_length,
     prompt_checkpoint_rendered_prefix_metadata,
+    prompt_checkpoint_io_lock,
     prune_prompt_checkpoints,
     rendered_prompt_bytes,
     save_prompt_checkpoint,
@@ -73,6 +74,7 @@ from .models.cache import (
     trim_prompt_cache,
     update_prompt_checkpoint_manifest,
 )
+from .models import glm_moe_dsa
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -84,6 +86,9 @@ DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS = 2048
 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS = 10_000
 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT = 0
 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS = 65_536
+DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS = 0
+DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 0.0
+DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 
 
 def get_system_fingerprint():
@@ -265,6 +270,12 @@ class GenerationContext:
         self._should_stop = True
 
 
+@dataclass
+class _AsyncCheckpointSaveJob:
+    label: str
+    save: Callable[[], bool]
+
+
 def _resolve_request_max_tokens(body, cli_args):
     if body.get("max_completion_tokens", None) is not None:
         max_tokens = body["max_completion_tokens"]
@@ -327,6 +338,57 @@ def _prompt_checkpoint_save_exact_enabled(args):
     if isinstance(value, bool):
         return value
     return str(value).lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _prompt_checkpoint_save_delta_enabled(args):
+    value = getattr(args, "checkpoint_save_delta", "enabled")
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _prompt_checkpoint_save_delta_mode(args):
+    value = getattr(args, "checkpoint_save_delta_mode", "async")
+    value = str(value).strip().lower()
+    if value not in {"sync", "async"}:
+        return "async"
+    return value
+
+
+def _prompt_checkpoint_async_shutdown_timeout_seconds(args):
+    value = getattr(
+        args,
+        "checkpoint_async_save_shutdown_timeout",
+        DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    if value is None:
+        value = DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS
+
+
+def _generation_shutdown_timeout_seconds(args):
+    value = getattr(
+        args,
+        "generation_shutdown_timeout",
+        DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    if value is None:
+        value = DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS
+
+
+def _prompt_checkpoint_delta_max_tokens(args):
+    return _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_delta_max_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS,
+    )
 
 
 def _prompt_checkpoint_save_exact_for_prompt(args, token_count):
@@ -766,20 +828,95 @@ class ResponseGenerator:
         self._rank = mx.distributed.init().rank()
         self._stop = False
         self._shutdown_complete = False
-        self._generation_thread = Thread(target=self._generate)
+        self._checkpoint_save_queue = Queue()
+        self._checkpoint_save_stop = object()
+        self._checkpoint_save_thread = Thread(
+            target=self._checkpoint_save_worker,
+            daemon=True,
+        )
+        self._checkpoint_save_thread.start()
+        self._generation_thread = Thread(target=self._generate, daemon=True)
         self._generation_thread.start()
 
     def stop_and_join(self):
         logging.info(
             "Shutdown requested: asking generation worker to stop. "
-            "Waiting for active generation or prompt checkpoint saves to finish..."
+            "Waiting for active generation to finish..."
         )
         self._stop = True
-        self._generation_thread.join()
+        try:
+            self.requests.put(None)
+        except Exception:
+            pass
+        cli_args = getattr(getattr(self, "model_provider", None), "cli_args", None)
+        generation_timeout = _generation_shutdown_timeout_seconds(cli_args)
+        self._generation_thread.join(timeout=generation_timeout)
+        generation_is_alive = getattr(self._generation_thread, "is_alive", lambda: False)
+        if generation_is_alive():
+            logging.info(
+                "Generation worker still active; not blocking shutdown. "
+                "timeout=%.3fs",
+                generation_timeout,
+            )
+        else:
+            logging.info("Generation worker stopped.")
+        checkpoint_queue = getattr(self, "_checkpoint_save_queue", None)
+        checkpoint_thread = getattr(self, "_checkpoint_save_thread", None)
+        if checkpoint_queue is not None and checkpoint_thread is not None:
+            checkpoint_queue.put(self._checkpoint_save_stop)
+            shutdown_timeout = _prompt_checkpoint_async_shutdown_timeout_seconds(
+                cli_args
+            )
+            pending_saves = checkpoint_queue.qsize()
+            if shutdown_timeout > 0:
+                logging.info(
+                    "Waiting up to %.3fs for async prompt checkpoint saves; "
+                    "pending=%s",
+                    shutdown_timeout,
+                    pending_saves,
+                )
+                checkpoint_thread.join(timeout=shutdown_timeout)
+            if checkpoint_thread.is_alive():
+                logging.info(
+                    "Async prompt checkpoint save worker still active; "
+                    "not blocking shutdown. pending=%s",
+                    pending_saves,
+                )
+            else:
+                logging.info("Async prompt checkpoint save worker stopped.")
         self.shutdown()
 
     def join(self):
         self._generation_thread.join()
+
+    def _checkpoint_save_worker(self):
+        while True:
+            job = self._checkpoint_save_queue.get()
+            try:
+                if job is self._checkpoint_save_stop:
+                    return
+                _prompt_checkpoint_debug(
+                    f"async checkpoint save start label={job.label}"
+                )
+                saved = job.save()
+                _prompt_checkpoint_debug(
+                    f"async checkpoint save complete label={job.label} "
+                    f"saved={int(bool(saved))}"
+                )
+            except Exception as exc:
+                _prompt_checkpoint_debug(
+                    f"async checkpoint save failure label={getattr(job, 'label', 'unknown')} "
+                    f"error={type(exc).__name__}"
+                )
+            finally:
+                self._checkpoint_save_queue.task_done()
+
+    def _enqueue_checkpoint_save(self, label: str, save: Callable[[], bool]):
+        self._checkpoint_save_queue.put(_AsyncCheckpointSaveJob(label=label, save=save))
+        _prompt_checkpoint_debug(
+            f"async checkpoint save queued label={label} "
+            f"pending={self._checkpoint_save_queue.qsize()}"
+        )
 
     def flush_shutdown_prompt_checkpoints(self):
         limit = _prompt_checkpoint_policy_int(
@@ -881,9 +1018,10 @@ class ResponseGenerator:
 
     def prune_shutdown_prompt_checkpoints(self):
         try:
-            stats = prune_prompt_checkpoints(
-                max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
-            )
+            with prompt_checkpoint_io_lock():
+                stats = prune_prompt_checkpoints(
+                    max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
+                )
         except Exception as exc:
             _prompt_checkpoint_debug(
                 "shutdown prune failure swallowed "
@@ -1284,13 +1422,14 @@ class ResponseGenerator:
                 )
                 continue
             try:
-                update_prompt_checkpoint_manifest(
-                    checkpoint_path,
-                    prefix_length=len(stored_prefix_tokens),
-                    kind=checkpoint_label,
-                    metadata=metadata,
-                    hit=True,
-                )
+                with prompt_checkpoint_io_lock():
+                    update_prompt_checkpoint_manifest(
+                        checkpoint_path,
+                        prefix_length=len(stored_prefix_tokens),
+                        kind=checkpoint_label,
+                        metadata=metadata,
+                        hit=True,
+                    )
             except Exception:
                 pass
             _prompt_checkpoint_debug(
@@ -1379,27 +1518,28 @@ class ResponseGenerator:
 
         checkpoint_path = prompt_checkpoint_file(prefix_tokens)
         try:
-            checkpoint_metadata = save_prompt_checkpoint(
-                checkpoint_path,
-                checkpoint_cache,
-                prefix_tokens=prefix_tokens,
-                checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
-                model=self.model_provider.model,
-                kv_bits=self.cli_args.kv_bits,
-                kv_group_size=self.cli_args.kv_group_size,
-                quantized_kv_start=self.cli_args.quantized_kv_start,
-                metadata=metadata,
-            )
-            update_prompt_checkpoint_manifest(
-                checkpoint_path,
-                prefix_length=store_length,
-                kind="continued",
-                metadata=checkpoint_metadata,
-            )
-            prune_prompt_checkpoints(
-                protected_files=[os.path.basename(checkpoint_path)],
-                max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
-            )
+            with prompt_checkpoint_io_lock():
+                checkpoint_metadata = save_prompt_checkpoint(
+                    checkpoint_path,
+                    checkpoint_cache,
+                    prefix_tokens=prefix_tokens,
+                    checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                    model=self.model_provider.model,
+                    kv_bits=self.cli_args.kv_bits,
+                    kv_group_size=self.cli_args.kv_group_size,
+                    quantized_kv_start=self.cli_args.quantized_kv_start,
+                    metadata=metadata,
+                )
+                update_prompt_checkpoint_manifest(
+                    checkpoint_path,
+                    prefix_length=store_length,
+                    kind="continued",
+                    metadata=checkpoint_metadata,
+                )
+                prune_prompt_checkpoints(
+                    protected_files=[os.path.basename(checkpoint_path)],
+                    max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
+                )
             _prompt_checkpoint_debug(
                 "save continued success "
                 f"file={os.path.basename(checkpoint_path)} "
@@ -1426,6 +1566,9 @@ class ResponseGenerator:
         base_checkpoint,
         rendered_continuation=None,
     ):
+        if not _prompt_checkpoint_save_delta_enabled(self.cli_args):
+            _prompt_checkpoint_debug("save delta skipped disabled")
+            return False
         if self.model_provider.draft_model is not None:
             _prompt_checkpoint_debug("save delta skipped draft model active")
             return False
@@ -1454,6 +1597,17 @@ class ResponseGenerator:
                 f"base_length={base_length}"
             )
             return False
+        delta_tokens = target_length - base_length
+        max_delta_tokens = _prompt_checkpoint_delta_max_tokens(self.cli_args)
+        if max_delta_tokens > 0 and delta_tokens > max_delta_tokens:
+            _prompt_checkpoint_debug(
+                "save delta skipped too large "
+                f"target_length={target_length} "
+                f"base_length={base_length} "
+                f"delta_tokens={delta_tokens} "
+                f"max_delta_tokens={max_delta_tokens}"
+            )
+            return False
         cache_length = prompt_cache_token_length(prompt_cache)
         if cache_length < target_length:
             _prompt_checkpoint_debug(
@@ -1463,6 +1617,13 @@ class ResponseGenerator:
             )
             return False
 
+        _prompt_checkpoint_debug(
+            "save delta start "
+            f"target_length={target_length} "
+            f"base_length={base_length} "
+            f"delta_tokens={delta_tokens} "
+            f"max_delta_tokens={max_delta_tokens}"
+        )
         try:
             delta_cache = slice_prompt_cache(
                 prompt_cache,
@@ -1516,36 +1677,37 @@ class ResponseGenerator:
 
         checkpoint_path = prompt_checkpoint_file(prefix_tokens)
         try:
-            checkpoint_metadata = save_prompt_checkpoint(
-                checkpoint_path,
-                delta_cache,
-                prefix_tokens=prefix_tokens,
-                checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
-                model=self.model_provider.model,
-                kv_bits=self.cli_args.kv_bits,
-                kv_group_size=self.cli_args.kv_group_size,
-                quantized_kv_start=self.cli_args.quantized_kv_start,
-                metadata=metadata,
-            )
-            update_prompt_checkpoint_manifest(
-                checkpoint_path,
-                prefix_length=target_length,
-                kind="delta",
-                metadata=checkpoint_metadata,
-            )
-            prune_prompt_checkpoints(
-                protected_files=[
-                    os.path.basename(base_path),
-                    os.path.basename(checkpoint_path),
-                ],
-                max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
-            )
+            with prompt_checkpoint_io_lock():
+                checkpoint_metadata = save_prompt_checkpoint(
+                    checkpoint_path,
+                    delta_cache,
+                    prefix_tokens=prefix_tokens,
+                    checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                    model=self.model_provider.model,
+                    kv_bits=self.cli_args.kv_bits,
+                    kv_group_size=self.cli_args.kv_group_size,
+                    quantized_kv_start=self.cli_args.quantized_kv_start,
+                    metadata=metadata,
+                )
+                update_prompt_checkpoint_manifest(
+                    checkpoint_path,
+                    prefix_length=target_length,
+                    kind="delta",
+                    metadata=checkpoint_metadata,
+                )
+                prune_prompt_checkpoints(
+                    protected_files=[
+                        os.path.basename(base_path),
+                        os.path.basename(checkpoint_path),
+                    ],
+                    max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
+                )
             _prompt_checkpoint_debug(
                 "save delta success "
                 f"file={os.path.basename(checkpoint_path)} "
                 f"target_length={target_length} "
                 f"base_length={base_length} "
-                f"delta_tokens={target_length - base_length} "
+                f"delta_tokens={delta_tokens} "
                 f"rendered_metadata={int(rendered_prefix is not None)}"
             )
             return True
@@ -2207,20 +2369,57 @@ class ResponseGenerator:
             rendered_continuation = None
             if rendered_prompt is not None and generated_text_parts:
                 rendered_continuation = rendered_prompt + "".join(generated_text_parts)
-            self._save_continued_prompt_checkpoint(
-                tokenizer,
-                cache,
-                cache_key,
-                prompt_token_count=prompt_token_count,
-                rendered_continuation=rendered_continuation,
-            )
-            self._save_delta_prompt_checkpoint(
-                tokenizer,
-                cache,
-                cache_key,
-                base_checkpoint=rendered_checkpoint,
-                rendered_continuation=rendered_continuation,
-            )
+            if (
+                _prompt_checkpoint_save_delta_mode(self.cli_args) == "async"
+                and hasattr(self, "_checkpoint_save_queue")
+            ):
+                self._enqueue_checkpoint_save(
+                    "continued",
+                    lambda tokenizer=tokenizer,
+                    cache=cache,
+                    cache_key=cache_key[:],
+                    prompt_token_count=prompt_token_count,
+                    rendered_continuation=rendered_continuation: (
+                        self._save_continued_prompt_checkpoint(
+                            tokenizer,
+                            cache,
+                            cache_key,
+                            prompt_token_count=prompt_token_count,
+                            rendered_continuation=rendered_continuation,
+                        )
+                    ),
+                )
+                self._enqueue_checkpoint_save(
+                    "delta",
+                    lambda tokenizer=tokenizer,
+                    cache=cache,
+                    cache_key=cache_key[:],
+                    rendered_checkpoint=rendered_checkpoint,
+                    rendered_continuation=rendered_continuation: (
+                        self._save_delta_prompt_checkpoint(
+                            tokenizer,
+                            cache,
+                            cache_key,
+                            base_checkpoint=rendered_checkpoint,
+                            rendered_continuation=rendered_continuation,
+                        )
+                    ),
+                )
+            else:
+                self._save_continued_prompt_checkpoint(
+                    tokenizer,
+                    cache,
+                    cache_key,
+                    prompt_token_count=prompt_token_count,
+                    rendered_continuation=rendered_continuation,
+                )
+                self._save_delta_prompt_checkpoint(
+                    tokenizer,
+                    cache,
+                    cache_key,
+                    base_checkpoint=rendered_checkpoint,
+                    rendered_continuation=rendered_continuation,
+                )
 
             # Save the KV cache again
             self.prompt_cache.insert_cache(
@@ -3569,6 +3768,22 @@ def configure_checkpoint_cache_dir(args):
     return str(resolved)
 
 
+def configure_glm_dsa_q_projection_preset(args):
+    preset = getattr(args, "glm_dsa_q_projection_preset", "default")
+    applied = None
+    if preset != "default":
+        os.environ[glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESET_ENV] = preset
+        logging.info("GLM DSA q_projection preset: %s", preset)
+        applied = preset
+
+    split_strategy = getattr(args, "glm_dsa_q_b_split_strategy", "default")
+    if split_strategy != "default":
+        os.environ[glm_moe_dsa.GLM_DSA_Q_B_SPLIT_STRATEGY_ENV] = split_strategy
+        logging.info("GLM DSA q_b split strategy: %s", split_strategy)
+
+    return applied
+
+
 def setup_arg_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
@@ -3784,6 +3999,25 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--glm-dsa-q-projection-preset",
+        choices=("default", *glm_moe_dsa.GLM_DSA_Q_PROJECTION_PRESETS.keys()),
+        default="default",
+        help=(
+            "Apply a GLM DSA q_projection structure preset. Individual "
+            "MLX_LM_GLM_DSA_* q_projection environment flags still override "
+            "the preset. The default leaves the environment unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--glm-dsa-q-b-split-strategy",
+        choices=("default", "heads", "flat-before-transpose"),
+        default="default",
+        help=(
+            "Select where GLM DSA q_b output is split into q_nope/q_pe. "
+            "The default leaves MLX_LM_GLM_DSA_Q_B_SPLIT_STRATEGY unchanged."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-cache-dir",
         type=Path,
         help=(
@@ -3871,6 +4105,72 @@ def setup_arg_parser():
         help="Alias for --checkpoint-save-exact disabled.",
     )
     parser.add_argument(
+        "--checkpoint-save-delta",
+        choices=["enabled", "disabled"],
+        default="enabled",
+        help=(
+            "Save suffix-only delta prompt checkpoints after generation when "
+            "the request loaded a base checkpoint. Keep enabled for long "
+            "coding-agent sessions; disable only for cold/debug runs "
+            "(default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-post-response-save-mode",
+        dest="checkpoint_save_delta_mode",
+        choices=["async", "sync"],
+        default="async",
+        help=(
+            "Run post-response continued/delta prompt checkpoint saves on a "
+            "background worker or synchronously on the generation worker "
+            "(default: async)."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-save-delta-mode",
+        dest="checkpoint_save_delta_mode",
+        choices=["async", "sync"],
+        help="Alias for --checkpoint-post-response-save-mode.",
+    )
+    parser.add_argument(
+        "--no-save-delta-checkpoint",
+        dest="checkpoint_save_delta",
+        action="store_const",
+        const="disabled",
+        help="Alias for --checkpoint-save-delta disabled.",
+    )
+    parser.add_argument(
+        "--checkpoint-delta-max-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS,
+        help=(
+            "Maximum suffix length eligible for delta prompt checkpoint save. "
+            "Use 0 to disable this cap "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_DELTA_MAX_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-async-save-shutdown-timeout",
+        type=float,
+        default=DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
+        help=(
+            "Seconds to wait for the async prompt-checkpoint save worker during "
+            "server shutdown. Use 0 to preserve immediate Ctrl+C shutdown "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--generation-shutdown-timeout",
+        type=float,
+        default=DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
+        help=(
+            "Seconds to wait for the generation worker during server shutdown. "
+            "Use 0 to preserve immediate Ctrl+C shutdown while startup model "
+            "loading or generation is still active "
+            f"(default: {DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS})."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-shutdown-save-limit",
         type=int,
         default=DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
@@ -3942,6 +4242,7 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     configure_checkpoint_cache_dir(args)
+    configure_glm_dsa_q_projection_preset(args)
     run(args.host, args.port, ModelProvider(args))
 
 
