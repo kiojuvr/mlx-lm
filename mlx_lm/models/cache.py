@@ -185,7 +185,21 @@ def save_prompt_cache(
     cache_classes = [type(c).__name__ for c in cache]
     cache_metadata = [cache_info, metadata, cache_classes]
     cache_metadata = dict(tree_flatten(cache_metadata))
-    mx.save_safetensors(file_name, cache_data, cache_metadata)
+    file_dir = os.path.dirname(os.path.abspath(file_name))
+    file_base = os.path.basename(file_name)
+    tmp_file = os.path.join(
+        file_dir,
+        f".{file_base}.{os.getpid()}.{time.time_ns()}.tmp.safetensors",
+    )
+    try:
+        mx.save_safetensors(tmp_file, cache_data, cache_metadata)
+        os.replace(tmp_file, file_name)
+    except Exception:
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+        raise
 
 
 def load_prompt_cache(file_name, return_metadata=False):

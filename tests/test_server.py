@@ -30,6 +30,7 @@ from mlx_lm.models.cache import (
 from mlx_lm.server import (
     APIHandler,
     DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
@@ -268,6 +269,10 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
                 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
             ),
             "checkpoint_max_age_seconds": DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
+            "checkpoint_post_response_save_mode": "async",
+            "checkpoint_async_save_shutdown_timeout": (
+                DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS
+            ),
             "checkpoint_shutdown_save_limit": (
                 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT
             ),
@@ -680,6 +685,47 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertIn("Shutdown sequence started", logs)
         self.assertIn("Shutdown sequence complete", logs)
 
+    def test_enqueue_checkpoint_save_queues_job(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._checkpoint_save_queue = Queue()
+
+        generator._enqueue_checkpoint_save("delta", lambda: True)
+
+        job = generator._checkpoint_save_queue.get_nowait()
+        self.assertEqual(job.label, "delta")
+        self.assertTrue(job.save())
+
+    def test_stop_and_join_stops_checkpoint_worker(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._stop = False
+        generator._shutdown_complete = False
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                generation_shutdown_timeout=0,
+                checkpoint_async_save_shutdown_timeout=1.25,
+            )
+        )
+        generator._generation_thread = types.SimpleNamespace(
+            join=mock.Mock(),
+            is_alive=mock.Mock(return_value=False),
+        )
+        generator._checkpoint_save_queue = Queue()
+        generator._checkpoint_save_stop = object()
+        generator._checkpoint_save_thread = types.SimpleNamespace(
+            join=mock.Mock(),
+            is_alive=mock.Mock(return_value=False),
+        )
+        generator.flush_shutdown_prompt_checkpoints = mock.Mock(return_value={})
+        generator.prune_shutdown_prompt_checkpoints = mock.Mock(return_value={})
+
+        generator.stop_and_join()
+
+        generator._checkpoint_save_thread.join.assert_called_once_with(timeout=1.25)
+        self.assertIs(
+            generator._checkpoint_save_queue.get_nowait(),
+            generator._checkpoint_save_stop,
+        )
+
     def test_run_http_server_logs_keyboard_interrupt_shutdown(self):
         calls = []
 
@@ -932,6 +978,11 @@ class TestServerCLI(unittest.TestCase):
             args.checkpoint_max_age_seconds,
             DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
         )
+        self.assertEqual(args.checkpoint_post_response_save_mode, "async")
+        self.assertEqual(
+            args.checkpoint_async_save_shutdown_timeout,
+            DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
+        )
         self.assertEqual(
             args.checkpoint_shutdown_save_limit,
             DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
@@ -1041,6 +1092,10 @@ class TestServerCLI(unittest.TestCase):
                 "3600",
                 "--checkpoint-save-exact",
                 "disabled",
+                "--checkpoint-post-response-save-mode",
+                "sync",
+                "--checkpoint-async-save-shutdown-timeout",
+                "2.5",
                 "--checkpoint-shutdown-save-limit",
                 "2",
                 "--checkpoint-shutdown-max-tokens",
@@ -1057,6 +1112,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.checkpoint_continued_interval_tokens, 8192)
         self.assertEqual(args.checkpoint_max_age_seconds, 3600)
         self.assertEqual(args.checkpoint_save_exact, "disabled")
+        self.assertEqual(args.checkpoint_post_response_save_mode, "sync")
+        self.assertEqual(args.checkpoint_async_save_shutdown_timeout, 2.5)
         self.assertEqual(args.checkpoint_shutdown_save_limit, 2)
         self.assertEqual(args.checkpoint_shutdown_max_tokens, 32768)
         self.assertEqual(args.generation_shutdown_timeout, 1.5)
