@@ -2318,6 +2318,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._client_disconnected_logged = True
             return False
 
+    def _end_headers_safely(self) -> bool:
+        try:
+            self.end_headers()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            if not getattr(self, "_client_disconnected_logged", False):
+                logging.info(
+                    "Client disconnected while writing response headers: %s",
+                    e,
+                )
+                self._client_disconnected_logged = True
+            return False
+
     def _set_cors_headers(self):
         allowed_origins = self.response_generator.cli_args.allowed_origins
         origin = self.headers.get("Origin")
@@ -2749,14 +2762,17 @@ class APIHandler(BaseHTTPRequestHandler):
             )
         except Exception as e:
             self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            if self._end_headers_safely():
+                self._write_response_bytes(json.dumps({"error": str(e)}).encode())
             return
 
         # Prepare the headers
         if self.stream:
             self._set_stream_headers(200)
-            self.end_headers()
+            if not self._end_headers_safely():
+                client_connected = False
+                ctx.stop()
+                return
             logging.debug("Starting stream:")
         else:
             self._set_completion_headers(200)
@@ -2925,8 +2941,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 response_json = json.dumps(resp).encode()
                 self.send_header("Content-Length", str(len(response_json)))
-                self.end_headers()
-                self._write_response_bytes(response_json)
+                if self._end_headers_safely():
+                    self._write_response_bytes(response_json)
         finally:
             ctx.stop()
 
@@ -3142,8 +3158,8 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.error(f"handle_responses_completion error: {e}")
             logging.error(traceback.format_exc())
             self._set_completion_headers(500)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            if self._end_headers_safely():
+                self._write_response_bytes(json.dumps({"error": str(e)}).encode())
             return
 
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, False)
@@ -3165,7 +3181,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if self.stream:
             self._set_stream_headers(200)
-            self.end_headers()
+            if not self._end_headers_safely():
+                client_connected = False
+                ctx.stop()
+                return
             if not stream_write(self._sse_event("response.created", {
                 "type": "response.created",
                 "response": {
@@ -3397,8 +3416,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             resp_bytes = json.dumps(resp).encode()
             self.send_header("Content-Length", str(len(resp_bytes)))
-            self.end_headers()
-            self._write_response_bytes(resp_bytes)
+            if self._end_headers_safely():
+                self._write_response_bytes(resp_bytes)
 
     def _sse_event(self, event: str, data: dict) -> bytes:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()

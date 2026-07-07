@@ -1625,6 +1625,24 @@ class TestServerWithDraftModel(unittest.TestCase):
 
 
 class TestKeepalive(unittest.TestCase):
+    def test_end_headers_safely_handles_client_disconnect(self):
+        handler = APIHandler.__new__(APIHandler)
+        handler.end_headers = mock.Mock(side_effect=BrokenPipeError("gone"))
+
+        with self.assertLogs(level="INFO") as captured:
+            self.assertFalse(handler._end_headers_safely())
+
+        handler.end_headers.assert_called_once()
+        logs = "\n".join(captured.output)
+        self.assertIn("Client disconnected while writing response headers", logs)
+
+    def test_end_headers_safely_success(self):
+        handler = APIHandler.__new__(APIHandler)
+        handler.end_headers = mock.Mock()
+
+        self.assertTrue(handler._end_headers_safely())
+        handler.end_headers.assert_called_once()
+
     def test_keepalive_callback(self):
         """Test keepalive callback sends SSE comments and handles errors"""
         from unittest.mock import Mock
