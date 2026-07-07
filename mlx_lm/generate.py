@@ -1417,16 +1417,35 @@ def generate_step(
                     f"prefix_length={len(prompt_checkpoint_exact_tokens)}"
                 )
 
+        decode_first_step_started_at = time.perf_counter()
+        _prompt_checkpoint_debug(
+            "decode first step start "
+            f"total_prompt_tokens={total_prompt_tokens} "
+            f"cached_tokens={prompt_checkpoint_cached_tokens} "
+            f"remaining_prompt_tokens={prompt.size}"
+        )
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        _prompt_checkpoint_debug(
+            "decode first step scheduled "
+            f"schedule_seconds={time.perf_counter() - decode_first_step_started_at:.6f}"
+        )
 
     mx.async_eval(y, logprobs)
     n = 0
     while True:
         if n != max_tokens:
+            if n == 0:
+                _prompt_checkpoint_debug("decode lookahead step start")
             next_y, next_logprobs = _step(y)
             mx.async_eval(next_y, next_logprobs)
+            if n == 0:
+                _prompt_checkpoint_debug("decode lookahead step scheduled")
         if n == 0:
             mx.eval(y)
+            _prompt_checkpoint_debug(
+                "decode first token ready "
+                f"first_token_seconds={time.perf_counter() - decode_first_step_started_at:.6f}"
+            )
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
         if n == max_tokens:
             break

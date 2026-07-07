@@ -137,7 +137,9 @@ python -m mlx_lm server \
   --disable-batching \
   --loop-guard-ngram-size 64 \
   --loop-guard-repeats 3 \
-  --loop-guard-min-tokens 256
+  --loop-guard-min-tokens 256 \
+  --decode-progress-interval-tokens 512 \
+  --tool-call-max-tokens 8192
 ```
 
 Do not pass `--model-name` for this OpenCode setup unless you have explicitly verified that you need request-facing model-name aliasing. The normal single-model local server workflow loads the model from `--model` and serves OpenCode requests through `/v1/chat/completions`.
@@ -145,11 +147,20 @@ Do not pass `--model-name` for this OpenCode setup unless you have explicitly ve
 OpenCode may still send a conservative `max_tokens` value such as 32000 even
 when `limit.output` is set higher. `--request-max-tokens-floor 384000` raises
 that request cap on the server side so long coding-agent turns are not cut off
-early with `finish_reason=length`.
+early with `finish_reason=length`. Because that also allows an unclosed tool
+call to run for a long time, keep `--tool-call-max-tokens 8192` enabled for
+OpenCode serving. It stops a single tool-call span that grows past the limit
+with `finish_reason=length` instead of waiting for the full raised token cap.
 
 The recommended server command intentionally leaves `--temp` and `--top-p` unset so request-side clients can control sampling. In local use, lower-temperature request settings helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
 
 `--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it. If the model still enters near-duplicate but non-exact loops, lower request sampling first (`temperature`, `top_p`) and add a small request-side `repetition_penalty` such as `1.05` to `1.10` when your client supports it.
+
+`--decode-progress-interval-tokens 512` logs generation progress from the
+generation worker. If prompt processing reaches 100% and no `decode first token`
+line follows, the first decode step is stalled. If progress continues with
+`state=tool` but the client shows no visible output, the model is producing an
+unclosed tool call; the `--tool-call-max-tokens` fuse bounds that case.
 
 `--kv-bits 8` is not a prefill-compute speedup by itself. Its value is that GLM MLA int8 KV cache reduces long-context KV memory and keeps 200K+ prompts inside the intended memory envelope. The native DSA indexer score/top-k route remains compatible with this setting because it uses the DSA indexer cache, not the GLM MLA KV cache.
 

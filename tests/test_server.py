@@ -127,6 +127,7 @@ class DummyModelProvider:
                 "loop_guard_repeats": 3,
                 "loop_guard_min_tokens": 256,
                 "decode_progress_interval_tokens": 0,
+                "tool_call_max_tokens": 0,
                 "prefill_progress_interval_tokens": 0,
                 "checkpoint_save_exact": "enabled",
             },
@@ -999,6 +1000,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.loop_guard_repeats, 3)
         self.assertEqual(args.loop_guard_min_tokens, 256)
         self.assertEqual(args.decode_progress_interval_tokens, 0)
+        self.assertEqual(args.tool_call_max_tokens, 0)
         self.assertEqual(args.prefill_progress_interval_tokens, 0)
         self.assertEqual(args.request_max_tokens_floor, 0)
         self.assertEqual(args.checkpoint_save_exact, "enabled")
@@ -1150,6 +1152,8 @@ class TestServerCLI(unittest.TestCase):
                 "32",
                 "--decode-progress-interval-tokens",
                 "256",
+                "--tool-call-max-tokens",
+                "8192",
                 "--prefill-progress-interval-tokens",
                 "2048",
                 "--loop-guard-repeats",
@@ -1161,6 +1165,7 @@ class TestServerCLI(unittest.TestCase):
 
         self.assertEqual(args.loop_guard_ngram_size, 32)
         self.assertEqual(args.decode_progress_interval_tokens, 256)
+        self.assertEqual(args.tool_call_max_tokens, 8192)
         self.assertEqual(args.prefill_progress_interval_tokens, 2048)
         self.assertEqual(args.loop_guard_repeats, 4)
         self.assertEqual(args.loop_guard_min_tokens, 128)

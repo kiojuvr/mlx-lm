@@ -2256,6 +2256,11 @@ class ResponseGenerator:
             )
             generated_text_parts = []
             finish_reason = None
+            decode_progress_interval = _prompt_checkpoint_policy_int(
+                self.cli_args,
+                "decode_progress_interval_tokens",
+                0,
+            )
             logging.info(
                 "generation request: prompt_tokens=%s max_tokens=%s "
                 "stop_words=%s prompt_cached_tokens=%s",
@@ -2330,6 +2335,39 @@ class ResponseGenerator:
                 cache_key.append(gen.token)
                 if gen.text:
                     generated_text_parts.append(gen.text)
+
+                generated_tokens_so_far = max(0, len(cache_key) - prompt_token_count)
+                if generated_tokens_so_far == 1:
+                    logging.info(
+                        "decode first token: prompt_tokens=%s cache_tokens=%s "
+                        "first_token_seconds=%.3f state=%s",
+                        prompt_token_count,
+                        len(cache_key),
+                        generated_token_at - generation_started_at,
+                        current_state,
+                    )
+                if (
+                    decode_progress_interval > 0
+                    and generated_tokens_so_far > 0
+                    and generated_tokens_so_far % decode_progress_interval == 0
+                ):
+                    decode_elapsed = max(
+                        generated_token_at - first_generated_token_at,
+                        1e-9,
+                    )
+                    logging.info(
+                        "generation progress: prompt_tokens=%s generated_tokens=%s "
+                        "cache_tokens=%s decode_seconds=%.3f decode_tps=%.3f "
+                        "state=%s draft_tokens=%s stopped_by_client=%s",
+                        prompt_token_count,
+                        generated_tokens_so_far,
+                        len(cache_key),
+                        decode_elapsed,
+                        generated_tokens_so_far / decode_elapsed,
+                        current_state,
+                        draft_tokens,
+                        ctx._should_stop,
+                    )
 
                 if ctx._should_stop:
                     if self._is_distributed:
@@ -2977,7 +3015,14 @@ class APIHandler(BaseHTTPRequestHandler):
             "decode_progress_interval_tokens",
             0,
         )
+        tool_call_max_tokens = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "tool_call_max_tokens",
+            0,
+        )
         decode_started_at = time.perf_counter()
+        tool_state_tokens = 0
+        tool_call_limit_reached = False
         loop_guard = TokenLoopGuard(
             self.response_generator.cli_args.loop_guard_ngram_size,
             self.response_generator.cli_args.loop_guard_repeats,
@@ -3003,6 +3048,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
+                if gen.state == "tool":
+                    tool_state_tokens += 1
+                else:
+                    tool_state_tokens = 0
                 if (
                     decode_progress_interval > 0
                     and len(tokens) % decode_progress_interval == 0
@@ -3031,6 +3080,22 @@ class APIHandler(BaseHTTPRequestHandler):
                     finish_reason = "stop"
                     ctx.stop()
                     break
+                if (
+                    tool_call_max_tokens > 0
+                    and tool_state_tokens > tool_call_max_tokens
+                ):
+                    logging.warning(
+                        "Stopping generation after tool call exceeded token limit "
+                        "(tool_call_max_tokens=%s generated_tokens=%s "
+                        "tool_state_tokens=%s)",
+                        tool_call_max_tokens,
+                        len(tokens),
+                        tool_state_tokens,
+                    )
+                    finish_reason = "length"
+                    tool_call_limit_reached = True
+                    ctx.stop()
+                    break
 
                 if (
                     self.stream
@@ -3054,7 +3119,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
-            if prev_state == "tool" and tool_text:
+            if prev_state == "tool" and tool_text and not tool_call_limit_reached:
                 tool_calls.append(tool_text)
                 made_tool_call = True
 
@@ -3066,7 +3131,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "generated_tokens=%s finish_reason=%s stream=%s "
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
                 "requested_max_tokens=%s max_tokens_floor_applied=%s "
-                "made_tool_call=%s",
+                "made_tool_call=%s tool_call_limit_reached=%s",
                 self.request_id,
                 len(ctx.prompt),
                 len(tokens),
@@ -3078,6 +3143,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.requested_max_tokens,
                 self.max_tokens_floor_applied,
                 made_tool_call,
+                tool_call_limit_reached,
             )
 
             if self.stream:
@@ -3353,6 +3419,13 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_text = ""
         tool_calls_raw = []
         made_tool_call = False
+        tool_call_max_tokens = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "tool_call_max_tokens",
+            0,
+        )
+        tool_state_tokens = 0
+        tool_call_limit_reached = False
         loop_guard = TokenLoopGuard(
             self.response_generator.cli_args.loop_guard_ngram_size,
             self.response_generator.cli_args.loop_guard_repeats,
@@ -3392,6 +3465,10 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             for gen in response_gen:
                 tokens.append(gen.token)
+                if gen.state == "tool":
+                    tool_state_tokens += 1
+                else:
+                    tool_state_tokens = 0
                 if loop_guard.append(gen.token):
                     logging.warning(
                         "Stopping generation after detecting repeated token loop "
@@ -3401,6 +3478,22 @@ class APIHandler(BaseHTTPRequestHandler):
                         len(tokens),
                     )
                     finish_reason = "stop"
+                    ctx.stop()
+                    break
+                if (
+                    tool_call_max_tokens > 0
+                    and tool_state_tokens > tool_call_max_tokens
+                ):
+                    logging.warning(
+                        "Stopping generation after tool call exceeded token limit "
+                        "(tool_call_max_tokens=%s generated_tokens=%s "
+                        "tool_state_tokens=%s)",
+                        tool_call_max_tokens,
+                        len(tokens),
+                        tool_state_tokens,
+                    )
+                    finish_reason = "length"
+                    tool_call_limit_reached = True
                     ctx.stop()
                     break
                 if gen.state == "tool":
@@ -3435,7 +3528,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     finish_reason = gen.finish_reason
                 prev_state = gen.state
 
-            if prev_state == "tool" and tool_text:
+            if prev_state == "tool" and tool_text and not tool_call_limit_reached:
                 tool_calls_raw.append(tool_text)
                 made_tool_call = True
             if finish_reason == "stop" and made_tool_call:
@@ -3445,7 +3538,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "generated_tokens=%s finish_reason=%s stream=%s "
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
                 "requested_max_tokens=%s max_tokens_floor_applied=%s "
-                "made_tool_call=%s",
+                "made_tool_call=%s tool_call_limit_reached=%s",
                 self.request_id,
                 len(ctx.prompt),
                 len(tokens),
@@ -3457,6 +3550,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.requested_max_tokens,
                 self.max_tokens_floor_applied,
                 made_tool_call,
+                tool_call_limit_reached,
             )
         finally:
             ctx.stop()
@@ -3908,6 +4002,15 @@ def setup_arg_parser():
         help=(
             "Log decode progress every N generated tokens. Use 0 to disable "
             "(default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--tool-call-max-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Stop generation if a single unclosed tool-call span exceeds this "
+            "many generated tokens. Use 0 to disable (default: 0)."
         ),
     )
     parser.add_argument(
