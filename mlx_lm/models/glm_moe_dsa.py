@@ -2302,6 +2302,19 @@ class Model(DSV32Model):
         super().__init__(config)
         self.model = GlmMoeDsaModel(config)
 
+    def sanitize(self, weights):
+        # Native MTP layers need a separate generation path. Keep baseline GLM
+        # loading compatible with updated checkpoints that include MTP weights.
+        return {
+            k: v
+            for k, v in weights.items()
+            if not (
+                k.startswith(("mtp.", "mtp_", "model.mtp"))
+                or ".mtp." in k
+                or ".mtp_" in k
+            )
+        }
+
     def make_cache(self):
         # Shared layers run no indexer, so they get no indexer KVCache.
         caches = []

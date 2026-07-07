@@ -2266,6 +2266,9 @@ class ResponseGenerator:
             )
 
             # Process the prompt and generate tokens
+            generation_started_at = time.perf_counter()
+            first_generated_token_at = None
+            draft_tokens = 0
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -2302,6 +2305,11 @@ class ResponseGenerator:
                 ),
                 prompt_checkpoint_rendered_prompt=rendered_prompt,
             ):
+                generated_token_at = time.perf_counter()
+                if first_generated_token_at is None:
+                    first_generated_token_at = generated_token_at
+                if getattr(gen, "from_draft", False):
+                    draft_tokens += 1
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
                 if match_sequence is not None and current_state is None:
@@ -2333,14 +2341,35 @@ class ResponseGenerator:
 
             rqueue.put(None)
             generated_tokens = max(0, len(cache_key) - prompt_token_count)
+            generation_finished_at = time.perf_counter()
+            generation_seconds = max(
+                generation_finished_at - generation_started_at, 0.0
+            )
+            generation_tps = (
+                generated_tokens / generation_seconds if generation_seconds > 0 else 0
+            )
+            decode_seconds = 0.0
+            if first_generated_token_at is not None:
+                decode_seconds = max(
+                    generation_finished_at - first_generated_token_at,
+                    0.0,
+                )
+            decode_tps = generated_tokens / decode_seconds if decode_seconds > 0 else 0
             logging.info(
                 "generation complete: prompt_tokens=%s generated_tokens=%s "
-                "finish_reason=%s stopped_by_client=%s cache_tokens=%s",
+                "finish_reason=%s stopped_by_client=%s cache_tokens=%s "
+                "generation_seconds=%.3f generation_tps=%.3f "
+                "decode_seconds=%.3f decode_tps=%.3f draft_tokens=%s",
                 prompt_token_count,
                 generated_tokens,
                 finish_reason,
                 ctx._should_stop,
                 len(cache_key),
+                generation_seconds,
+                generation_tps,
+                decode_seconds,
+                decode_tps,
+                draft_tokens,
             )
 
             rendered_continuation = None

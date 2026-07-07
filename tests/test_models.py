@@ -1633,6 +1633,21 @@ class TestModels(unittest.TestCase):
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
 
+    def test_glm_moe_dsa_sanitize_drops_mtp_weights(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = glm_moe_dsa.Model.__new__(glm_moe_dsa.Model)
+        weights = {
+            "model.embed_tokens.weight": mx.ones((1,), dtype=mx.float32),
+            "model.mtp_layers.0.norm.weight": mx.zeros((1,), dtype=mx.float32),
+            "mtp.fc.weight": mx.zeros((1,), dtype=mx.float32),
+            "model.foo.mtp_block.weight": mx.zeros((1,), dtype=mx.float32),
+        }
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(list(sanitized), ["model.embed_tokens.weight"])
+
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4
 
