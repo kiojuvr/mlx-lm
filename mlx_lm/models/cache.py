@@ -7,7 +7,7 @@ import os
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -599,6 +599,25 @@ def _manifest_metadata_rendered_prefix(metadata):
     }
 
 
+def _manifest_metadata_cache_layout(metadata):
+    if not metadata:
+        return {}
+    layout_json = metadata.get(PROMPT_CHECKPOINT_CACHE_LAYOUT_METADATA_KEY)
+    layout_hash = metadata.get(PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY)
+    if not layout_json or not layout_hash:
+        return {}
+    try:
+        layout = json.loads(layout_json)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if layout_hash != _json_hash(layout):
+        return {}
+    return {
+        PROMPT_CHECKPOINT_CACHE_LAYOUT_METADATA_KEY: _json_dumps(layout),
+        PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY: str(layout_hash),
+    }
+
+
 def _manifest_metadata_lcp_block(metadata):
     if not metadata:
         return {}
@@ -681,6 +700,7 @@ def _normalize_manifest_entry(filename, entry):
         normalized[PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY] = (
             rendered_bytes
         )
+    normalized.update(_manifest_metadata_cache_layout(entry))
     block_hash = entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY)
     block_hash_algo = entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY)
     block_size = _safe_manifest_int(
@@ -814,6 +834,7 @@ def _manifest_entry_from_file(filename, *, kind="unknown", metadata=None):
     }
     entry.update(_manifest_metadata_identity(metadata))
     entry.update(_manifest_metadata_rendered_prefix(metadata))
+    entry.update(_manifest_metadata_cache_layout(metadata))
     entry.update(_manifest_metadata_lcp_block(metadata))
     if metadata:
         for key in (
@@ -1203,7 +1224,28 @@ class PromptCheckpointManager:
             "lcp_manager_block_lengths": len(self.block_index),
             "lcp_block_hashes_computed": 0,
             "lcp_block_hash_matches": 0,
+            "cache_layout_rejections": 0,
         }
+
+    def _entry_matches_expected_cache_layout(
+        self,
+        entry,
+        prefix_length,
+        expected_cache_layout_by_length,
+        stats,
+    ):
+        if expected_cache_layout_by_length is None:
+            return True
+        expected_cache_layout = expected_cache_layout_by_length(prefix_length)
+        if expected_cache_layout is None:
+            return True
+        saved_layout_hash = entry.get(PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY)
+        if not saved_layout_hash:
+            return True
+        if saved_layout_hash == _json_hash(expected_cache_layout):
+            return True
+        stats["cache_layout_rejections"] += 1
+        return False
 
     def find_token_prefix(
         self,
@@ -1211,6 +1253,9 @@ class PromptCheckpointManager:
         *,
         min_prefix_length=2,
         allowed_kinds=("exact", "prefix", "frontier", "continued", "unknown"),
+        expected_cache_layout_by_length: Optional[
+            Callable[[int], Optional[List[Any]]]
+        ] = None,
         return_stats=False,
     ):
         tokens = _token_list(prefix_tokens)
@@ -1224,6 +1269,13 @@ class PromptCheckpointManager:
             for hash_part, entry in by_hash.items():
                 if allowed_kinds and entry.get("kind") not in allowed_kinds:
                     continue
+                if not self._entry_matches_expected_cache_layout(
+                    entry,
+                    prefix_length,
+                    expected_cache_layout_by_length,
+                    stats,
+                ):
+                    continue
                 stats["candidate_files_scanned"] += 1
                 by_length.setdefault(prefix_length, {})[hash_part] = entry
 
@@ -1233,6 +1285,13 @@ class PromptCheckpointManager:
                 self.block_index.get(prefix_length, {}).items()
             ):
                 if allowed_kinds and block_entry.get("kind") not in allowed_kinds:
+                    continue
+                if not self._entry_matches_expected_cache_layout(
+                    block_entry,
+                    prefix_length,
+                    expected_cache_layout_by_length,
+                    stats,
+                ):
                     continue
                 group = (block_size, block_extra_hash)
                 block_lengths_by_group.setdefault(group, set()).add(prefix_length)
@@ -1262,6 +1321,13 @@ class PromptCheckpointManager:
                 expected_block_hash,
             ), block_entry in self.block_index.get(prefix_length, {}).items():
                 if allowed_kinds and block_entry.get("kind") not in allowed_kinds:
+                    continue
+                if not self._entry_matches_expected_cache_layout(
+                    block_entry,
+                    prefix_length,
+                    expected_cache_layout_by_length,
+                    stats,
+                ):
                     continue
                 actual_block_hash = block_hashes_by_group.get(
                     (block_size, block_extra_hash),
@@ -1293,6 +1359,9 @@ class PromptCheckpointManager:
         *,
         min_prefix_bytes=1,
         allowed_kinds=("prefix", "frontier", "continued"),
+        expected_cache_layout_by_length: Optional[
+            Callable[[int], Optional[List[Any]]]
+        ] = None,
         return_stats=False,
     ):
         rendered = rendered_prompt_bytes(rendered_prompt)
@@ -1307,6 +1376,13 @@ class PromptCheckpointManager:
                 continue
             for rendered_hash, entry in by_hash.items():
                 if allowed_kinds and entry.get("kind") not in allowed_kinds:
+                    continue
+                if not self._entry_matches_expected_cache_layout(
+                    entry,
+                    entry["prefix_length"],
+                    expected_cache_layout_by_length,
+                    stats,
+                ):
                     continue
                 stats["candidate_files_scanned"] += 1
                 by_length.setdefault(rendered_bytes, {})[rendered_hash] = entry
@@ -1363,6 +1439,9 @@ def find_prompt_checkpoint_prefix(
     *,
     min_prefix_length=2,
     allowed_kinds=("exact", "prefix", "frontier", "continued", "unknown"),
+    expected_cache_layout_by_length: Optional[
+        Callable[[int], Optional[List[Any]]]
+    ] = None,
     return_stats=False,
 ):
     """
@@ -1377,6 +1456,7 @@ def find_prompt_checkpoint_prefix(
         prefix_tokens,
         min_prefix_length=min_prefix_length,
         allowed_kinds=allowed_kinds,
+        expected_cache_layout_by_length=expected_cache_layout_by_length,
         return_stats=return_stats,
     )
 
@@ -1386,6 +1466,9 @@ def find_prompt_checkpoint_rendered_prefix(
     *,
     min_prefix_bytes=1,
     allowed_kinds=("prefix", "frontier", "continued"),
+    expected_cache_layout_by_length: Optional[
+        Callable[[int], Optional[List[Any]]]
+    ] = None,
     return_stats=False,
 ):
     """
@@ -1399,6 +1482,7 @@ def find_prompt_checkpoint_rendered_prefix(
         rendered_prompt,
         min_prefix_bytes=min_prefix_bytes,
         allowed_kinds=allowed_kinds,
+        expected_cache_layout_by_length=expected_cache_layout_by_length,
         return_stats=return_stats,
     )
 

@@ -440,6 +440,55 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertEqual(int8_layout[0]["group_size"], 32)
         self.assertEqual(int8_layout[0]["bits"], 8)
 
+    def test_lcp_checkpoint_manager_filters_cache_layout_mismatch(self):
+        self._set_home_to_test_dir()
+        ensure_glm52_local_cache_dirs()
+        kv_tokens = [1, 2, 3, 4]
+        rotating_tokens = [1, 2, 3]
+
+        kv_metadata = save_prompt_checkpoint(
+            prompt_checkpoint_file(kv_tokens),
+            self._filled_kv_cache(),
+            model_id="toy-model",
+            prefix_tokens=kv_tokens,
+        )
+        update_prompt_checkpoint_manifest(
+            prompt_checkpoint_file(kv_tokens),
+            prefix_length=len(kv_tokens),
+            kind="prefix",
+            metadata=kv_metadata,
+        )
+
+        rotating_cache = [RotatingKVCache(max_size=4) for _ in range(2)]
+        for c in rotating_cache:
+            x = mx.random.uniform(shape=(1, 2, 3, 8)).astype(mx.float32)
+            c.update_and_fetch(x, x)
+        rotating_metadata = save_prompt_checkpoint(
+            prompt_checkpoint_file(rotating_tokens),
+            rotating_cache,
+            model_id="toy-model",
+            prefix_tokens=rotating_tokens,
+        )
+        update_prompt_checkpoint_manifest(
+            prompt_checkpoint_file(rotating_tokens),
+            prefix_length=len(rotating_tokens),
+            kind="prefix",
+            metadata=rotating_metadata,
+        )
+
+        expected_layout = prompt_cache_layout_signature(
+            [RotatingKVCache(max_size=4) for _ in range(2)]
+        )
+        candidates, stats = find_prompt_checkpoint_prefix(
+            [1, 2, 3, 4, 5],
+            expected_cache_layout_by_length=lambda _: expected_layout,
+            return_stats=True,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], len(rotating_tokens))
+        self.assertEqual(stats["cache_layout_rejections"], 1)
+
     def test_checkpoint_rejects_malformed_or_partial_metadata(self):
         cache = self._filled_kv_cache()
         cache_file = os.path.join(self.test_dir, "checkpoint.safetensors")
@@ -1409,7 +1458,9 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
             )
 
         output = "\n".join(logs.output)
-        self.assertIn("miss rejected", output)
+        self.assertTrue(
+            "miss rejected" in output or "cache_layout_rejections=" in output
+        )
         self.assertNotIn("prompt checkpoint: frontier hit", output)
         self.assertIn("fresh_prefill_tokens=14", output)
         self.assertEqual(progress[0], (0, len(prompt_b)))

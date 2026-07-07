@@ -766,6 +766,25 @@ def generate_step(
     if prompt_checkpoint_existing_cache:
         prompt_checkpoint_cached_tokens = prompt_checkpoint_initial_cached_tokens
 
+    def _checkpoint_cache_token_length_for_prefix(prefix_length):
+        return (
+            prefix_length - 1
+            if prefix_length == total_prompt_tokens
+            else prefix_length
+        )
+
+    def _expected_checkpoint_cache_layout(prefix_length):
+        return cache.expected_prompt_cache_layout_signature(
+            model,
+            max_kv_size=max_kv_size,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+            cache_token_length=_checkpoint_cache_token_length_for_prefix(
+                prefix_length
+            ),
+        )
+
     _prompt_checkpoint_debug(
         "request "
         f"total_prompt_tokens={total_prompt_tokens} "
@@ -815,6 +834,9 @@ def generate_step(
         all_candidates, prompt_checkpoint_lookup_stats = (
             cache.find_prompt_checkpoint_prefix(
                 checkpoint_full_prompt,
+                expected_cache_layout_by_length=(
+                    _expected_checkpoint_cache_layout
+                ),
                 return_stats=True,
             )
         )
@@ -837,6 +859,7 @@ def generate_step(
             f"lcp_block_lengths={prompt_checkpoint_lookup_stats.get('lcp_manager_block_lengths', 0)} "
             f"lcp_block_hashes={prompt_checkpoint_lookup_stats.get('lcp_block_hashes_computed', 0)} "
             f"lcp_block_matches={prompt_checkpoint_lookup_stats.get('lcp_block_hash_matches', 0)} "
+            f"cache_layout_rejections={prompt_checkpoint_lookup_stats.get('cache_layout_rejections', 0)} "
             f"lookup_seconds={prompt_checkpoint_lookup_seconds:.6f}"
         )
         candidates = [
@@ -849,9 +872,7 @@ def generate_step(
             for candidate_length, candidate_prefix, candidate_path in candidates:
                 candidate_basename = os.path.basename(candidate_path)
                 checkpoint_cache_token_length = (
-                    candidate_length - 1
-                    if candidate_length == total_prompt_tokens
-                    else candidate_length
+                    _checkpoint_cache_token_length_for_prefix(candidate_length)
                 )
                 expected_glm_mla_kv_quantization = (
                     cache.expected_glm_mla_kv_quantization_metadata(
@@ -870,15 +891,8 @@ def generate_step(
                         quantized_kv_start=quantized_kv_start,
                     )
                 )
-                expected_cache_layout = (
-                    cache.expected_prompt_cache_layout_signature(
-                        model,
-                        max_kv_size=max_kv_size,
-                        kv_bits=kv_bits,
-                        kv_group_size=kv_group_size,
-                        quantized_kv_start=quantized_kv_start,
-                        cache_token_length=checkpoint_cache_token_length,
-                    )
+                expected_cache_layout = _expected_checkpoint_cache_layout(
+                    candidate_length
                 )
                 load_t0 = time.perf_counter()
                 try:
@@ -1004,6 +1018,7 @@ def generate_step(
         f"files_scanned={prompt_checkpoint_lookup_stats['files_scanned']} "
         f"candidates_scanned={prompt_checkpoint_lookup_stats['candidate_files_scanned']} "
         f"matched_candidates={prompt_checkpoint_lookup_stats['matched_candidates']} "
+        f"cache_layout_rejections={prompt_checkpoint_lookup_stats.get('cache_layout_rejections', 0)} "
         f"manifest_entries={prompt_checkpoint_lookup_stats.get('manifest_entries', 0)} "
         f"manifest_bootstrap={int(prompt_checkpoint_lookup_stats.get('manifest_bootstrap', False))} "
         f"lookup_seconds={prompt_checkpoint_lookup_seconds:.6f}"
@@ -1069,10 +1084,8 @@ def generate_step(
             )
 
     def _expected_checkpoint_metadata(prefix_length):
-        checkpoint_cache_token_length = (
-            prefix_length - 1
-            if prefix_length == total_prompt_tokens
-            else prefix_length
+        checkpoint_cache_token_length = _checkpoint_cache_token_length_for_prefix(
+            prefix_length
         )
         return (
             cache.expected_glm_mla_kv_quantization_metadata(
@@ -1088,14 +1101,7 @@ def generate_step(
                 kv_group_size=kv_group_size,
                 quantized_kv_start=quantized_kv_start,
             ),
-            cache.expected_prompt_cache_layout_signature(
-                model,
-                max_kv_size=max_kv_size,
-                kv_bits=kv_bits,
-                kv_group_size=kv_group_size,
-                quantized_kv_start=quantized_kv_start,
-                cache_token_length=checkpoint_cache_token_length,
-            ),
+            _expected_checkpoint_cache_layout(prefix_length),
         )
 
     def _update_manifest_for_checkpoint(
