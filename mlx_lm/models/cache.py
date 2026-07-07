@@ -1236,7 +1236,13 @@ class PromptCheckpointManager:
     ):
         if expected_cache_layout_by_length is None:
             return True
-        expected_cache_layout = expected_cache_layout_by_length(prefix_length)
+        return self._entry_matches_cache_layout(
+            entry,
+            expected_cache_layout_by_length(prefix_length),
+            stats,
+        )
+
+    def _entry_matches_cache_layout(self, entry, expected_cache_layout, stats):
         if expected_cache_layout is None:
             return True
         saved_layout_hash = entry.get(PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY)
@@ -1362,6 +1368,9 @@ class PromptCheckpointManager:
         expected_cache_layout_by_length: Optional[
             Callable[[int], Optional[List[Any]]]
         ] = None,
+        expected_cache_layout_by_candidate: Optional[
+            Callable[[int, str], Optional[List[Any]]]
+        ] = None,
         return_stats=False,
     ):
         rendered = rendered_prompt_bytes(rendered_prompt)
@@ -1377,11 +1386,20 @@ class PromptCheckpointManager:
             for rendered_hash, entry in by_hash.items():
                 if allowed_kinds and entry.get("kind") not in allowed_kinds:
                     continue
-                if not self._entry_matches_expected_cache_layout(
-                    entry,
-                    entry["prefix_length"],
-                    expected_cache_layout_by_length,
-                    stats,
+                kind = entry.get("kind", "unknown")
+                if expected_cache_layout_by_candidate is not None:
+                    expected_cache_layout = expected_cache_layout_by_candidate(
+                        entry["prefix_length"],
+                        kind,
+                    )
+                elif expected_cache_layout_by_length is not None:
+                    expected_cache_layout = expected_cache_layout_by_length(
+                        entry["prefix_length"]
+                    )
+                else:
+                    expected_cache_layout = None
+                if not self._entry_matches_cache_layout(
+                    entry, expected_cache_layout, stats
                 ):
                     continue
                 stats["candidate_files_scanned"] += 1
@@ -1469,6 +1487,9 @@ def find_prompt_checkpoint_rendered_prefix(
     expected_cache_layout_by_length: Optional[
         Callable[[int], Optional[List[Any]]]
     ] = None,
+    expected_cache_layout_by_candidate: Optional[
+        Callable[[int, str], Optional[List[Any]]]
+    ] = None,
     return_stats=False,
 ):
     """
@@ -1483,6 +1504,7 @@ def find_prompt_checkpoint_rendered_prefix(
         min_prefix_bytes=min_prefix_bytes,
         allowed_kinds=allowed_kinds,
         expected_cache_layout_by_length=expected_cache_layout_by_length,
+        expected_cache_layout_by_candidate=expected_cache_layout_by_candidate,
         return_stats=return_stats,
     )
 

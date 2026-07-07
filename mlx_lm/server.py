@@ -1260,9 +1260,28 @@ class ResponseGenerator:
         if not rendered:
             return None
 
+        def expected_cache_layout_for_rendered_candidate(prefix_length, kind):
+            if kind == "delta":
+                return None
+            cache_token_length = (
+                max(prefix_length - 1, 0)
+                if kind == "exact"
+                else prefix_length
+            )
+            return expected_prompt_cache_layout_signature(
+                self.model_provider.model,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
+                cache_token_length=cache_token_length,
+            )
+
         candidates, lookup_stats = find_prompt_checkpoint_rendered_prefix(
             rendered,
             allowed_kinds=("prefix", "frontier", "continued", "delta", "exact"),
+            expected_cache_layout_by_candidate=(
+                expected_cache_layout_for_rendered_candidate
+            ),
             return_stats=True,
         )
         _prompt_checkpoint_debug(
@@ -1271,6 +1290,7 @@ class ResponseGenerator:
             f"candidates={len(candidates)} "
             f"lcp_index_entries={lookup_stats.get('lcp_manager_entries', 0)} "
             f"lcp_rendered_lengths={lookup_stats.get('lcp_manager_rendered_lengths', 0)} "
+            f"cache_layout_rejections={lookup_stats.get('cache_layout_rejections', 0)} "
             f"manifest_missing_entries_removed={lookup_stats.get('manifest_missing_entries_removed', 0)}"
         )
         for rendered_prefix_length, token_prefix_length, checkpoint_path, kind in (

@@ -1326,6 +1326,31 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertEqual(stats["matched_candidates"], 3)
         self.assertGreaterEqual(stats["lcp_manager_rendered_lengths"], 3)
 
+        filtered_candidates, filtered_stats = manager.find_rendered_prefix(
+            decode_prefix(prompt_tokens[:12]) + "<extra>",
+            expected_cache_layout_by_candidate=lambda length, _kind: (
+                expected_prompt_cache_layout_signature(
+                    model,
+                    cache_token_length=length,
+                )
+            ),
+            return_stats=True,
+        )
+        self.assertTrue(filtered_candidates)
+        self.assertEqual(filtered_candidates[0][1], 12)
+        self.assertEqual(filtered_stats["cache_layout_rejections"], 0)
+
+        wrong_layout = prompt_cache_layout_signature(
+            [RotatingKVCache(max_size=4) for _ in model.layers]
+        )
+        wrong_candidates, wrong_stats = manager.find_rendered_prefix(
+            decode_prefix(prompt_tokens[:12]) + "<extra>",
+            expected_cache_layout_by_candidate=lambda _length, _kind: wrong_layout,
+            return_stats=True,
+        )
+        self.assertFalse(wrong_candidates)
+        self.assertGreater(wrong_stats["cache_layout_rejections"], 0)
+
     def test_prompt_checkpoint_reuses_deepest_frontier_after_restart(self):
         self._set_home_to_test_dir()
         self._set_prompt_checkpoint_debug()
