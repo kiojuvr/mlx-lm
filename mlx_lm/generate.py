@@ -738,6 +738,11 @@ def generate_step(
         "manifest_malformed": False,
         "manifest_bootstrap": False,
         "manifest_missing_entries_removed": 0,
+        "lcp_manager_entries": 0,
+        "lcp_manager_token_lengths": 0,
+        "lcp_manager_block_lengths": 0,
+        "lcp_block_hashes_computed": 0,
+        "lcp_block_hash_matches": 0,
     }
     prompt_checkpoint_lookup_seconds = 0.0
     prompt_checkpoint_rendered_bytes = cache.rendered_prompt_bytes(
@@ -827,6 +832,11 @@ def generate_step(
             f"manifest_loaded={int(prompt_checkpoint_lookup_stats.get('manifest_loaded', False))} "
             f"manifest_bootstrap={int(prompt_checkpoint_lookup_stats.get('manifest_bootstrap', False))} "
             f"manifest_missing_entries_removed={prompt_checkpoint_lookup_stats.get('manifest_missing_entries_removed', 0)} "
+            f"lcp_index_entries={prompt_checkpoint_lookup_stats.get('lcp_manager_entries', 0)} "
+            f"lcp_token_lengths={prompt_checkpoint_lookup_stats.get('lcp_manager_token_lengths', 0)} "
+            f"lcp_block_lengths={prompt_checkpoint_lookup_stats.get('lcp_manager_block_lengths', 0)} "
+            f"lcp_block_hashes={prompt_checkpoint_lookup_stats.get('lcp_block_hashes_computed', 0)} "
+            f"lcp_block_matches={prompt_checkpoint_lookup_stats.get('lcp_block_hash_matches', 0)} "
             f"lookup_seconds={prompt_checkpoint_lookup_seconds:.6f}"
         )
         candidates = [
@@ -860,6 +870,16 @@ def generate_step(
                         quantized_kv_start=quantized_kv_start,
                     )
                 )
+                expected_cache_layout = (
+                    cache.expected_prompt_cache_layout_signature(
+                        model,
+                        max_kv_size=max_kv_size,
+                        kv_bits=kv_bits,
+                        kv_group_size=kv_group_size,
+                        quantized_kv_start=quantized_kv_start,
+                        cache_token_length=checkpoint_cache_token_length,
+                    )
+                )
                 load_t0 = time.perf_counter()
                 try:
                     prompt_cache, checkpoint_metadata = cache.load_prompt_checkpoint(
@@ -871,6 +891,7 @@ def generate_step(
                             expected_glm_mla_kv_quantization
                         ),
                         expected_glm_mla_kv_settings=expected_glm_mla_kv_settings,
+                        expected_cache_layout=expected_cache_layout,
                         return_metadata=True,
                     )
                     load_seconds = time.perf_counter() - load_t0
@@ -1067,6 +1088,14 @@ def generate_step(
                 kv_group_size=kv_group_size,
                 quantized_kv_start=quantized_kv_start,
             ),
+            cache.expected_prompt_cache_layout_signature(
+                model,
+                max_kv_size=max_kv_size,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+                cache_token_length=checkpoint_cache_token_length,
+            ),
         )
 
     def _update_manifest_for_checkpoint(
@@ -1191,9 +1220,11 @@ def generate_step(
         if label != "frontier" or not os.path.exists(checkpoint_path):
             return False
         prefix_length = len(prefix_tokens)
-        expected_quantization, expected_settings = _expected_checkpoint_metadata(
-            prefix_length
-        )
+        (
+            expected_quantization,
+            expected_settings,
+            expected_cache_layout,
+        ) = _expected_checkpoint_metadata(prefix_length)
         basename = os.path.basename(checkpoint_path)
         try:
             _, checkpoint_metadata = cache.load_prompt_checkpoint(
@@ -1203,6 +1234,7 @@ def generate_step(
                 model=model,
                 expected_glm_mla_kv_quantization=expected_quantization,
                 expected_glm_mla_kv_settings=expected_settings,
+                expected_cache_layout=expected_cache_layout,
                 return_metadata=True,
             )
         except cache.PromptCacheCheckpointError:

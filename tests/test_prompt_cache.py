@@ -30,6 +30,12 @@ from mlx_lm.models.cache import (
     GlmMlaKVCache,
     KVCache,
     PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
+    PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY,
+    PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY,
+    PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY,
+    PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY,
+    PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY,
+    PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY,
     PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY,
     PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY,
     PROMPT_CHECKPOINT_CACHE_DIR_ENV,
@@ -37,13 +43,17 @@ from mlx_lm.models.cache import (
     PROMPT_CHECKPOINT_MAX_BYTES_ENV,
     PROMPT_CHECKPOINT_MAX_FILES_ENV,
     PromptCacheCheckpointError,
+    PromptCheckpointManager,
     QuantizedGlmMlaKVCache,
     QuantizedKVCache,
     RotatingKVCache,
     expected_glm_mla_kv_quantization_metadata,
     expected_glm_mla_kv_settings_metadata,
+    expected_prompt_cache_layout_signature,
+    find_prompt_checkpoint_prefix,
     find_prompt_checkpoint_rendered_prefix,
     ensure_glm52_local_cache_dirs,
+    get_prompt_checkpoint_manager,
     glm52_kv_cache_dir,
     glm52_local_cache_root,
     glm52_prompt_checkpoints_dir,
@@ -54,7 +64,9 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
     prompt_checkpoint_budget_from_env,
     prompt_checkpoint_file,
+    prompt_checkpoint_lcp_block_hash_chain,
     prompt_checkpoint_manifest_file,
+    prompt_cache_layout_signature,
     prompt_cache_token_length,
     prompt_prefix_hash,
     prune_prompt_checkpoints,
@@ -382,6 +394,51 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 model_id="toy-model",
                 prefix_tokens=[1, 2, 3, 4],
             )
+
+    def test_checkpoint_rejects_expected_cache_layout_mismatch(self):
+        cache = self._filled_kv_cache()
+        cache_file = os.path.join(self.test_dir, "checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="toy-model",
+            prefix_tokens=[1, 2, 3, 4],
+        )
+        expected_layout = prompt_cache_layout_signature(
+            [RotatingKVCache(max_size=4)]
+        )
+
+        with self.assertRaisesRegex(PromptCacheCheckpointError, "layout"):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="toy-model",
+                prefix_tokens=[1, 2, 3, 4],
+                expected_cache_layout=expected_layout,
+            )
+
+    def test_expected_cache_layout_tracks_quantization_threshold(self):
+        class ToyModel:
+            layers = [object()]
+
+        fp_layout = expected_prompt_cache_layout_signature(
+            ToyModel(),
+            kv_bits=8,
+            kv_group_size=32,
+            quantized_kv_start=4,
+            cache_token_length=3,
+        )
+        int8_layout = expected_prompt_cache_layout_signature(
+            ToyModel(),
+            kv_bits=8,
+            kv_group_size=32,
+            quantized_kv_start=4,
+            cache_token_length=4,
+        )
+
+        self.assertEqual(fp_layout[0]["class"], "KVCache")
+        self.assertEqual(int8_layout[0]["class"], "QuantizedKVCache")
+        self.assertEqual(int8_layout[0]["group_size"], 32)
+        self.assertEqual(int8_layout[0]["bits"], 8)
 
     def test_checkpoint_rejects_malformed_or_partial_metadata(self):
         cache = self._filled_kv_cache()
@@ -810,6 +867,209 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         for (_, expected), (_, from_hit) in zip(baseline_b, hit_b):
             self.assertTrue(mx.allclose(expected, from_hit).item())
 
+    def test_lcp_checkpoint_manager_finds_longest_token_prefix(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = list(range(1, 16))
+
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    mx.array(prompt_tokens),
+                    model,
+                    max_tokens=1,
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        candidates, stats = find_prompt_checkpoint_prefix(
+            prompt_tokens[:12] + [999],
+            return_stats=True,
+        )
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], 12)
+        self.assertGreater(stats["lcp_manager_block_lengths"], 0)
+
+        candidates, stats = find_prompt_checkpoint_prefix(
+            prompt_tokens[:12] + [999],
+            return_stats=True,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], 12)
+        self.assertEqual(candidates[0][1], prompt_tokens[:12])
+        self.assertEqual(stats["matched_candidates"], 3)
+        self.assertEqual(stats["lcp_manager_entries"], 4)
+        self.assertGreaterEqual(stats["lcp_manager_token_lengths"], 4)
+        self.assertEqual(stats["lcp_block_hash_matches"], 3)
+        self.assertEqual(stats["prefix_hashes_computed"], 0)
+
+    def test_lcp_checkpoint_manager_uses_manifest_block_size(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = list(range(1, 16))
+
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    mx.array(prompt_tokens),
+                    model,
+                    max_tokens=1,
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        manifest = load_prompt_checkpoint_manifest()
+        for entry in manifest["entries"].values():
+            prefix_length = entry["prefix_length"]
+            chain = prompt_checkpoint_lcp_block_hash_chain(
+                prompt_tokens[:prefix_length],
+                block_size=4,
+                extra_hash=entry[PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY],
+            )
+            entry[PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY] = chain["hash"]
+            entry[PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY] = chain["block_size"]
+            entry[PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY] = chain[
+                "block_count"
+            ]
+            entry[PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY] = chain["tokens"]
+        save_prompt_checkpoint_manifest(manifest)
+
+        manager = PromptCheckpointManager.load()
+        candidates, stats = manager.find_token_prefix(
+            prompt_tokens[:12] + [999],
+            return_stats=True,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], 12)
+        self.assertEqual(stats["lcp_block_hash_matches"], 3)
+        self.assertEqual(stats["prefix_hashes_computed"], 0)
+
+    def test_lcp_checkpoint_manager_invalidates_when_file_is_removed(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        common = list(range(1, 13))
+        prompt_a = common + [101, 102, 103]
+        prompt_b = common + [201, 202, 203]
+
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    mx.array(prompt_a),
+                    model,
+                    max_tokens=1,
+                    **self._small_frontier_kwargs(),
+                )
+            )
+        candidates, stats = find_prompt_checkpoint_prefix(
+            prompt_b,
+            return_stats=True,
+        )
+        self.assertEqual(candidates[0][0], 12)
+        self.assertEqual(stats["lcp_manager_entries"], 4)
+
+        os.remove(prompt_checkpoint_file(common))
+        candidates, stats = find_prompt_checkpoint_prefix(
+            prompt_b,
+            return_stats=True,
+        )
+
+        self.assertEqual(candidates[0][0], 8)
+        self.assertEqual(stats["manifest_missing_entries_removed"], 1)
+        self.assertEqual(stats["lcp_manager_entries"], 3)
+
+    def test_lcp_checkpoint_manager_falls_back_when_block_metadata_missing(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = list(range(1, 16))
+
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    mx.array(prompt_tokens),
+                    model,
+                    max_tokens=1,
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        manifest = load_prompt_checkpoint_manifest()
+        lcp_block_keys = (
+            PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY,
+            PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY,
+            PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY,
+            PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY,
+            PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY,
+            PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY,
+        )
+        for entry in manifest["entries"].values():
+            for key in lcp_block_keys:
+                entry.pop(key, None)
+        save_prompt_checkpoint_manifest(manifest)
+
+        manager = PromptCheckpointManager.load()
+        candidates, stats = manager.find_token_prefix(
+            prompt_tokens[:12] + [999],
+            return_stats=True,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], 12)
+        self.assertEqual(stats["matched_candidates"], 3)
+        self.assertEqual(stats["lcp_manager_block_lengths"], 0)
+        self.assertEqual(stats["lcp_block_hash_matches"], 0)
+        self.assertGreater(stats["prefix_hashes_computed"], 0)
+
+    def test_lcp_checkpoint_manager_drops_invalid_block_count(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = list(range(1, 16))
+
+        with self.assertLogs("mlx_lm.generate", level="INFO"):
+            list(
+                generate_step(
+                    mx.array(prompt_tokens),
+                    model,
+                    max_tokens=1,
+                    **self._small_frontier_kwargs(),
+                )
+            )
+
+        candidates, stats = find_prompt_checkpoint_prefix(
+            prompt_tokens[:12] + [999],
+            return_stats=True,
+        )
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], 12)
+        self.assertGreater(stats["lcp_manager_block_lengths"], 0)
+        manager_before = get_prompt_checkpoint_manager()
+
+        manifest = load_prompt_checkpoint_manifest()
+        for entry in manifest["entries"].values():
+            entry[PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY] = (
+                entry[PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY] + 1
+            )
+        save_prompt_checkpoint_manifest(manifest)
+        manager_after = get_prompt_checkpoint_manager()
+        self.assertIsNot(manager_before, manager_after)
+
+        candidates, stats = find_prompt_checkpoint_prefix(
+            prompt_tokens[:12] + [999],
+            return_stats=True,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][0], 12)
+        self.assertEqual(stats["lcp_manager_block_lengths"], 0)
+        self.assertEqual(stats["lcp_block_hash_matches"], 0)
+        self.assertGreater(stats["prefix_hashes_computed"], 0)
+
     def test_prompt_checkpoint_can_skip_final_exact_save(self):
         self._set_home_to_test_dir()
         self._set_prompt_checkpoint_debug()
@@ -896,6 +1156,42 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertTrue(
             all("checkpoint_glm_mla_kv_settings_hash" in entry for entry in entries)
         )
+        self.assertTrue(
+            all(
+                PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY in entry
+                for entry in entries
+            )
+        )
+        self.assertTrue(
+            all(
+                PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY in entry
+                for entry in entries
+            )
+        )
+        self.assertTrue(
+            all(
+                PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY in entry
+                for entry in entries
+            )
+        )
+        self.assertTrue(
+            all(
+                PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY in entry
+                for entry in entries
+            )
+        )
+        self.assertTrue(
+            all(
+                PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY in entry
+                for entry in entries
+            )
+        )
+        self.assertTrue(
+            all(
+                PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY in entry
+                for entry in entries
+            )
+        )
         self.assertIn("manifest update", output)
         self.assertIn("manifest prune", output)
 
@@ -949,6 +1245,37 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertEqual(prefix_tokens, prompt_tokens[:12])
         self.assertEqual(metadata["checkpoint_label"], "frontier")
         self.assertEqual([len(c.caches) for c in loaded_cache], [2, 1, 2, 1])
+
+    def test_lcp_checkpoint_manager_finds_rendered_prefix(self):
+        self._set_home_to_test_dir()
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = list(range(1, 16))
+
+        def decode_prefix(tokens):
+            return "".join(f"<{token}>" for token in tokens)
+
+        rendered_prompt = decode_prefix(prompt_tokens)
+        list(
+            generate_step(
+                mx.array(prompt_tokens),
+                model,
+                max_tokens=1,
+                prompt_checkpoint_rendered_prompt=rendered_prompt,
+                prompt_checkpoint_decode_prefix=decode_prefix,
+                **self._small_frontier_kwargs(),
+            )
+        )
+
+        manager = PromptCheckpointManager.load()
+        candidates, stats = manager.find_rendered_prefix(
+            decode_prefix(prompt_tokens[:12]) + "<extra>",
+            return_stats=True,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][1], 12)
+        self.assertEqual(stats["matched_candidates"], 3)
+        self.assertGreaterEqual(stats["lcp_manager_rendered_lengths"], 3)
 
     def test_prompt_checkpoint_reuses_deepest_frontier_after_restart(self):
         self._set_home_to_test_dir()

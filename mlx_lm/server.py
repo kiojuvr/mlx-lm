@@ -57,6 +57,7 @@ from .models.cache import (
     concat_prompt_caches,
     expected_glm_mla_kv_quantization_metadata,
     expected_glm_mla_kv_settings_metadata,
+    expected_prompt_cache_layout_signature,
     find_prompt_checkpoint_rendered_prefix,
     load_prompt_checkpoint_with_metadata_prefix,
     make_prompt_cache,
@@ -1222,6 +1223,13 @@ class ResponseGenerator:
             kv_group_size=self.cli_args.kv_group_size,
             quantized_kv_start=self.cli_args.quantized_kv_start,
         )
+        expected_cache_layout = expected_prompt_cache_layout_signature(
+            self.model_provider.model,
+            kv_bits=self.cli_args.kv_bits,
+            kv_group_size=self.cli_args.kv_group_size,
+            quantized_kv_start=self.cli_args.quantized_kv_start,
+            cache_token_length=base_prefix_length,
+        )
         base_cache, loaded_base_tokens, _ = (
             load_prompt_checkpoint_with_metadata_prefix(
                 base_path,
@@ -1229,6 +1237,7 @@ class ResponseGenerator:
                 model=self.model_provider.model,
                 expected_glm_mla_kv_quantization=expected_quantization,
                 expected_glm_mla_kv_settings=expected_settings,
+                expected_cache_layout=expected_cache_layout,
                 return_metadata=True,
             )
         )
@@ -1251,7 +1260,7 @@ class ResponseGenerator:
         if not rendered:
             return None
 
-        candidates, _ = find_prompt_checkpoint_rendered_prefix(
+        candidates, lookup_stats = find_prompt_checkpoint_rendered_prefix(
             rendered,
             allowed_kinds=("prefix", "frontier", "continued", "delta", "exact"),
             return_stats=True,
@@ -1259,7 +1268,10 @@ class ResponseGenerator:
         _prompt_checkpoint_debug(
             "rendered lookup result "
             f"rendered_bytes={len(rendered)} "
-            f"candidates={len(candidates)}"
+            f"candidates={len(candidates)} "
+            f"lcp_index_entries={lookup_stats.get('lcp_manager_entries', 0)} "
+            f"lcp_rendered_lengths={lookup_stats.get('lcp_manager_rendered_lengths', 0)} "
+            f"manifest_missing_entries_removed={lookup_stats.get('manifest_missing_entries_removed', 0)}"
         )
         for rendered_prefix_length, token_prefix_length, checkpoint_path, kind in (
             candidates
@@ -1296,6 +1308,13 @@ class ResponseGenerator:
                         kv_group_size=self.cli_args.kv_group_size,
                         quantized_kv_start=self.cli_args.quantized_kv_start,
                     )
+                    expected_cache_layout = expected_prompt_cache_layout_signature(
+                        self.model_provider.model,
+                        kv_bits=self.cli_args.kv_bits,
+                        kv_group_size=self.cli_args.kv_group_size,
+                        quantized_kv_start=self.cli_args.quantized_kv_start,
+                        cache_token_length=checkpoint_cache_token_length,
+                    )
                     prompt_cache, prefix_tokens, metadata = (
                         load_prompt_checkpoint_with_metadata_prefix(
                             checkpoint_path,
@@ -1303,6 +1322,7 @@ class ResponseGenerator:
                             model=self.model_provider.model,
                             expected_glm_mla_kv_quantization=expected_quantization,
                             expected_glm_mla_kv_settings=expected_settings,
+                            expected_cache_layout=expected_cache_layout,
                             return_metadata=True,
                         )
                     )

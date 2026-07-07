@@ -55,9 +55,21 @@ PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY = (
 PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY = (
     "checkpoint_delta_cache_tokens"
 )
+PROMPT_CHECKPOINT_CACHE_LAYOUT_METADATA_KEY = "checkpoint_cache_layout"
+PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY = "checkpoint_cache_layout_hash"
+PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY = "checkpoint_lcp_block_hash"
+PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY = "checkpoint_lcp_block_hash_algo"
+PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY = "checkpoint_lcp_block_size"
+PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY = "checkpoint_lcp_block_count"
+PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY = "checkpoint_lcp_block_tokens"
+PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY = (
+    "checkpoint_lcp_block_extra_hash"
+)
 DEFAULT_PROMPT_CHECKPOINT_MAX_FILES = 256
 DEFAULT_PROMPT_CHECKPOINT_MAX_BYTES = 256 * 1024**3
 DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS = 0
+DEFAULT_PROMPT_CHECKPOINT_LCP_BLOCK_SIZE = 2048
+PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO = "sha256-chain-v1"
 
 _CHECKPOINT_REQUIRED_METADATA_KEYS = (
     "checkpoint_format",
@@ -283,6 +295,120 @@ def prompt_prefix_hash(prefix_tokens):
     return _json_hash(_token_list(prefix_tokens))
 
 
+def _prompt_checkpoint_lcp_extra_hash(metadata):
+    payload = {
+        "namespace": metadata.get("checkpoint_namespace"),
+        "model_hint_hash": metadata.get("checkpoint_model_hint_hash"),
+        "tokenizer_hint_hash": metadata.get("checkpoint_tokenizer_hint_hash"),
+        "glm_mla_kv_quantization": metadata.get("checkpoint_glm_mla_kv_quantization"),
+        "glm_mla_kv_settings": metadata.get("checkpoint_glm_mla_kv_settings"),
+    }
+    return _json_hash(payload)
+
+
+def prompt_checkpoint_lcp_block_hash_chain(
+    prefix_tokens,
+    *,
+    block_size: int = DEFAULT_PROMPT_CHECKPOINT_LCP_BLOCK_SIZE,
+    extra_hash: Optional[str] = None,
+):
+    tokens = _token_list(prefix_tokens)
+    block_size = max(1, int(block_size))
+    parent = "root"
+    block_count = 0
+    for start in range(0, len(tokens), block_size):
+        block = tokens[start : start + block_size]
+        if not block:
+            continue
+        block_hash_payload = {
+            "algo": PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO,
+            "parent": parent,
+            "tokens": block,
+            "extra_hash": extra_hash or "",
+        }
+        parent = _json_hash(block_hash_payload)
+        block_count += 1
+    return {
+        "hash": "" if block_count == 0 else parent,
+        "block_size": block_size,
+        "block_count": block_count,
+        "tokens": len(tokens),
+        "extra_hash": extra_hash or "",
+    }
+
+
+def _prompt_checkpoint_lcp_block_count(block_tokens, block_size):
+    if block_tokens <= 0 or block_size <= 0:
+        return 0
+    return (block_tokens + block_size - 1) // block_size
+
+
+def _prompt_checkpoint_lcp_block_hashes_for_lengths(
+    tokens,
+    prefix_lengths,
+    *,
+    block_size: int,
+    extra_hash: str,
+):
+    block_size = max(1, int(block_size))
+    lengths = sorted({int(length) for length in prefix_lengths if int(length) >= 0})
+    if not lengths:
+        return {}
+
+    max_full_blocks = max(lengths) // block_size
+    full_block_hashes = {0: "root"}
+    parent = "root"
+    for block_number in range(max_full_blocks):
+        start = block_number * block_size
+        block = tokens[start : start + block_size]
+        block_hash_payload = {
+            "algo": PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO,
+            "parent": parent,
+            "tokens": block,
+            "extra_hash": extra_hash or "",
+        }
+        parent = _json_hash(block_hash_payload)
+        full_block_hashes[block_number + 1] = parent
+
+    hashes = {}
+    for length in lengths:
+        if length == 0:
+            hashes[length] = ""
+            continue
+        full_blocks = length // block_size
+        remainder = length % block_size
+        if remainder == 0:
+            hashes[length] = full_block_hashes[full_blocks]
+            continue
+        start = full_blocks * block_size
+        block_hash_payload = {
+            "algo": PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO,
+            "parent": full_block_hashes[full_blocks],
+            "tokens": tokens[start:length],
+            "extra_hash": extra_hash or "",
+        }
+        hashes[length] = _json_hash(block_hash_payload)
+    return hashes
+
+
+def prompt_checkpoint_lcp_block_metadata(prefix_tokens, checkpoint_metadata):
+    extra_hash = _prompt_checkpoint_lcp_extra_hash(checkpoint_metadata)
+    chain = prompt_checkpoint_lcp_block_hash_chain(
+        prefix_tokens,
+        extra_hash=extra_hash,
+    )
+    return {
+        PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY: chain["hash"],
+        PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY: (
+            PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO
+        ),
+        PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY: str(chain["block_size"]),
+        PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY: str(chain["block_count"]),
+        PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY: str(chain["tokens"]),
+        PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY: chain["extra_hash"],
+    }
+
+
 def rendered_prompt_bytes(rendered_prompt):
     if rendered_prompt is None:
         return None
@@ -473,6 +599,45 @@ def _manifest_metadata_rendered_prefix(metadata):
     }
 
 
+def _manifest_metadata_lcp_block(metadata):
+    if not metadata:
+        return {}
+    block_hash = metadata.get(PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY)
+    block_hash_algo = metadata.get(PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY)
+    block_size = _safe_manifest_int(
+        metadata.get(PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY),
+        0,
+    )
+    block_count = _safe_manifest_int(
+        metadata.get(PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY),
+        0,
+    )
+    block_tokens = _safe_manifest_int(
+        metadata.get(PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY),
+        0,
+    )
+    extra_hash = metadata.get(PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY)
+    if (
+        not block_hash
+        or block_hash_algo != PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO
+        or block_size <= 0
+        or block_count <= 0
+        or block_tokens <= 0
+        or block_count
+        != _prompt_checkpoint_lcp_block_count(block_tokens, block_size)
+        or not extra_hash
+    ):
+        return {}
+    return {
+        PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY: str(block_hash),
+        PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY: str(block_hash_algo),
+        PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY: block_size,
+        PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY: block_count,
+        PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY: block_tokens,
+        PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY: str(extra_hash),
+    }
+
+
 def _normalize_manifest_entry(filename, entry):
     if not isinstance(entry, dict):
         return None
@@ -515,6 +680,41 @@ def _normalize_manifest_entry(filename, entry):
         )
         normalized[PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY] = (
             rendered_bytes
+        )
+    block_hash = entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY)
+    block_hash_algo = entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY)
+    block_size = _safe_manifest_int(
+        entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY),
+        0,
+    )
+    block_count = _safe_manifest_int(
+        entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY),
+        0,
+    )
+    block_tokens = _safe_manifest_int(
+        entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY),
+        0,
+    )
+    block_extra_hash = entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY)
+    if (
+        block_hash
+        and block_hash_algo == PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO
+        and block_size > 0
+        and block_count > 0
+        and block_tokens == prefix_length
+        and block_count
+        == _prompt_checkpoint_lcp_block_count(block_tokens, block_size)
+        and block_extra_hash
+    ):
+        normalized[PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY] = str(block_hash)
+        normalized[PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY] = str(
+            block_hash_algo
+        )
+        normalized[PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY] = block_size
+        normalized[PROMPT_CHECKPOINT_LCP_BLOCK_COUNT_METADATA_KEY] = block_count
+        normalized[PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY] = block_tokens
+        normalized[PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY] = str(
+            block_extra_hash
         )
     for key in (
         "checkpoint_namespace",
@@ -586,6 +786,7 @@ def save_prompt_checkpoint_manifest(manifest):
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(manifest, f, sort_keys=True, separators=(",", ":"))
     os.replace(tmp_file, prompt_checkpoint_manifest_file())
+    invalidate_prompt_checkpoint_manager()
 
 
 def _manifest_entry_from_file(filename, *, kind="unknown", metadata=None):
@@ -613,6 +814,7 @@ def _manifest_entry_from_file(filename, *, kind="unknown", metadata=None):
     }
     entry.update(_manifest_metadata_identity(metadata))
     entry.update(_manifest_metadata_rendered_prefix(metadata))
+    entry.update(_manifest_metadata_lcp_block(metadata))
     if metadata:
         for key in (
             PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
@@ -898,6 +1100,264 @@ def prune_prompt_checkpoints(
     }
 
 
+def _path_signature(path):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return (os.path.abspath(path), None, None)
+    return (os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _prompt_checkpoint_manager_signature():
+    return (
+        _path_signature(prompt_checkpoint_manifest_file()),
+        _path_signature(glm52_prompt_checkpoints_dir()),
+    )
+
+
+class PromptCheckpointManager:
+    """
+    Indexed longest-common-prefix lookup over the prompt checkpoint manifest.
+
+    The manager keeps the public lookup semantics unchanged while separating
+    manifest synchronization from token/rendered prefix index queries. Newer
+    entries are matched through a token block-hash chain first, with the legacy
+    full-prefix filename hash retained as a fallback for older checkpoints.
+    """
+
+    def __init__(self, manifest, manifest_stats=None, checkpoint_dir=None):
+        self.manifest = manifest
+        self.manifest_stats = manifest_stats or {}
+        self.checkpoint_dir = checkpoint_dir or glm52_prompt_checkpoints_dir()
+        self.entries = dict(manifest.get("entries", {}))
+        self.token_index = {}
+        self.rendered_index = {}
+        self.block_index = {}
+        self._build_indexes()
+
+    @classmethod
+    def load(cls):
+        manifest, stats = sync_prompt_checkpoint_manifest(bootstrap=True)
+        return cls(manifest, stats)
+
+    def _build_indexes(self):
+        for name, entry in self.entries.items():
+            parsed = _parse_prompt_checkpoint_name(name)
+            if parsed is None:
+                continue
+            hash_part, prefix_length = parsed
+            self.token_index.setdefault(prefix_length, {})[hash_part] = entry
+
+            block_hash = entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY)
+            block_size = _safe_manifest_int(
+                entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY),
+                0,
+            )
+            block_tokens = _safe_manifest_int(
+                entry.get(PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY),
+                0,
+            )
+            block_extra_hash = entry.get(
+                PROMPT_CHECKPOINT_LCP_BLOCK_EXTRA_HASH_METADATA_KEY
+            )
+            if (
+                block_hash
+                and block_size > 0
+                and block_tokens == prefix_length
+                and block_extra_hash
+            ):
+                key = (block_size, str(block_extra_hash), str(block_hash))
+                self.block_index.setdefault(prefix_length, {})[key] = entry
+
+            rendered_hash = entry.get(
+                PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY
+            )
+            rendered_bytes = _safe_manifest_int(
+                entry.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY),
+                0,
+            )
+            if rendered_hash and rendered_bytes > 0:
+                self.rendered_index.setdefault(rendered_bytes, {})[
+                    str(rendered_hash)
+                ] = entry
+
+    def _base_stats(self, hash_counter_name):
+        return {
+            "files_scanned": len(self.entries),
+            "candidate_files_scanned": 0,
+            "candidate_lengths_scanned": 0,
+            hash_counter_name: 0,
+            "matched_candidates": 0,
+            "manifest_entries": len(self.entries),
+            "manifest_loaded": self.manifest_stats.get("loaded", False),
+            "manifest_missing": self.manifest_stats.get("missing", False),
+            "manifest_malformed": self.manifest_stats.get("malformed", False),
+            "manifest_bootstrap": self.manifest_stats.get("bootstrap", False),
+            "manifest_missing_entries_removed": self.manifest_stats.get(
+                "missing_entries_removed",
+                0,
+            ),
+            "lcp_manager_entries": len(self.entries),
+            "lcp_manager_token_lengths": len(self.token_index),
+            "lcp_manager_rendered_lengths": len(self.rendered_index),
+            "lcp_manager_block_lengths": len(self.block_index),
+            "lcp_block_hashes_computed": 0,
+            "lcp_block_hash_matches": 0,
+        }
+
+    def find_token_prefix(
+        self,
+        prefix_tokens,
+        *,
+        min_prefix_length=2,
+        allowed_kinds=("exact", "prefix", "frontier", "continued", "unknown"),
+        return_stats=False,
+    ):
+        tokens = _token_list(prefix_tokens)
+        allowed_kinds = set(allowed_kinds or ())
+        stats = self._base_stats("prefix_hashes_computed")
+
+        by_length = {}
+        for prefix_length, by_hash in self.token_index.items():
+            if prefix_length < min_prefix_length or prefix_length > len(tokens):
+                continue
+            for hash_part, entry in by_hash.items():
+                if allowed_kinds and entry.get("kind") not in allowed_kinds:
+                    continue
+                stats["candidate_files_scanned"] += 1
+                by_length.setdefault(prefix_length, {})[hash_part] = entry
+
+        block_lengths_by_group = {}
+        for prefix_length in by_length:
+            for (block_size, block_extra_hash, _), block_entry in (
+                self.block_index.get(prefix_length, {}).items()
+            ):
+                if allowed_kinds and block_entry.get("kind") not in allowed_kinds:
+                    continue
+                group = (block_size, block_extra_hash)
+                block_lengths_by_group.setdefault(group, set()).add(prefix_length)
+
+        block_hashes_by_group = {}
+        for (block_size, block_extra_hash), prefix_lengths in (
+            block_lengths_by_group.items()
+        ):
+            block_hashes_by_group[(block_size, block_extra_hash)] = (
+                _prompt_checkpoint_lcp_block_hashes_for_lengths(
+                    tokens,
+                    prefix_lengths,
+                    block_size=block_size,
+                    extra_hash=block_extra_hash,
+                )
+            )
+            stats["lcp_block_hashes_computed"] += len(prefix_lengths)
+
+        candidates = []
+        for prefix_length in sorted(by_length, reverse=True):
+            stats["candidate_lengths_scanned"] += 1
+            prefix = tokens[:prefix_length]
+            entry = None
+            for (
+                block_size,
+                block_extra_hash,
+                expected_block_hash,
+            ), block_entry in self.block_index.get(prefix_length, {}).items():
+                if allowed_kinds and block_entry.get("kind") not in allowed_kinds:
+                    continue
+                actual_block_hash = block_hashes_by_group.get(
+                    (block_size, block_extra_hash),
+                    {},
+                ).get(prefix_length)
+                if actual_block_hash == expected_block_hash:
+                    stats["lcp_block_hash_matches"] += 1
+                    entry = block_entry
+                    break
+            if entry is None:
+                prefix_hash = prompt_prefix_hash(prefix)
+                stats["prefix_hashes_computed"] += 1
+                entry = by_length[prefix_length].get(prefix_hash)
+            if entry is None:
+                continue
+            candidates.append(
+                (
+                    prefix_length,
+                    prefix,
+                    os.path.join(self.checkpoint_dir, entry["filename"]),
+                )
+            )
+        stats["matched_candidates"] = len(candidates)
+        return (candidates, stats) if return_stats else candidates
+
+    def find_rendered_prefix(
+        self,
+        rendered_prompt,
+        *,
+        min_prefix_bytes=1,
+        allowed_kinds=("prefix", "frontier", "continued"),
+        return_stats=False,
+    ):
+        rendered = rendered_prompt_bytes(rendered_prompt)
+        if rendered is None:
+            rendered = b""
+        allowed_kinds = set(allowed_kinds or ())
+        stats = self._base_stats("rendered_prefix_hashes_computed")
+
+        by_length = {}
+        for rendered_bytes, by_hash in self.rendered_index.items():
+            if rendered_bytes < min_prefix_bytes or rendered_bytes > len(rendered):
+                continue
+            for rendered_hash, entry in by_hash.items():
+                if allowed_kinds and entry.get("kind") not in allowed_kinds:
+                    continue
+                stats["candidate_files_scanned"] += 1
+                by_length.setdefault(rendered_bytes, {})[rendered_hash] = entry
+
+        candidates = []
+        for rendered_bytes in sorted(by_length, reverse=True):
+            stats["candidate_lengths_scanned"] += 1
+            rendered_hash = hashlib.sha256(rendered[:rendered_bytes]).hexdigest()
+            stats["rendered_prefix_hashes_computed"] += 1
+            entry = by_length[rendered_bytes].get(rendered_hash)
+            if entry is None:
+                continue
+            candidates.append(
+                (
+                    rendered_bytes,
+                    entry["prefix_length"],
+                    os.path.join(self.checkpoint_dir, entry["filename"]),
+                    entry.get("kind", "unknown"),
+                )
+            )
+        stats["matched_candidates"] = len(candidates)
+        return (candidates, stats) if return_stats else candidates
+
+
+_PROMPT_CHECKPOINT_MANAGER = None
+_PROMPT_CHECKPOINT_MANAGER_SIGNATURE = None
+
+
+def invalidate_prompt_checkpoint_manager():
+    global _PROMPT_CHECKPOINT_MANAGER, _PROMPT_CHECKPOINT_MANAGER_SIGNATURE
+    _PROMPT_CHECKPOINT_MANAGER = None
+    _PROMPT_CHECKPOINT_MANAGER_SIGNATURE = None
+
+
+def get_prompt_checkpoint_manager(*, force_reload=False):
+    global _PROMPT_CHECKPOINT_MANAGER, _PROMPT_CHECKPOINT_MANAGER_SIGNATURE
+
+    signature = _prompt_checkpoint_manager_signature()
+    if (
+        not force_reload
+        and _PROMPT_CHECKPOINT_MANAGER is not None
+        and _PROMPT_CHECKPOINT_MANAGER_SIGNATURE == signature
+    ):
+        return _PROMPT_CHECKPOINT_MANAGER
+
+    manager = PromptCheckpointManager.load()
+    _PROMPT_CHECKPOINT_MANAGER = manager
+    _PROMPT_CHECKPOINT_MANAGER_SIGNATURE = _prompt_checkpoint_manager_signature()
+    return manager
+
+
 def find_prompt_checkpoint_prefix(
     prefix_tokens,
     *,
@@ -913,67 +1373,12 @@ def find_prompt_checkpoint_prefix(
     returns longest candidates first so callers can safely fall back to shorter
     checkpoints when a longer file is malformed or rejected.
     """
-    tokens = _token_list(prefix_tokens)
-    allowed_kinds = set(allowed_kinds or ())
-    stats = {
-        "files_scanned": 0,
-        "candidate_files_scanned": 0,
-        "candidate_lengths_scanned": 0,
-        "prefix_hashes_computed": 0,
-        "matched_candidates": 0,
-        "manifest_entries": 0,
-        "manifest_loaded": False,
-        "manifest_missing": False,
-        "manifest_malformed": False,
-        "manifest_bootstrap": False,
-        "manifest_missing_entries_removed": 0,
-    }
-    manifest, manifest_stats = sync_prompt_checkpoint_manifest(bootstrap=True)
-    stats["manifest_entries"] = len(manifest["entries"])
-    stats["manifest_loaded"] = manifest_stats.get("loaded", False)
-    stats["manifest_missing"] = manifest_stats.get("missing", False)
-    stats["manifest_malformed"] = manifest_stats.get("malformed", False)
-    stats["manifest_bootstrap"] = manifest_stats.get("bootstrap", False)
-    stats["manifest_missing_entries_removed"] = manifest_stats.get(
-        "missing_entries_removed",
-        0,
+    return get_prompt_checkpoint_manager().find_token_prefix(
+        prefix_tokens,
+        min_prefix_length=min_prefix_length,
+        allowed_kinds=allowed_kinds,
+        return_stats=return_stats,
     )
-
-    by_length = {}
-    for name, entry in manifest["entries"].items():
-        stats["files_scanned"] += 1
-        if allowed_kinds and entry.get("kind") not in allowed_kinds:
-            continue
-        parsed = _parse_prompt_checkpoint_name(name)
-        if parsed is None:
-            continue
-        hash_part, prefix_length = parsed
-        if (
-            prefix_length < min_prefix_length
-            or prefix_length > len(tokens)
-        ):
-            continue
-        stats["candidate_files_scanned"] += 1
-        by_length.setdefault(prefix_length, {})[hash_part] = name
-
-    candidates = []
-    for prefix_length in sorted(by_length, reverse=True):
-        stats["candidate_lengths_scanned"] += 1
-        prefix = tokens[:prefix_length]
-        prefix_hash = prompt_prefix_hash(prefix)
-        stats["prefix_hashes_computed"] += 1
-        name = by_length[prefix_length].get(prefix_hash)
-        if name is None:
-            continue
-        candidates.append(
-            (
-                prefix_length,
-                prefix,
-                os.path.join(glm52_prompt_checkpoints_dir(), name),
-            )
-        )
-    stats["matched_candidates"] = len(candidates)
-    return (candidates, stats) if return_stats else candidates
 
 
 def find_prompt_checkpoint_rendered_prefix(
@@ -990,71 +1395,12 @@ def find_prompt_checkpoint_rendered_prefix(
     prefix in metadata. This lets server code load the stored token prefix and
     tokenize only the rendered suffix, avoiding tokenizer-boundary merge drift.
     """
-    rendered = rendered_prompt_bytes(rendered_prompt)
-    if rendered is None:
-        rendered = b""
-    allowed_kinds = set(allowed_kinds or ())
-    stats = {
-        "files_scanned": 0,
-        "candidate_files_scanned": 0,
-        "candidate_lengths_scanned": 0,
-        "rendered_prefix_hashes_computed": 0,
-        "matched_candidates": 0,
-        "manifest_entries": 0,
-        "manifest_loaded": False,
-        "manifest_missing": False,
-        "manifest_malformed": False,
-        "manifest_bootstrap": False,
-        "manifest_missing_entries_removed": 0,
-    }
-    manifest, manifest_stats = sync_prompt_checkpoint_manifest(bootstrap=True)
-    stats["manifest_entries"] = len(manifest["entries"])
-    stats["manifest_loaded"] = manifest_stats.get("loaded", False)
-    stats["manifest_missing"] = manifest_stats.get("missing", False)
-    stats["manifest_malformed"] = manifest_stats.get("malformed", False)
-    stats["manifest_bootstrap"] = manifest_stats.get("bootstrap", False)
-    stats["manifest_missing_entries_removed"] = manifest_stats.get(
-        "missing_entries_removed",
-        0,
+    return get_prompt_checkpoint_manager().find_rendered_prefix(
+        rendered_prompt,
+        min_prefix_bytes=min_prefix_bytes,
+        allowed_kinds=allowed_kinds,
+        return_stats=return_stats,
     )
-
-    by_length = {}
-    for name, entry in manifest["entries"].items():
-        stats["files_scanned"] += 1
-        if allowed_kinds and entry.get("kind") not in allowed_kinds:
-            continue
-        rendered_hash = entry.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY)
-        rendered_bytes = _safe_manifest_int(
-            entry.get(PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY),
-            0,
-        )
-        if (
-            not rendered_hash
-            or rendered_bytes < min_prefix_bytes
-            or rendered_bytes > len(rendered)
-        ):
-            continue
-        stats["candidate_files_scanned"] += 1
-        by_length.setdefault(rendered_bytes, {})[rendered_hash] = entry
-
-    candidates = []
-    for rendered_bytes in sorted(by_length, reverse=True):
-        stats["candidate_lengths_scanned"] += 1
-        rendered_hash = hashlib.sha256(rendered[:rendered_bytes]).hexdigest()
-        stats["rendered_prefix_hashes_computed"] += 1
-        entry = by_length[rendered_bytes].get(rendered_hash)
-        if entry is None:
-            continue
-        candidates.append(
-            (
-                rendered_bytes,
-                entry["prefix_length"],
-                os.path.join(glm52_prompt_checkpoints_dir(), entry["filename"]),
-                entry.get("kind", "unknown"),
-            )
-        )
-    stats["matched_candidates"] = len(candidates)
-    return (candidates, stats) if return_stats else candidates
 
 
 def _model_config_dict(model):
@@ -1171,6 +1517,89 @@ def _cache_quantization_signature(cache):
     if cache_type in ("GlmMlaKVCache", "BatchGlmMlaKVCache"):
         return {"scheme": "glm_mla_latent_fp"}
     return None
+
+
+def _cache_layout_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if hasattr(value, "item"):
+        try:
+            item = value.item()
+            if isinstance(item, (bool, int)):
+                return item
+        except Exception:
+            pass
+    return None
+
+
+def _single_cache_layout_signature(cache):
+    entry = {
+        "class": type(cache).__name__,
+        "quantization": _cache_quantization_signature(cache),
+    }
+    if hasattr(cache, "caches"):
+        entry["caches"] = [
+            _single_cache_layout_signature(c) for c in cache.caches
+        ]
+        return entry
+
+    for attr in ("max_size", "keep", "group_size", "bits", "chunk_size"):
+        if not hasattr(cache, attr):
+            continue
+        value = _cache_layout_value(getattr(cache, attr))
+        if value is not None:
+            entry[attr] = value
+    return entry
+
+
+def prompt_cache_layout_signature(cache: List[Any]):
+    """
+    Describe cache compatibility without including runtime offset or data shape.
+
+    ``prompt_cache_signature`` is the integrity check for the loaded checkpoint
+    tensors. This layout signature answers the separate question: can this
+    checkpoint be reused by the cache layout requested for the current run?
+    """
+    return [_single_cache_layout_signature(c) for c in cache]
+
+
+def expected_prompt_cache_layout_signature(
+    model: Optional[nn.Module],
+    *,
+    max_kv_size: Optional[int] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    cache_token_length: Optional[int] = None,
+    prompt_cache: Optional[List[Any]] = None,
+):
+    if prompt_cache is not None:
+        return prompt_cache_layout_signature(prompt_cache)
+    if model is None:
+        return None
+
+    try:
+        expected_cache = make_prompt_cache(model, max_kv_size=max_kv_size)
+    except AttributeError:
+        return None
+    if (
+        kv_bits is not None
+        and cache_token_length is not None
+        and cache_token_length >= quantized_kv_start
+    ):
+        for idx, cache_entry in enumerate(expected_cache):
+            if not hasattr(cache_entry, "to_quantized"):
+                continue
+            try:
+                expected_cache[idx] = cache_entry.to_quantized(
+                    group_size=kv_group_size,
+                    bits=kv_bits,
+                )
+            except NotImplementedError:
+                pass
+    return prompt_cache_layout_signature(expected_cache)
 
 
 def glm_mla_kv_quantization_metadata(cache: List[Any]):
@@ -1320,6 +1749,7 @@ def build_prompt_cache_checkpoint_metadata(
         quantized_kv_start=quantized_kv_start,
     )
     cache_signature = prompt_cache_signature(cache)
+    cache_layout_signature = prompt_cache_layout_signature(cache)
 
     checkpoint_metadata = {
         "checkpoint_format": PROMPT_CACHE_CHECKPOINT_FORMAT,
@@ -1333,6 +1763,12 @@ def build_prompt_cache_checkpoint_metadata(
         "checkpoint_prefix_length": str(len(prefix)),
         "checkpoint_cache_signature_hash": _json_hash(cache_signature),
         "checkpoint_cache_signature": _json_dumps(cache_signature),
+        PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY: _json_hash(
+            cache_layout_signature
+        ),
+        PROMPT_CHECKPOINT_CACHE_LAYOUT_METADATA_KEY: _json_dumps(
+            cache_layout_signature
+        ),
         "checkpoint_model_hint_metadata": _json_dumps(model_info),
         "checkpoint_tokenizer_hint_metadata": _json_dumps(tokenizer_info),
         "checkpoint_glm_dsa_metadata": _json_dumps(glm_dsa_info),
@@ -1345,6 +1781,9 @@ def build_prompt_cache_checkpoint_metadata(
         "model": model_id,
         "tokenizer_config": json.dumps(tokenizer_config or {}),
     }
+    checkpoint_metadata.update(
+        prompt_checkpoint_lcp_block_metadata(prefix, checkpoint_metadata)
+    )
     if metadata:
         extra_metadata = {str(k): str(v) for k, v in metadata.items()}
         reserved = set(checkpoint_metadata)
@@ -1429,6 +1868,7 @@ def _validate_checkpoint_metadata(
     tokenizer_config: Optional[Dict[str, Any]],
     expected_glm_mla_kv_quantization: Optional[Dict[str, Any]],
     expected_glm_mla_kv_settings: Optional[Dict[str, Any]],
+    expected_cache_layout: Optional[List[Any]] = None,
 ):
     _require_checkpoint_metadata(metadata)
     if _require_metadata(metadata, "checkpoint_format") != PROMPT_CACHE_CHECKPOINT_FORMAT:
@@ -1482,6 +1922,29 @@ def _validate_checkpoint_metadata(
     ):
         raise PromptCacheCheckpointError("checkpoint cache signature does not match")
 
+    cache_layout = prompt_cache_layout_signature(cache)
+    if (
+        PROMPT_CHECKPOINT_CACHE_LAYOUT_METADATA_KEY in metadata
+        or PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY in metadata
+    ):
+        saved_cache_layout = _metadata_json(
+            metadata, PROMPT_CHECKPOINT_CACHE_LAYOUT_METADATA_KEY
+        )
+        if (
+            saved_cache_layout != cache_layout
+            or _require_metadata(
+                metadata, PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY
+            )
+            != _json_hash(cache_layout)
+        ):
+            raise PromptCacheCheckpointError(
+                "checkpoint cache layout metadata does not match"
+            )
+    if expected_cache_layout is not None and cache_layout != expected_cache_layout:
+        raise PromptCacheCheckpointError(
+            "checkpoint cache layout does not match current run"
+        )
+
     saved_glm_dsa = _metadata_json(metadata, "checkpoint_glm_dsa_metadata")
     current_glm_dsa = _glm_dsa_metadata(model)
     if saved_glm_dsa != current_glm_dsa:
@@ -1527,6 +1990,7 @@ def load_prompt_checkpoint(
     tokenizer_config: Optional[Dict[str, Any]] = None,
     expected_glm_mla_kv_quantization: Optional[Dict[str, Any]] = None,
     expected_glm_mla_kv_settings: Optional[Dict[str, Any]] = None,
+    expected_cache_layout: Optional[List[Any]] = None,
     return_metadata: bool = False,
 ):
     try:
@@ -1547,6 +2011,7 @@ def load_prompt_checkpoint(
         tokenizer_config=tokenizer_config,
         expected_glm_mla_kv_quantization=expected_glm_mla_kv_quantization,
         expected_glm_mla_kv_settings=expected_glm_mla_kv_settings,
+        expected_cache_layout=expected_cache_layout,
     )
     if return_metadata:
         return cache, metadata
@@ -1564,6 +2029,7 @@ def load_prompt_checkpoint_with_metadata_prefix(
     tokenizer_config: Optional[Dict[str, Any]] = None,
     expected_glm_mla_kv_quantization: Optional[Dict[str, Any]] = None,
     expected_glm_mla_kv_settings: Optional[Dict[str, Any]] = None,
+    expected_cache_layout: Optional[List[Any]] = None,
     return_metadata: bool = False,
 ):
     try:
@@ -1585,6 +2051,7 @@ def load_prompt_checkpoint_with_metadata_prefix(
         tokenizer_config=tokenizer_config,
         expected_glm_mla_kv_quantization=expected_glm_mla_kv_quantization,
         expected_glm_mla_kv_settings=expected_glm_mla_kv_settings,
+        expected_cache_layout=expected_cache_layout,
     )
     if return_metadata:
         return cache, prefix_tokens, metadata
