@@ -29,6 +29,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.server import (
     APIHandler,
+    DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
@@ -658,7 +659,13 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator._stop = False
         generator._shutdown_complete = False
-        generator._generation_thread = types.SimpleNamespace(join=mock.Mock())
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(generation_shutdown_timeout=0)
+        )
+        generator._generation_thread = types.SimpleNamespace(
+            join=mock.Mock(),
+            is_alive=mock.Mock(return_value=True),
+        )
         generator.flush_shutdown_prompt_checkpoints = mock.Mock(return_value={})
         generator.prune_shutdown_prompt_checkpoints = mock.Mock(return_value={})
 
@@ -666,9 +673,10 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
             generator.stop_and_join()
 
         self.assertTrue(generator._stop)
-        generator._generation_thread.join.assert_called_once()
+        generator._generation_thread.join.assert_called_once_with(timeout=0.0)
         logs = "\n".join(captured.output)
         self.assertIn("Shutdown requested", logs)
+        self.assertIn("Generation worker still active", logs)
         self.assertIn("Shutdown sequence started", logs)
         self.assertIn("Shutdown sequence complete", logs)
 
@@ -932,6 +940,10 @@ class TestServerCLI(unittest.TestCase):
             args.checkpoint_shutdown_max_tokens,
             DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
         )
+        self.assertEqual(
+            args.generation_shutdown_timeout,
+            DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
+        )
         self.assertEqual(args.loop_guard_ngram_size, 64)
         self.assertEqual(args.loop_guard_repeats, 3)
         self.assertEqual(args.loop_guard_min_tokens, 256)
@@ -1033,6 +1045,8 @@ class TestServerCLI(unittest.TestCase):
                 "2",
                 "--checkpoint-shutdown-max-tokens",
                 "32768",
+                "--generation-shutdown-timeout",
+                "1.5",
             ]
         )
 
@@ -1045,6 +1059,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.checkpoint_save_exact, "disabled")
         self.assertEqual(args.checkpoint_shutdown_save_limit, 2)
         self.assertEqual(args.checkpoint_shutdown_max_tokens, 32768)
+        self.assertEqual(args.generation_shutdown_timeout, 1.5)
 
     def test_setup_arg_parser_no_save_exact_checkpoint_alias(self):
         args = setup_arg_parser().parse_args(["--no-save-exact-checkpoint"])

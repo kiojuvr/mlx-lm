@@ -84,6 +84,7 @@ DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS = 2048
 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS = 10_000
 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT = 0
 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS = 65_536
+DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 
 
 def get_system_fingerprint():
@@ -342,6 +343,15 @@ def _prompt_checkpoint_save_exact_for_prompt(args, token_count):
     except (TypeError, ValueError):
         return False
     return cold_max_tokens <= 0 or token_count <= cold_max_tokens
+
+
+def _generation_shutdown_timeout_seconds(args):
+    if args is None:
+        return DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS
+    try:
+        return max(float(getattr(args, "generation_shutdown_timeout", 0.0)), 0.0)
+    except (TypeError, ValueError):
+        return DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS
 
 
 def _prompt_checkpoint_boundary_store_length(
@@ -766,16 +776,25 @@ class ResponseGenerator:
         self._rank = mx.distributed.init().rank()
         self._stop = False
         self._shutdown_complete = False
-        self._generation_thread = Thread(target=self._generate)
+        self._generation_thread = Thread(target=self._generate, daemon=True)
         self._generation_thread.start()
 
     def stop_and_join(self):
+        cli_args = getattr(getattr(self, "model_provider", None), "cli_args", None)
+        generation_timeout = _generation_shutdown_timeout_seconds(cli_args)
         logging.info(
             "Shutdown requested: asking generation worker to stop. "
-            "Waiting for active generation or prompt checkpoint saves to finish..."
+            "Waiting up to %.3fs for active generation to finish...",
+            generation_timeout,
         )
         self._stop = True
-        self._generation_thread.join()
+        self._generation_thread.join(timeout=generation_timeout)
+        is_alive = getattr(self._generation_thread, "is_alive", lambda: False)
+        if is_alive():
+            logging.warning(
+                "Generation worker still active after %.3fs; continuing shutdown.",
+                generation_timeout,
+            )
         self.shutdown()
 
     def join(self):
@@ -3889,6 +3908,17 @@ def setup_arg_parser():
             "server shutdown when --checkpoint-shutdown-save-limit is enabled. "
             "Use 0 to disable this cap "
             f"(default: {DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--generation-shutdown-timeout",
+        type=float,
+        default=DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
+        help=(
+            "Seconds to wait for the generation worker during server shutdown. "
+            "Use 0 to continue shutdown immediately when model loading or "
+            "generation is still active "
+            f"(default: {DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS})."
         ),
     )
     parser.add_argument(
