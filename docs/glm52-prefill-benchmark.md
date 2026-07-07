@@ -716,7 +716,10 @@ length should equal the expected prefix:
   "fresh_prompt_tokens": 2048,
   "fresh_prefill_tokens": 2047,
   "checkpoint_resolution": "prefix",
-  "checkpoint_expected_match": true
+  "checkpoint_expected_match": true,
+  "checkpoint_lcp_block_matches": 1,
+  "checkpoint_prefix_hashes": 0,
+  "checkpoint_cache_layout_rejections": 0
 }
 ```
 
@@ -733,7 +736,9 @@ For the 8192+2048 int8 case, the expected accounting is:
   "fresh_prefill_tokens": 2047,
   "checkpoint_resolution": "prefix",
   "checkpoint_expected_match": true,
-  "checkpoint_save_exact": "disabled"
+  "checkpoint_save_exact": "disabled",
+  "checkpoint_lcp_block_matches": 1,
+  "checkpoint_cache_layout_rejections": 0
 }
 ```
 

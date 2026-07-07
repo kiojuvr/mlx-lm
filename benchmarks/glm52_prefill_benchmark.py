@@ -329,12 +329,62 @@ def extract_checkpoint_summary(messages):
         "checkpoint_lookup_seconds": None,
         "checkpoint_files_scanned": None,
         "checkpoint_candidates_scanned": None,
+        "checkpoint_candidate_lengths_scanned": None,
         "checkpoint_matched_candidates": None,
+        "checkpoint_prefix_hashes": None,
         "checkpoint_manifest_entries": None,
+        "checkpoint_manifest_loaded": None,
         "checkpoint_manifest_bootstrap": None,
+        "checkpoint_manifest_missing_entries_removed": None,
+        "checkpoint_lcp_index_entries": None,
+        "checkpoint_lcp_token_lengths": None,
+        "checkpoint_lcp_block_lengths": None,
+        "checkpoint_lcp_block_hashes": None,
+        "checkpoint_lcp_block_matches": None,
+        "checkpoint_cache_layout_rejections": None,
         "checkpoint_events": len(messages),
     }
+
+    def update_lookup_fields(message, *, include_resolution=False):
+        for key, value in re.findall(r"([a-z0-9_]+)=([^ ]+)", message):
+            output_key = {
+                "files_scanned": "checkpoint_files_scanned",
+                "candidates_scanned": "checkpoint_candidates_scanned",
+                "candidate_lengths": "checkpoint_candidate_lengths_scanned",
+                "matched_candidates": "checkpoint_matched_candidates",
+                "prefix_hashes": "checkpoint_prefix_hashes",
+                "manifest_entries": "checkpoint_manifest_entries",
+                "manifest_loaded": "checkpoint_manifest_loaded",
+                "manifest_bootstrap": "checkpoint_manifest_bootstrap",
+                "manifest_missing_entries_removed": (
+                    "checkpoint_manifest_missing_entries_removed"
+                ),
+                "lcp_index_entries": "checkpoint_lcp_index_entries",
+                "lcp_token_lengths": "checkpoint_lcp_token_lengths",
+                "lcp_block_lengths": "checkpoint_lcp_block_lengths",
+                "lcp_block_hashes": "checkpoint_lcp_block_hashes",
+                "lcp_block_matches": "checkpoint_lcp_block_matches",
+                "cache_layout_rejections": "checkpoint_cache_layout_rejections",
+                "lookup_seconds": "checkpoint_lookup_seconds",
+                "resolution": "checkpoint_resolution",
+            }.get(key)
+            if output_key is None or output_key not in summary:
+                continue
+            if output_key == "checkpoint_resolution":
+                if include_resolution:
+                    summary[output_key] = value
+            elif output_key == "checkpoint_lookup_seconds":
+                summary[output_key] = float(value)
+            elif value == "None":
+                summary[output_key] = None
+            else:
+                summary[output_key] = int(value)
+
     for message in messages:
+        if "lookup result " in message:
+            update_lookup_fields(message)
+            continue
+
         if "prefill summary " in message:
             for key, value in re.findall(r"([a-z0-9_]+)=([^ ]+)", message):
                 output_key = {
@@ -350,12 +400,6 @@ def extract_checkpoint_summary(messages):
                     "glm_dsa_adaptive_prefill_min_remaining_tokens": (
                         "checkpoint_glm_dsa_adaptive_prefill_min_remaining_tokens"
                     ),
-                    "files_scanned": "checkpoint_files_scanned",
-                    "candidates_scanned": "checkpoint_candidates_scanned",
-                    "matched_candidates": "checkpoint_matched_candidates",
-                    "manifest_entries": "checkpoint_manifest_entries",
-                    "manifest_bootstrap": "checkpoint_manifest_bootstrap",
-                    "lookup_seconds": "checkpoint_lookup_seconds",
                     "resolution": "checkpoint_resolution",
                 }.get(key, key)
                 if output_key not in summary:
@@ -368,6 +412,7 @@ def extract_checkpoint_summary(messages):
                     summary[output_key] = None
                 else:
                     summary[output_key] = int(value)
+            update_lookup_fields(message, include_resolution=True)
             continue
 
         if "prefill chunk " not in message:
@@ -1778,9 +1823,19 @@ def print_table(rows, output_format):
         "checkpoint_lookup_seconds",
         "checkpoint_files_scanned",
         "checkpoint_candidates_scanned",
+        "checkpoint_candidate_lengths_scanned",
         "checkpoint_matched_candidates",
+        "checkpoint_prefix_hashes",
         "checkpoint_manifest_entries",
+        "checkpoint_manifest_loaded",
         "checkpoint_manifest_bootstrap",
+        "checkpoint_manifest_missing_entries_removed",
+        "checkpoint_lcp_index_entries",
+        "checkpoint_lcp_token_lengths",
+        "checkpoint_lcp_block_lengths",
+        "checkpoint_lcp_block_hashes",
+        "checkpoint_lcp_block_matches",
+        "checkpoint_cache_layout_rejections",
         "prefill_stopped_early",
         "prefill_stop_after_tokens",
         "partial_prefill_tokens",

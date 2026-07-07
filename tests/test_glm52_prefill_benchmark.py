@@ -16,6 +16,18 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         summary = benchmark.extract_checkpoint_summary(
             [
                 (
+                    "prompt checkpoint: lookup result "
+                    "file=abc-8192.safetensors prefix_length=8192 "
+                    "files_scanned=4 candidates_scanned=3 candidate_lengths=2 "
+                    "matched_candidates=1 prefix_hashes=0 manifest_entries=4 "
+                    "manifest_loaded=1 manifest_bootstrap=0 "
+                    "manifest_missing_entries_removed=1 "
+                    "lcp_index_entries=4 lcp_token_lengths=3 "
+                    "lcp_block_lengths=2 lcp_block_hashes=2 "
+                    "lcp_block_matches=1 cache_layout_rejections=1 "
+                    "lookup_seconds=0.001234"
+                ),
+                (
                     "prompt checkpoint: prefill summary "
                     "total_prompt_tokens=8192 server_cached_tokens=0 "
                     "disk_cached_tokens=6144 fresh_prompt_tokens=2048 "
@@ -26,7 +38,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "glm_dsa_adaptive_prefill_min_remaining_tokens=2048 "
                     "resolution=prefix files_scanned=1 candidates_scanned=1 "
                     "matched_candidates=1 manifest_entries=1 "
-                    "manifest_bootstrap=0 lookup_seconds=0.001234"
+                    "manifest_bootstrap=0 cache_layout_rejections=1 "
+                    "lookup_seconds=0.001234"
                 ),
                 (
                     "prompt checkpoint: prefill chunk start_tokens=6144 "
@@ -49,6 +62,16 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(summary["fresh_prefill_tokens"], 2047)
         self.assertEqual(summary["checkpoint_resolution"], "prefix")
         self.assertEqual(summary["checkpoint_lookup_seconds"], 0.001234)
+        self.assertEqual(summary["checkpoint_candidate_lengths_scanned"], 2)
+        self.assertEqual(summary["checkpoint_prefix_hashes"], 0)
+        self.assertEqual(summary["checkpoint_manifest_loaded"], 1)
+        self.assertEqual(summary["checkpoint_manifest_missing_entries_removed"], 1)
+        self.assertEqual(summary["checkpoint_lcp_index_entries"], 4)
+        self.assertEqual(summary["checkpoint_lcp_token_lengths"], 3)
+        self.assertEqual(summary["checkpoint_lcp_block_lengths"], 2)
+        self.assertEqual(summary["checkpoint_lcp_block_hashes"], 2)
+        self.assertEqual(summary["checkpoint_lcp_block_matches"], 1)
+        self.assertEqual(summary["checkpoint_cache_layout_rejections"], 1)
         self.assertEqual(summary["checkpoint_prefill_max_qk_tokens"], 67108864)
         self.assertEqual(
             summary["checkpoint_glm_dsa_adaptive_prefill_step_size"], 8192
