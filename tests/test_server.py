@@ -24,13 +24,16 @@ from mlx_lm.models.cache import (
     PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY,
+    materialize_prompt_cache,
     prompt_cache_token_length,
     prompt_prefix_hash,
+    slice_prompt_cache,
 )
 from mlx_lm.server import (
     APIHandler,
     DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
@@ -39,10 +42,12 @@ from mlx_lm.server import (
     DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
+    GlobalSessionLoopGuard,
     LRUPromptCache,
     RenderedPromptCheckpoint,
     Response,
     ResponseGenerator,
+    TextLoopGuard,
     TokenLoopGuard,
     _prompt_checkpoint_boundary_store_length,
     _prompt_checkpoint_continued_frontier_args,
@@ -128,8 +133,19 @@ class DummyModelProvider:
                 "loop_guard_min_tokens": 256,
                 "decode_progress_interval_tokens": 0,
                 "tool_call_max_tokens": 0,
+                "session_loop_history_size": 256,
+                "session_loop_max_no_progress_turns": 0,
+                "session_loop_repeated_output_limit": 0,
+                "session_loop_repeated_action_limit": 0,
+                "reasoning_max_tokens": 0,
+                "reasoning_loop_guard_min_chars": 0,
+                "reasoning_loop_guard_repeats": 4,
+                "reasoning_loop_guard_max_span_chars": 2048,
                 "prefill_progress_interval_tokens": 0,
                 "checkpoint_save_exact": "enabled",
+                "checkpoint_async_save_backlog_limit": (
+                    DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT
+                ),
             },
         )
 
@@ -252,6 +268,131 @@ class TestTokenLoopGuard(unittest.TestCase):
         guard = TokenLoopGuard(ngram_size=0, repeats=3, min_tokens=0)
 
         self.assertFalse(any(guard.append(t) for t in [1, 2, 3, 4] * 5))
+
+
+class TestTextLoopGuard(unittest.TestCase):
+    def test_detects_repeated_long_text_span(self):
+        guard = TextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+        )
+        span = (
+            "Actually, I need to inspect the setup again because the approval "
+            "record must already exist before request import. "
+        )
+        results = [guard.append(span) for _ in range(4)]
+
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+        self.assertEqual(guard.last_decision.repeats, 4)
+        self.assertGreaterEqual(guard.last_decision.span_chars, 60)
+
+    def test_ignores_short_repeated_span(self):
+        guard = TextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+        )
+
+        self.assertFalse(any(guard.append("Wait. ") for _ in range(8)))
+
+    def test_detects_repeated_reasoning_block_with_interleaving(self):
+        guard = TextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+        )
+        block = (
+            "The approval must already exist before request import because "
+            "the request command only stores the request file."
+        )
+        spacer = "Let me inspect the setup again from a different angle."
+
+        for idx in range(3):
+            self.assertFalse(guard.append(f"{block}\n\n{spacer} {idx}\n\n"))
+
+        self.assertTrue(guard.append(block))
+        self.assertEqual(guard.last_decision.repeats, 4)
+        self.assertIn("approval must already exist", guard.last_decision.sample)
+
+
+class TestGlobalSessionLoopGuard(unittest.TestCase):
+    @staticmethod
+    def _args(**overrides):
+        values = {
+            "session_loop_history_size": 256,
+            "session_loop_max_no_progress_turns": 0,
+            "session_loop_repeated_output_limit": 0,
+            "session_loop_repeated_action_limit": 0,
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def test_global_guard_ignores_tool_call_turns(self):
+        guard = GlobalSessionLoopGuard()
+        args = self._args(session_loop_max_no_progress_turns=1)
+
+        for idx in range(3):
+            guard.observe(
+                request_id=f"r{idx}",
+                finish_reason="tool_calls",
+                made_tool_call=True,
+            )
+
+        self.assertIsNone(guard.decision(args))
+
+    def test_visible_text_resets_no_progress_turns(self):
+        guard = GlobalSessionLoopGuard()
+        args = self._args(session_loop_max_no_progress_turns=2)
+
+        guard.observe(request_id="r1", finish_reason="length", made_tool_call=False)
+        guard.observe(
+            request_id="r2",
+            finish_reason="stop",
+            made_tool_call=False,
+            visible_text="I summarized the current state.",
+        )
+        guard.observe(request_id="r3", finish_reason="length", made_tool_call=False)
+
+        self.assertIsNone(guard.decision(args))
+
+    def test_detects_repeated_visible_output_signature(self):
+        guard = GlobalSessionLoopGuard()
+        args = self._args(session_loop_repeated_output_limit=3)
+
+        for idx in range(3):
+            guard.observe(
+                request_id=f"r{idx}",
+                finish_reason="stop",
+                made_tool_call=False,
+                visible_text="The same visible answer is repeated again.",
+            )
+
+        decision = guard.decision(args)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.reason, "global_repeated_output_signature")
+        self.assertEqual(decision.count, 3)
+
+    def test_detects_repeated_action_signature_inside_pool(self):
+        guard = GlobalSessionLoopGuard()
+        args = self._args(session_loop_repeated_action_limit=3)
+
+        for idx in range(3):
+            guard.observe(
+                request_id=f"r{idx}",
+                finish_reason="tool_calls",
+                made_tool_call=True,
+                action_text='{"name":"read","arguments":{"file":"a.py"}}',
+            )
+
+        decision = guard.decision(args)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.reason, "global_repeated_action_signature")
+        self.assertEqual(decision.count, 3)
 
 
 class TestPromptCheckpointPolicy(unittest.TestCase):
@@ -487,6 +628,12 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
             "mlx_lm.server.save_prompt_checkpoint",
             fake_save_prompt_checkpoint,
         ), mock.patch(
+            "mlx_lm.server.materialize_prompt_cache",
+            wraps=materialize_prompt_cache,
+        ) as materialize, mock.patch(
+            "mlx_lm.server.time.perf_counter",
+            side_effect=[1.0, 1.25],
+        ), mock.patch(
             "mlx_lm.server.update_prompt_checkpoint_manifest"
         ) as update_manifest, mock.patch(
             "mlx_lm.server.prune_prompt_checkpoints"
@@ -500,6 +647,7 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
             )
 
         self.assertTrue(saved)
+        materialize.assert_called_once()
         self.assertEqual(prompt_cache_token_length(captured["cache"]), 2)
         self.assertEqual(captured["kwargs"]["prefix_tokens"], cache_key)
         metadata = captured["kwargs"]["metadata"]
@@ -515,6 +663,65 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         update_manifest.assert_called_once()
         self.assertEqual(update_manifest.call_args.kwargs["kind"], "delta")
         prune.assert_called_once()
+
+    def test_save_delta_prompt_checkpoint_uses_prepared_delta_cache(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=cli_args,
+        )
+        tokenizer = types.SimpleNamespace(
+            decode=lambda tokens, **kwargs: "".join(f"<{token}>" for token in tokens)
+        )
+        prompt_cache = [KVCache()]
+        keys = mx.array(list(range(10)), dtype=mx.float32).reshape(1, 1, 5, 2)
+        prompt_cache[0].update_and_fetch(keys, keys + 100)
+        delta_cache = materialize_prompt_cache(slice_prompt_cache(prompt_cache, 3, 5))
+        cache_key = [1, 2, 3, 4, 5]
+        base_checkpoint = RenderedPromptCheckpoint(
+            prompt_cache=[],
+            prefix_tokens=[1, 2, 3],
+            suffix_tokens=[],
+            kind="frontier",
+            rendered_prefix_bytes=9,
+            checkpoint_path="/tmp/base-3.safetensors",
+        )
+        captured = {}
+
+        def fake_save_prompt_checkpoint(file_name, cache, **kwargs):
+            captured["cache"] = cache
+            captured["kwargs"] = kwargs
+            return dict(kwargs["metadata"])
+
+        with mock.patch(
+            "mlx_lm.server.prompt_checkpoint_file",
+            return_value="/tmp/delta-5.safetensors",
+        ), mock.patch(
+            "mlx_lm.server.save_prompt_checkpoint",
+            fake_save_prompt_checkpoint,
+        ), mock.patch(
+            "mlx_lm.server.materialize_prompt_cache",
+            side_effect=AssertionError("prepared cache should already be materialized"),
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ), mock.patch(
+            "mlx_lm.server.prune_prompt_checkpoints"
+        ):
+            saved = generator._save_delta_prompt_checkpoint(
+                tokenizer,
+                None,
+                cache_key,
+                base_checkpoint=base_checkpoint,
+                delta_cache=delta_cache,
+                materialize_seconds=0.125,
+            )
+
+        self.assertTrue(saved)
+        self.assertIs(captured["cache"], delta_cache)
+        self.assertEqual(prompt_cache_token_length(captured["cache"]), 2)
+        self.assertEqual(captured["kwargs"]["prefix_tokens"], cache_key)
 
     def test_load_delta_prompt_checkpoint_concatenates_base_and_delta(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
@@ -690,11 +897,24 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator._checkpoint_save_queue = Queue()
 
-        generator._enqueue_checkpoint_save("delta", lambda: True)
+        self.assertTrue(generator._enqueue_checkpoint_save("delta", lambda: True))
 
         job = generator._checkpoint_save_queue.get_nowait()
         self.assertEqual(job.label, "delta")
         self.assertTrue(job.save())
+
+    def test_enqueue_checkpoint_save_drops_when_backlog_full(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._checkpoint_save_queue = Queue()
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(checkpoint_async_save_backlog_limit=1)
+        )
+
+        self.assertTrue(generator._enqueue_checkpoint_save("continued", lambda: True))
+        self.assertFalse(generator._enqueue_checkpoint_save("delta", lambda: True))
+        self.assertEqual(generator._checkpoint_save_queue.qsize(), 1)
+        job = generator._checkpoint_save_queue.get_nowait()
+        self.assertEqual(job.label, "continued")
 
     def test_stop_and_join_stops_checkpoint_worker(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
@@ -985,6 +1205,10 @@ class TestServerCLI(unittest.TestCase):
             DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
         )
         self.assertEqual(
+            args.checkpoint_async_save_backlog_limit,
+            DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT,
+        )
+        self.assertEqual(
             args.checkpoint_shutdown_save_limit,
             DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
         )
@@ -1001,6 +1225,14 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.loop_guard_min_tokens, 256)
         self.assertEqual(args.decode_progress_interval_tokens, 0)
         self.assertEqual(args.tool_call_max_tokens, 0)
+        self.assertEqual(args.session_loop_history_size, 256)
+        self.assertEqual(args.session_loop_max_no_progress_turns, 0)
+        self.assertEqual(args.session_loop_repeated_output_limit, 0)
+        self.assertEqual(args.session_loop_repeated_action_limit, 0)
+        self.assertEqual(args.reasoning_max_tokens, 0)
+        self.assertEqual(args.reasoning_loop_guard_min_chars, 0)
+        self.assertEqual(args.reasoning_loop_guard_repeats, 4)
+        self.assertEqual(args.reasoning_loop_guard_max_span_chars, 2048)
         self.assertEqual(args.prefill_progress_interval_tokens, 0)
         self.assertEqual(args.request_max_tokens_floor, 0)
         self.assertEqual(args.checkpoint_save_exact, "enabled")
@@ -1098,6 +1330,8 @@ class TestServerCLI(unittest.TestCase):
                 "sync",
                 "--checkpoint-async-save-shutdown-timeout",
                 "2.5",
+                "--checkpoint-async-save-backlog-limit",
+                "3",
                 "--checkpoint-shutdown-save-limit",
                 "2",
                 "--checkpoint-shutdown-max-tokens",
@@ -1116,6 +1350,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.checkpoint_save_exact, "disabled")
         self.assertEqual(args.checkpoint_post_response_save_mode, "sync")
         self.assertEqual(args.checkpoint_async_save_shutdown_timeout, 2.5)
+        self.assertEqual(args.checkpoint_async_save_backlog_limit, 3)
         self.assertEqual(args.checkpoint_shutdown_save_limit, 2)
         self.assertEqual(args.checkpoint_shutdown_max_tokens, 32768)
         self.assertEqual(args.generation_shutdown_timeout, 1.5)
@@ -1154,6 +1389,22 @@ class TestServerCLI(unittest.TestCase):
                 "256",
                 "--tool-call-max-tokens",
                 "8192",
+                "--session-loop-history-size",
+                "128",
+                "--session-loop-max-no-progress-turns",
+                "32",
+                "--session-loop-repeated-output-limit",
+                "4",
+                "--session-loop-repeated-action-limit",
+                "8",
+                "--reasoning-max-tokens",
+                "4096",
+                "--reasoning-loop-guard-min-chars",
+                "60",
+                "--reasoning-loop-guard-repeats",
+                "4",
+                "--reasoning-loop-guard-max-span-chars",
+                "1024",
                 "--prefill-progress-interval-tokens",
                 "2048",
                 "--loop-guard-repeats",
@@ -1166,6 +1417,14 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.loop_guard_ngram_size, 32)
         self.assertEqual(args.decode_progress_interval_tokens, 256)
         self.assertEqual(args.tool_call_max_tokens, 8192)
+        self.assertEqual(args.session_loop_history_size, 128)
+        self.assertEqual(args.session_loop_max_no_progress_turns, 32)
+        self.assertEqual(args.session_loop_repeated_output_limit, 4)
+        self.assertEqual(args.session_loop_repeated_action_limit, 8)
+        self.assertEqual(args.reasoning_max_tokens, 4096)
+        self.assertEqual(args.reasoning_loop_guard_min_chars, 60)
+        self.assertEqual(args.reasoning_loop_guard_repeats, 4)
+        self.assertEqual(args.reasoning_loop_guard_max_span_chars, 1024)
         self.assertEqual(args.prefill_progress_interval_tokens, 2048)
         self.assertEqual(args.loop_guard_repeats, 4)
         self.assertEqual(args.loop_guard_min_tokens, 128)
@@ -1442,6 +1701,36 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_session_loop_guard_preflight_returns_message(self):
+        cli_args = self.response_generator.model_provider.cli_args
+        old_limit = cli_args.session_loop_max_no_progress_turns
+        guard = self.response_generator.session_loop_guard
+        guard.reset()
+        cli_args.session_loop_max_no_progress_turns = 1
+        try:
+            guard.observe(
+                request_id="prev",
+                finish_reason="length",
+                made_tool_call=False,
+            )
+            url = f"http://localhost:{self.port}/v1/chat/completions"
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+            )
+            response_body = response.json()
+
+            self.assertEqual(response_body["choices"][0]["finish_reason"], "stop")
+            content = response_body["choices"][0]["message"]["content"]
+            self.assertIn("loop guard detected", content)
+        finally:
+            cli_args.session_loop_max_no_progress_turns = old_limit
+            guard.reset()
 
     def test_handle_chat_completions_with_content_fragments(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"

@@ -2,11 +2,13 @@
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import os
 import pickle
 import platform
+import re
 import socket
 import time
 import uuid
@@ -16,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -61,6 +63,7 @@ from .models.cache import (
     find_prompt_checkpoint_rendered_prefix,
     load_prompt_checkpoint_with_metadata_prefix,
     make_prompt_cache,
+    materialize_prompt_cache,
     model_has_glm_mla_kv_cache,
     prompt_checkpoint_file,
     prompt_checkpoint_prefix_tokens_metadata,
@@ -87,6 +90,7 @@ DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT = 0
 DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS = 65_536
 DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 0.0
+DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT = 2
 
 
 def get_system_fingerprint():
@@ -388,6 +392,14 @@ def _prompt_checkpoint_async_shutdown_timeout_seconds(args):
         return DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS
 
 
+def _prompt_checkpoint_async_save_backlog_limit(args):
+    return _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_async_save_backlog_limit",
+        DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT,
+    )
+
+
 def _prompt_checkpoint_boundary_store_length(
     token_count,
     *,
@@ -575,6 +587,291 @@ class TokenLoopGuard:
             ):
                 return True
         return False
+
+
+class TextLoopGuardDecision(NamedTuple):
+    span_chars: int
+    repeated_chars: int
+    repeats: int
+    sample: str
+
+
+def _normalize_loop_text(text):
+    return " ".join((text or "").split())
+
+
+def _text_loop_guard_message(decision):
+    return (
+        "Local MLX server reasoning loop guard detected repetitive reasoning "
+        f"(span_chars={decision.span_chars}, repeats={decision.repeats}). "
+        "Stop the current reasoning loop. Summarize the current state and ask "
+        "the user for confirmation before continuing."
+    )
+
+
+class TextLoopGuard:
+    def __init__(
+        self,
+        min_chars: int = 0,
+        repeats: int = 4,
+        max_span_chars: int = 2048,
+        check_interval_chars: int = 64,
+    ):
+        self.min_chars = max(0, int(min_chars))
+        self.repeats = max(0, int(repeats))
+        self.max_span_chars = max(0, int(max_span_chars))
+        self.check_interval_chars = max(1, int(check_interval_chars))
+        self.raw_tail = ""
+        self.raw_chars = 0
+        self.last_checked_raw_chars = 0
+        self.last_decision = None
+
+    @property
+    def enabled(self):
+        return (
+            self.min_chars > 0
+            and self.repeats > 1
+            and self.max_span_chars >= self.min_chars
+        )
+
+    def append(self, text: str) -> bool:
+        if not self.enabled or not text:
+            return False
+        self.raw_tail += text
+        self.raw_chars += len(text)
+        raw_tail_limit = max(4096, self.max_span_chars * self.repeats * 4)
+        if len(self.raw_tail) > raw_tail_limit:
+            self.raw_tail = self.raw_tail[-raw_tail_limit:]
+        if self.raw_chars - self.last_checked_raw_chars < self.check_interval_chars:
+            return False
+        self.last_checked_raw_chars = self.raw_chars
+        return self.has_loop()
+
+    def has_loop(self) -> bool:
+        self.last_decision = None
+        if not self.enabled:
+            return False
+        tail_chars = max(
+            self.min_chars * self.repeats,
+            self.max_span_chars * self.repeats,
+        )
+        tail = _normalize_loop_text(self.raw_tail)
+        if tail:
+            tail += " "
+        tail = tail[-tail_chars:]
+        max_span = min(self.max_span_chars, len(tail) // self.repeats)
+        if max_span < self.min_chars:
+            return False
+
+        end = len(tail)
+        for span_chars in range(self.min_chars, max_span + 1):
+            span = tail[end - span_chars : end]
+            if not any(ch.isalnum() for ch in span):
+                continue
+            if all(
+                tail[
+                    end - repeat * span_chars : end - (repeat - 1) * span_chars
+                ]
+                == span
+                for repeat in range(2, self.repeats + 1)
+            ):
+                self.last_decision = TextLoopGuardDecision(
+                    span_chars=span_chars,
+                    repeated_chars=span_chars * self.repeats,
+                    repeats=self.repeats,
+                    sample=span[:160],
+                )
+                return True
+        return self.has_repeated_block_loop()
+
+    def has_repeated_block_loop(self) -> bool:
+        blocks = [
+            _normalize_loop_text(part)
+            for part in re.split(
+                r"(?:\n\s*){2,}|(?<=[.!?。！？])\s+",
+                self.raw_tail,
+            )
+        ]
+        counts = {}
+        for block in blocks:
+            if len(block) < self.min_chars or not any(ch.isalnum() for ch in block):
+                continue
+            count = counts.get(block, 0) + 1
+            counts[block] = count
+            if count >= self.repeats:
+                self.last_decision = TextLoopGuardDecision(
+                    span_chars=len(block),
+                    repeated_chars=len(block) * count,
+                    repeats=count,
+                    sample=block[:160],
+                )
+                return True
+        return False
+
+
+class SessionLoopGuardDecision(NamedTuple):
+    reason: str
+    count: int
+    limit: int
+
+
+class SessionLoopGuardEvent(NamedTuple):
+    kind: str
+    finish_reason: str
+    visible_signature: str
+    action_signature: str
+    visible_chars: int
+    no_visible_progress: bool
+    made_tool_call: bool
+    generated_tokens: int
+    request_id: str
+    created_at: float
+
+
+def _session_loop_normalize_text(text):
+    return _normalize_loop_text(text)
+
+
+def _session_loop_signature(text, *, min_chars=16):
+    normalized = _session_loop_normalize_text(text)
+    if len(normalized) < min_chars:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _session_loop_guard_message(decision):
+    return (
+        "Local MLX server loop guard detected repeated turns without visible "
+        f"progress ({decision.reason}: {decision.count}/{decision.limit}). "
+        "Do not continue the same action loop. Summarize the current state "
+        "and ask the user for confirmation before continuing."
+    )
+
+
+class GlobalSessionLoopGuard:
+    def __init__(self):
+        self._lock = Lock()
+        self._events = deque()
+
+    def reset(self):
+        with self._lock:
+            self._events.clear()
+
+    def observe(
+        self,
+        *,
+        request_id,
+        finish_reason,
+        made_tool_call,
+        visible_text="",
+        reasoning_text="",
+        action_text="",
+        generated_tokens=0,
+        history_size=256,
+    ):
+        visible_text = _session_loop_normalize_text(visible_text)
+        reasoning_text = _session_loop_normalize_text(reasoning_text)
+        action_text = _session_loop_normalize_text(action_text)
+        visible_chars = len(visible_text)
+        made_tool_call = bool(made_tool_call or finish_reason == "tool_calls")
+        no_visible_progress = (
+            not made_tool_call
+            and (
+                visible_chars == 0
+                or (finish_reason == "length" and visible_chars < 32)
+            )
+        )
+        if made_tool_call:
+            kind = "tool_call"
+        elif no_visible_progress:
+            kind = "no_progress"
+        else:
+            kind = "text"
+
+        event = SessionLoopGuardEvent(
+            kind=kind,
+            finish_reason=str(finish_reason),
+            visible_signature=_session_loop_signature(visible_text or reasoning_text),
+            action_signature=_session_loop_signature(action_text),
+            visible_chars=visible_chars,
+            no_visible_progress=no_visible_progress,
+            made_tool_call=made_tool_call,
+            generated_tokens=max(0, int(generated_tokens or 0)),
+            request_id=str(request_id),
+            created_at=time.time(),
+        )
+
+        history_size = max(1, int(history_size or 256))
+        with self._lock:
+            self._events.append(event)
+            while len(self._events) > history_size:
+                self._events.popleft()
+        return event
+
+    def _tail_count(self, predicate):
+        count = 0
+        for event in reversed(self._events):
+            if not predicate(event):
+                break
+            count += 1
+        return count
+
+    def decision(self, args):
+        history_size = _prompt_checkpoint_policy_int(
+            args, "session_loop_history_size", 256
+        )
+        max_no_progress_turns = _prompt_checkpoint_policy_int(
+            args, "session_loop_max_no_progress_turns", 0
+        )
+        repeated_output_limit = _prompt_checkpoint_policy_int(
+            args, "session_loop_repeated_output_limit", 0
+        )
+        repeated_action_limit = _prompt_checkpoint_policy_int(
+            args, "session_loop_repeated_action_limit", 0
+        )
+
+        with self._lock:
+            while len(self._events) > max(1, history_size):
+                self._events.popleft()
+            if not self._events:
+                return None
+
+            no_progress_turns = self._tail_count(lambda e: e.no_visible_progress)
+            if (
+                max_no_progress_turns > 0
+                and no_progress_turns >= max_no_progress_turns
+            ):
+                return SessionLoopGuardDecision(
+                    "global_no_visible_progress_turns",
+                    no_progress_turns,
+                    max_no_progress_turns,
+                )
+
+            last_signature = self._events[-1].visible_signature
+            if repeated_output_limit > 0 and last_signature:
+                repeated = self._tail_count(
+                    lambda e: e.visible_signature == last_signature
+                )
+                if repeated >= repeated_output_limit:
+                    return SessionLoopGuardDecision(
+                        "global_repeated_output_signature",
+                        repeated,
+                        repeated_output_limit,
+                    )
+
+            last_action_signature = self._events[-1].action_signature
+            if repeated_action_limit > 0 and last_action_signature:
+                repeated = self._tail_count(
+                    lambda e: e.action_signature == last_action_signature
+                )
+                if repeated >= repeated_action_limit:
+                    return SessionLoopGuardDecision(
+                        "global_repeated_action_signature",
+                        repeated,
+                        repeated_action_limit,
+                    )
+
+        return None
 
 
 @dataclass
@@ -804,6 +1101,7 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
+        self.session_loop_guard = GlobalSessionLoopGuard()
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -869,12 +1167,32 @@ class ResponseGenerator:
                     self._checkpoint_save_active = False
                 self._checkpoint_save_queue.task_done()
 
+    def _checkpoint_save_backlog_limit(self):
+        cli_args = getattr(getattr(self, "model_provider", None), "cli_args", None)
+        return _prompt_checkpoint_async_save_backlog_limit(cli_args)
+
+    def _checkpoint_save_backlog_full(self, label: str) -> bool:
+        limit = self._checkpoint_save_backlog_limit()
+        if limit < 0:
+            return False
+        pending = self._checkpoint_save_queue.qsize()
+        if pending < limit:
+            return False
+        _prompt_checkpoint_debug(
+            "async checkpoint save skipped backlog "
+            f"label={label} pending={pending} limit={limit}"
+        )
+        return True
+
     def _enqueue_checkpoint_save(self, label: str, save: Callable[[], bool]):
+        if self._checkpoint_save_backlog_full(label):
+            return False
         self._checkpoint_save_queue.put(_AsyncCheckpointSaveJob(label=label, save=save))
         _prompt_checkpoint_debug(
             f"async checkpoint save queued label={label} "
             f"pending={self._checkpoint_save_queue.qsize()}"
         )
+        return True
 
     def _stop_checkpoint_save_worker(self, cli_args):
         checkpoint_queue = getattr(self, "_checkpoint_save_queue", None)
@@ -1596,6 +1914,56 @@ class ResponseGenerator:
             )
             return False
 
+    def _prepare_delta_prompt_checkpoint_cache(
+        self,
+        prompt_cache,
+        cache_key,
+        *,
+        base_checkpoint,
+    ):
+        if self.model_provider.draft_model is not None or base_checkpoint is None:
+            return None, 0.0
+
+        base_tokens = (
+            base_checkpoint.delta_base_prefix_tokens
+            or base_checkpoint.prefix_tokens
+        )
+        if (
+            not base_tokens
+            or not (base_checkpoint.delta_base_path or base_checkpoint.checkpoint_path)
+            or base_checkpoint.kind == "exact"
+        ):
+            return None, 0.0
+
+        base_length = len(base_tokens)
+        target_length = len(cache_key)
+        if target_length <= base_length:
+            return None, 0.0
+        cache_length = prompt_cache_token_length(prompt_cache)
+        if cache_length < target_length:
+            return None, 0.0
+
+        materialize_seconds = 0.0
+        try:
+            delta_cache = slice_prompt_cache(
+                prompt_cache,
+                base_length,
+                target_length,
+            )
+            materialize_t0 = time.perf_counter()
+            delta_cache = materialize_prompt_cache(delta_cache)
+            materialize_seconds = time.perf_counter() - materialize_t0
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "save delta skipped slice/materialize failure "
+                f"target_length={target_length} "
+                f"base_length={base_length} "
+                f"error={type(exc).__name__} "
+                f"message={str(exc)!r}"
+            )
+            return None, 0.0
+        return delta_cache, materialize_seconds
+
     def _save_delta_prompt_checkpoint(
         self,
         tokenizer,
@@ -1604,6 +1972,8 @@ class ResponseGenerator:
         *,
         base_checkpoint,
         rendered_continuation=None,
+        delta_cache=None,
+        materialize_seconds=0.0,
     ):
         if self.model_provider.draft_model is not None:
             _prompt_checkpoint_debug("save delta skipped draft model active")
@@ -1633,27 +2003,33 @@ class ResponseGenerator:
                 f"base_length={base_length}"
             )
             return False
-        cache_length = prompt_cache_token_length(prompt_cache)
-        if cache_length < target_length:
-            _prompt_checkpoint_debug(
-                "save delta skipped cache too short "
-                f"cache_length={cache_length} "
-                f"target_length={target_length}"
+        if delta_cache is None:
+            cache_length = prompt_cache_token_length(prompt_cache)
+            if cache_length < target_length:
+                _prompt_checkpoint_debug(
+                    "save delta skipped cache too short "
+                    f"cache_length={cache_length} "
+                    f"target_length={target_length}"
+                )
+                return False
+            delta_cache, materialize_seconds = (
+                self._prepare_delta_prompt_checkpoint_cache(
+                    prompt_cache,
+                    cache_key,
+                    base_checkpoint=base_checkpoint,
+                )
             )
+        if delta_cache is None:
             return False
-
-        try:
-            delta_cache = slice_prompt_cache(
-                prompt_cache,
-                base_length,
-                target_length,
-            )
-        except Exception as exc:
+        delta_tokens = target_length - base_length
+        delta_cache_length = prompt_cache_token_length(delta_cache)
+        if delta_cache_length != delta_tokens:
             _prompt_checkpoint_debug(
-                "save delta skipped slice failure "
+                "save delta skipped cache length mismatch "
                 f"target_length={target_length} "
                 f"base_length={base_length} "
-                f"error={type(exc).__name__}"
+                f"delta_tokens={delta_tokens} "
+                f"delta_cache_length={delta_cache_length}"
             )
             return False
 
@@ -1725,6 +2101,7 @@ class ResponseGenerator:
                 f"target_length={target_length} "
                 f"base_length={base_length} "
                 f"delta_tokens={target_length - base_length} "
+                f"materialize_seconds={materialize_seconds:.6f} "
                 f"rendered_metadata={int(rendered_prefix is not None)}"
             )
             return True
@@ -1734,7 +2111,10 @@ class ResponseGenerator:
                 f"file={os.path.basename(checkpoint_path)} "
                 f"target_length={target_length} "
                 f"base_length={base_length} "
-                f"error={type(exc).__name__}"
+                f"delta_tokens={target_length - base_length} "
+                f"materialize_seconds={materialize_seconds:.6f} "
+                f"error={type(exc).__name__} "
+                f"message={str(exc)!r}"
             )
             return False
 
@@ -2471,18 +2851,30 @@ class ResponseGenerator:
                     ),
                 )
                 delta_cache_key = list(cache_key)
-                self._enqueue_checkpoint_save(
-                    "delta",
-                    lambda delta_cache_key=delta_cache_key: (
-                        self._save_delta_prompt_checkpoint(
-                            tokenizer,
+                if not self._checkpoint_save_backlog_full("delta"):
+                    delta_cache_snapshot, delta_materialize_seconds = (
+                        self._prepare_delta_prompt_checkpoint_cache(
                             cache,
                             delta_cache_key,
                             base_checkpoint=rendered_checkpoint,
-                            rendered_continuation=rendered_continuation,
                         )
-                    ),
-                )
+                    )
+                    self._enqueue_checkpoint_save(
+                        "delta",
+                        lambda delta_cache_key=delta_cache_key,
+                        delta_cache_snapshot=delta_cache_snapshot,
+                        delta_materialize_seconds=delta_materialize_seconds: (
+                            self._save_delta_prompt_checkpoint(
+                                tokenizer,
+                                None,
+                                delta_cache_key,
+                                base_checkpoint=rendered_checkpoint,
+                                rendered_continuation=rendered_continuation,
+                                delta_cache=delta_cache_snapshot,
+                                materialize_seconds=delta_materialize_seconds,
+                            )
+                        ),
+                    )
             else:
                 self._save_continued_prompt_checkpoint(
                     tokenizer,
@@ -2736,6 +3128,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Create the completion request
         request = request_factories[self.path]()
+        session_loop_decision = (
+            self.response_generator.session_loop_guard.decision(
+                self.response_generator.cli_args
+            )
+        )
+        if session_loop_decision is not None:
+            self._send_session_loop_guard_response(session_loop_decision)
+            return
+
         if self.object_type == "response":
             self.handle_responses_completion(request, stop_words)
         else:
@@ -2905,6 +3306,189 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def _session_loop_history_size(self):
+        return _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "session_loop_history_size",
+            256,
+        )
+
+    def _observe_session_loop_event(
+        self,
+        *,
+        finish_reason,
+        made_tool_call,
+        visible_text="",
+        reasoning_text="",
+        action_text="",
+        generated_tokens=0,
+    ):
+        self.response_generator.session_loop_guard.observe(
+            request_id=self.request_id,
+            finish_reason=finish_reason,
+            made_tool_call=made_tool_call,
+            visible_text=visible_text,
+            reasoning_text=reasoning_text,
+            action_text=action_text,
+            generated_tokens=generated_tokens,
+            history_size=self._session_loop_history_size(),
+        )
+
+    def _send_session_loop_guard_response(self, decision):
+        message = _session_loop_guard_message(decision)
+        logging.warning(
+            "Global session loop guard triggered: reason=%s count=%s limit=%s "
+            "request_id=%s object_type=%s stream=%s",
+            decision.reason,
+            decision.count,
+            decision.limit,
+            self.request_id,
+            self.object_type,
+            self.stream,
+        )
+
+        if self.object_type == "response":
+            self._send_responses_session_loop_guard_response(message)
+        elif self.stream:
+            self._set_stream_headers(200)
+            if self._end_headers_safely():
+                resp = self.generate_response(message, "stop")
+                self._write_response_bytes(f"data: {json.dumps(resp)}\n\n".encode())
+                self._write_response_bytes(b"data: [DONE]\n\n")
+        else:
+            self._set_completion_headers(200)
+            resp = self.generate_response(
+                message,
+                "stop",
+                0,
+                0,
+                0,
+            )
+            resp_bytes = json.dumps(resp).encode()
+            self.send_header("Content-Length", str(len(resp_bytes)))
+            if self._end_headers_safely():
+                self._write_response_bytes(resp_bytes)
+
+        self._observe_session_loop_event(
+            finish_reason="stop",
+            made_tool_call=False,
+            visible_text=message,
+            generated_tokens=0,
+        )
+
+    def _send_responses_session_loop_guard_response(self, message):
+        msg_id = f"msg_{uuid.uuid4().hex}"
+        text_item = {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {"type": "output_text", "text": message, "annotations": []}
+            ],
+        }
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        if self.stream:
+            self._set_stream_headers(200)
+            if not self._end_headers_safely():
+                return
+            self._write_response_bytes(self._sse_event("response.created", {
+                "type": "response.created",
+                "response": {
+                    "id": self.request_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": self.requested_model,
+                    "output": [],
+                },
+            }))
+            self._write_response_bytes(self._sse_event("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress",
+                },
+            }))
+            self._write_response_bytes(self._sse_event("response.content_part.added", {
+                "type": "response.content_part.added",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            }))
+            self._write_response_bytes(self._sse_event("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": message,
+            }))
+            self._write_response_bytes(self._sse_event("response.output_text.done", {
+                "type": "response.output_text.done",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": message,
+            }))
+            self._write_response_bytes(self._sse_event("response.content_part.done", {
+                "type": "response.content_part.done",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": message,
+                    "annotations": [],
+                },
+            }))
+            self._write_response_bytes(self._sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": text_item,
+            }))
+            self._write_response_bytes(self._sse_event("response.completed", {
+                "type": "response.completed",
+                "response": {
+                    "id": self.request_id,
+                    "object": "response",
+                    "status": "completed",
+                    "model": self.requested_model,
+                    "output": [text_item],
+                    "usage": usage,
+                    "end_turn": True,
+                },
+            }))
+            return
+
+        self._set_completion_headers(200)
+        resp = {
+            "id": self.request_id,
+            "object": "response",
+            "created_at": self.created,
+            "model": self.requested_model,
+            "status": "completed",
+            "output": [text_item],
+            "usage": usage,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": self.body.get("instructions"),
+            "metadata": {},
+            "parallel_tool_calls": True,
+            "temperature": self.temperature,
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": self.top_p,
+            "truncation": "disabled",
+        }
+        resp_bytes = json.dumps(resp).encode()
+        self.send_header("Content-Length", str(len(resp_bytes)))
+        if self._end_headers_safely():
+            self._write_response_bytes(resp_bytes)
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -3043,6 +3627,9 @@ class APIHandler(BaseHTTPRequestHandler):
         prev_state = None
         finish_reason = "stop"
         reasoning_text = ""
+        session_text = ""
+        session_reasoning_text = ""
+        session_action_text = ""
         made_tool_call = False
         tool_text = ""
         tool_calls = []
@@ -3060,31 +3647,67 @@ class APIHandler(BaseHTTPRequestHandler):
             "tool_call_max_tokens",
             0,
         )
+        reasoning_max_tokens = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_max_tokens",
+            0,
+        )
+        reasoning_loop_guard_min_chars = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_loop_guard_min_chars",
+            0,
+        )
+        reasoning_loop_guard_repeats = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_loop_guard_repeats",
+            4,
+        )
+        reasoning_loop_guard_max_span_chars = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_loop_guard_max_span_chars",
+            2048,
+        )
         decode_started_at = time.perf_counter()
         tool_state_tokens = 0
+        reasoning_state_tokens = 0
         tool_call_limit_reached = False
+        reasoning_limit_reached = False
+        reasoning_loop_guard_reached = False
         loop_guard = TokenLoopGuard(
             self.response_generator.cli_args.loop_guard_ngram_size,
             self.response_generator.cli_args.loop_guard_repeats,
             self.response_generator.cli_args.loop_guard_min_tokens,
         )
+        reasoning_loop_guard = TextLoopGuard(
+            reasoning_loop_guard_min_chars,
+            reasoning_loop_guard_repeats,
+            reasoning_loop_guard_max_span_chars,
+        )
 
         try:
             for gen in response:
                 logging.debug(gen.text)
+                reasoning_loop_decision = None
 
                 # Collect the text according to our current state and state
                 # transitions. Reasoning or tool or normal text.
                 if gen.state == "reasoning":
                     reasoning_text += gen.text
+                    session_reasoning_text += gen.text
+                    if reasoning_loop_guard.append(gen.text):
+                        reasoning_loop_decision = (
+                            reasoning_loop_guard.last_decision
+                        )
                 elif gen.state == "tool":
                     tool_text += gen.text
                 elif gen.state == "normal":
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
+                        session_action_text += "\n" + tool_text
                         tool_text = ""
                         made_tool_call = True
                     text += gen.text
+                    session_text += gen.text
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -3092,6 +3715,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_state_tokens += 1
                 else:
                     tool_state_tokens = 0
+                if gen.state == "reasoning":
+                    reasoning_state_tokens += 1
+                else:
+                    reasoning_state_tokens = 0
                 if (
                     decode_progress_interval > 0
                     and len(tokens) % decode_progress_interval == 0
@@ -3109,6 +3736,24 @@ class APIHandler(BaseHTTPRequestHandler):
                     token_logprobs.append(gen.logprob)
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
+                if reasoning_loop_decision is not None:
+                    guard_message = _text_loop_guard_message(reasoning_loop_decision)
+                    logging.warning(
+                        "Stopping generation after detecting repeated reasoning "
+                        "text loop (span_chars=%s repeats=%s repeated_chars=%s "
+                        "generated_tokens=%s sample=%r)",
+                        reasoning_loop_decision.span_chars,
+                        reasoning_loop_decision.repeats,
+                        reasoning_loop_decision.repeated_chars,
+                        len(tokens),
+                        reasoning_loop_decision.sample,
+                    )
+                    text += guard_message
+                    session_text += guard_message
+                    finish_reason = "stop"
+                    reasoning_loop_guard_reached = True
+                    ctx.stop()
+                    break
                 if loop_guard.append(gen.token):
                     logging.warning(
                         "Stopping generation after detecting repeated token loop "
@@ -3136,6 +3781,22 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_call_limit_reached = True
                     ctx.stop()
                     break
+                if (
+                    reasoning_max_tokens > 0
+                    and reasoning_state_tokens > reasoning_max_tokens
+                ):
+                    logging.warning(
+                        "Stopping generation after reasoning span exceeded token "
+                        "limit (reasoning_max_tokens=%s generated_tokens=%s "
+                        "reasoning_state_tokens=%s)",
+                        reasoning_max_tokens,
+                        len(tokens),
+                        reasoning_state_tokens,
+                    )
+                    finish_reason = "length"
+                    reasoning_limit_reached = True
+                    ctx.stop()
+                    break
 
                 if (
                     self.stream
@@ -3159,19 +3820,34 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
-            if prev_state == "tool" and tool_text and not tool_call_limit_reached:
+            if (
+                prev_state == "tool"
+                and tool_text
+                and not tool_call_limit_reached
+            ):
                 tool_calls.append(tool_text)
+                session_action_text += "\n" + tool_text
                 made_tool_call = True
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
+
+            self._observe_session_loop_event(
+                finish_reason=finish_reason,
+                made_tool_call=made_tool_call,
+                visible_text=session_text,
+                reasoning_text=session_reasoning_text,
+                action_text=session_action_text,
+                generated_tokens=len(tokens),
+            )
 
             logging.info(
                 "completion finished: request_id=%s prompt_tokens=%s "
                 "generated_tokens=%s finish_reason=%s stream=%s "
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
                 "requested_max_tokens=%s max_tokens_floor_applied=%s "
-                "made_tool_call=%s tool_call_limit_reached=%s",
+                "made_tool_call=%s tool_call_limit_reached=%s "
+                "reasoning_limit_reached=%s reasoning_loop_guard_reached=%s",
                 self.request_id,
                 len(ctx.prompt),
                 len(tokens),
@@ -3184,6 +3860,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.max_tokens_floor_applied,
                 made_tool_call,
                 tool_call_limit_reached,
+                reasoning_limit_reached,
+                reasoning_loop_guard_reached,
             )
 
             if self.stream:
@@ -3464,12 +4142,40 @@ class APIHandler(BaseHTTPRequestHandler):
             "tool_call_max_tokens",
             0,
         )
+        reasoning_max_tokens = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_max_tokens",
+            0,
+        )
+        reasoning_loop_guard_min_chars = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_loop_guard_min_chars",
+            0,
+        )
+        reasoning_loop_guard_repeats = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_loop_guard_repeats",
+            4,
+        )
+        reasoning_loop_guard_max_span_chars = _prompt_checkpoint_policy_int(
+            self.response_generator.cli_args,
+            "reasoning_loop_guard_max_span_chars",
+            2048,
+        )
         tool_state_tokens = 0
+        reasoning_state_tokens = 0
         tool_call_limit_reached = False
+        reasoning_limit_reached = False
+        reasoning_loop_guard_reached = False
         loop_guard = TokenLoopGuard(
             self.response_generator.cli_args.loop_guard_ngram_size,
             self.response_generator.cli_args.loop_guard_repeats,
             self.response_generator.cli_args.loop_guard_min_tokens,
+        )
+        reasoning_loop_guard = TextLoopGuard(
+            reasoning_loop_guard_min_chars,
+            reasoning_loop_guard_repeats,
+            reasoning_loop_guard_max_span_chars,
         )
 
         if self.stream:
@@ -3509,6 +4215,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_state_tokens += 1
                 else:
                     tool_state_tokens = 0
+                if gen.state == "reasoning":
+                    reasoning_state_tokens += 1
+                else:
+                    reasoning_state_tokens = 0
                 if loop_guard.append(gen.token):
                     logging.warning(
                         "Stopping generation after detecting repeated token loop "
@@ -3536,11 +4246,60 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_call_limit_reached = True
                     ctx.stop()
                     break
+                if (
+                    reasoning_max_tokens > 0
+                    and reasoning_state_tokens > reasoning_max_tokens
+                ):
+                    logging.warning(
+                        "Stopping generation after reasoning span exceeded token "
+                        "limit (reasoning_max_tokens=%s generated_tokens=%s "
+                        "reasoning_state_tokens=%s)",
+                        reasoning_max_tokens,
+                        len(tokens),
+                        reasoning_state_tokens,
+                    )
+                    finish_reason = "length"
+                    reasoning_limit_reached = True
+                    ctx.stop()
+                    break
                 if gen.state == "tool":
                     tool_text += gen.text
                 elif gen.state == "reasoning":
                     if gen.text:
                         reasoning_text += gen.text
+                        if reasoning_loop_guard.append(gen.text):
+                            reasoning_loop_decision = (
+                                reasoning_loop_guard.last_decision
+                            )
+                            guard_message = _text_loop_guard_message(
+                                reasoning_loop_decision
+                            )
+                            logging.warning(
+                                "Stopping generation after detecting repeated "
+                                "reasoning text loop (span_chars=%s repeats=%s "
+                                "repeated_chars=%s generated_tokens=%s "
+                                "sample=%r)",
+                                reasoning_loop_decision.span_chars,
+                                reasoning_loop_decision.repeats,
+                                reasoning_loop_decision.repeated_chars,
+                                len(tokens),
+                                reasoning_loop_decision.sample,
+                            )
+                            full_text += guard_message
+                            if self.stream:
+                                if not stream_write(self._sse_event(
+                                    "response.output_text.delta", {
+                                        "type": "response.output_text.delta",
+                                        "item_id": msg_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": guard_message,
+                                    })):
+                                    client_connected = False
+                            finish_reason = "stop"
+                            reasoning_loop_guard_reached = True
+                            ctx.stop()
+                            break
                         if self.stream:
                             if not stream_write(self._sse_event(
                                 "response.reasoning_text.delta", {
@@ -3568,7 +4327,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     finish_reason = gen.finish_reason
                 prev_state = gen.state
 
-            if prev_state == "tool" and tool_text and not tool_call_limit_reached:
+            if (
+                prev_state == "tool"
+                and tool_text
+                and not tool_call_limit_reached
+            ):
                 tool_calls_raw.append(tool_text)
                 made_tool_call = True
             if finish_reason == "stop" and made_tool_call:
@@ -3578,7 +4341,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "generated_tokens=%s finish_reason=%s stream=%s "
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
                 "requested_max_tokens=%s max_tokens_floor_applied=%s "
-                "made_tool_call=%s tool_call_limit_reached=%s",
+                "made_tool_call=%s tool_call_limit_reached=%s "
+                "reasoning_limit_reached=%s reasoning_loop_guard_reached=%s",
                 self.request_id,
                 len(ctx.prompt),
                 len(tokens),
@@ -3591,6 +4355,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.max_tokens_floor_applied,
                 made_tool_call,
                 tool_call_limit_reached,
+                reasoning_limit_reached,
+                reasoning_loop_guard_reached,
             )
         finally:
             ctx.stop()
@@ -3606,7 +4372,11 @@ class APIHandler(BaseHTTPRequestHandler):
         formatted_tool_calls = tool_formatter(tool_calls_raw)
 
         # Fallback: parse tool calls from plain text JSON
-        if not formatted_tool_calls and request.tools and full_text:
+        if (
+            not formatted_tool_calls
+            and request.tools
+            and full_text
+        ):
             import re
             json_pattern = re.compile(
                 r'(?:```(?:json)?\s*\n?)?\s*(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\})\s*(?:\n?```)?',
@@ -3637,6 +4407,19 @@ class APIHandler(BaseHTTPRequestHandler):
                             logging.info(f"Fallback tool call parsed: {tc_data['name']}")
                 except (json.JSONDecodeError, KeyError):
                     pass
+
+        self._observe_session_loop_event(
+            finish_reason=finish_reason,
+            made_tool_call=made_tool_call or bool(formatted_tool_calls),
+            visible_text=full_text,
+            reasoning_text=reasoning_text,
+            action_text=(
+                "\n".join(tool_calls_raw)
+                if tool_calls_raw
+                else json.dumps(formatted_tool_calls, sort_keys=True)
+            ),
+            generated_tokens=len(tokens),
+        )
 
         # Count reasoning tokens separately
         reasoning_token_count = len(reasoning_text.split()) if reasoning_text else 0
@@ -4054,6 +4837,82 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--session-loop-history-size",
+        type=int,
+        default=256,
+        help=(
+            "Number of recent HTTP completions kept in the single global "
+            "local-session loop history (default: 256)."
+        ),
+    )
+    parser.add_argument(
+        "--session-loop-max-no-progress-turns",
+        type=int,
+        default=0,
+        help=(
+            "Stop before generation when the single global local-session "
+            "history already has this many consecutive completions without "
+            "visible assistant progress. Use 0 to disable (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--session-loop-repeated-output-limit",
+        type=int,
+        default=0,
+        help=(
+            "Stop before generation when the single global local-session "
+            "history repeats the same normalized visible output this many "
+            "times. Use 0 to disable (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--session-loop-repeated-action-limit",
+        type=int,
+        default=0,
+        help=(
+            "Stop before generation when the single global local-session "
+            "history repeats the same normalized action/tool signature this "
+            "many consecutive times. Use 0 to disable (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-max-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Stop generation if a single unclosed reasoning span exceeds this "
+            "many generated tokens. Use 0 to disable (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-loop-guard-min-chars",
+        type=int,
+        default=0,
+        help=(
+            "Stop generation when reasoning text ends with a repeated "
+            "normalized span of at least this many characters. Use 0 to "
+            "disable (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-loop-guard-repeats",
+        type=int,
+        default=4,
+        help=(
+            "Number of consecutive repeated reasoning text spans needed by "
+            "the reasoning loop guard (default: 4)."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-loop-guard-max-span-chars",
+        type=int,
+        default=2048,
+        help=(
+            "Largest normalized text span length scanned by the reasoning "
+            "loop guard (default: 2048)."
+        ),
+    )
+    parser.add_argument(
         "--prefill-progress-interval-tokens",
         type=int,
         default=0,
@@ -4249,6 +5108,18 @@ def setup_arg_parser():
             "Seconds to wait for async prompt checkpoint saves during server "
             "shutdown. Use 0 to continue shutdown immediately "
             f"(default: {DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-async-save-backlog-limit",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT,
+        help=(
+            "Maximum pending async post-response prompt checkpoint save jobs. "
+            "New continued/delta saves are skipped once the backlog reaches "
+            "this limit, which prevents queued cache snapshots from exhausting "
+            "unified memory. Use a negative value to disable the limit "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT})."
         ),
     )
     parser.add_argument(

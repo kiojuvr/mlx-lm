@@ -129,6 +129,7 @@ python -m mlx_lm server \
   --checkpoint-save-exact disabled \
   --checkpoint-post-response-save-mode async \
   --checkpoint-async-save-shutdown-timeout 0 \
+  --checkpoint-async-save-backlog-limit 2 \
   --generation-shutdown-timeout 0 \
   --checkpoint-shutdown-save-limit 0 \
   --request-max-tokens-floor 384000 \
@@ -139,7 +140,14 @@ python -m mlx_lm server \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256 \
   --decode-progress-interval-tokens 512 \
-  --tool-call-max-tokens 8192
+  --tool-call-max-tokens 8192 \
+  --reasoning-loop-guard-min-chars 60 \
+  --reasoning-loop-guard-repeats 4 \
+  --reasoning-loop-guard-max-span-chars 2048 \
+  --session-loop-history-size 256 \
+  --session-loop-max-no-progress-turns 64 \
+  --session-loop-repeated-output-limit 4 \
+  --session-loop-repeated-action-limit 8
 ```
 
 Do not pass `--model-name` for this OpenCode setup unless you have explicitly verified that you need request-facing model-name aliasing. The normal single-model local server workflow loads the model from `--model` and serves OpenCode requests through `/v1/chat/completions`.
@@ -151,20 +159,62 @@ early with `finish_reason=length`. Because that also allows an unclosed tool
 call to run for a long time, keep `--tool-call-max-tokens 8192` enabled for
 OpenCode serving. It stops a single tool-call span that grows past the limit
 with `finish_reason=length` instead of waiting for the full raised token cap.
+This local fork assumes a single-user, single-active-task server profile. The
+session loop guard therefore uses one process-global local-session history pool,
+not HTTP cookies, TCP connections, or per-client session IDs. With the
+recommended `--session-loop-*` settings, the server records recent completions
+across all HTTP requests and stops before generation when that global history
+shows a non-tool loop: too many turns without visible assistant progress, or
+repeated visible output/action signatures inside the bounded pool. It
+intentionally does not count total tool-call turns at request-history or
+process-global scope because legitimate tasks may issue many tools over a long
+run. On detection it returns a short assistant message asking the client to stop
+the same action loop, summarize state, and ask the user before continuing. This
+is intentionally suited to personal OpenCode serving; do not use it as-is for
+multi-user serving where independent conversations need separate loop histories.
 
 The recommended server command intentionally leaves `--temp` and `--top-p` unset so request-side clients can control sampling. In local use, lower-temperature request settings helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
 
 `--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it. If the model still enters near-duplicate but non-exact loops, lower request sampling first (`temperature`, `top_p`) and add a small request-side `repetition_penalty` such as `1.05` to `1.10` when your client supports it.
 
+`--reasoning-loop-guard-*` is a text-span guard for reasoning doom loops that
+do not line up with exact token n-grams. The recommended settings follow the
+same detection shape used by Liquid AI's
+[Antidoom](https://www.liquid.ai/blog/antidoom) mining pass: a normalized
+reasoning span/block of at least 60 characters repeating four times. This is an
+inference-time fuse, not FTPO/LoRA training. On detection, the server stops the
+current generation with `finish_reason=stop` and returns a visible assistant
+message telling the client to stop the reasoning loop, summarize state, and ask
+the user before continuing.
+
+`--reasoning-max-tokens` is intentionally not part of the recommended
+long-running OpenCode command. It defaults to `0` (disabled). Use it only as a
+diagnostic hard fuse when you want to intentionally stop a single unclosed
+reasoning span; values such as `8192` can terminate legitimate long coding-agent
+turns before the task has completed.
+
 `--decode-progress-interval-tokens 512` logs generation progress from the
 generation worker. If prompt processing reaches 100% and no `decode first token`
 line follows, the first decode step is stalled. If progress continues with
 `state=tool` but the client shows no visible output, the model is producing an
-unclosed tool call; the `--tool-call-max-tokens` fuse bounds that case.
+unclosed tool call; the `--tool-call-max-tokens` fuse bounds that case. If the
+log shows many short completions ending with `finish_reason=tool_calls`, the
+client is repeatedly executing tools and sending the growing history back. The
+server does not cap the total number of tool-call turns; it only bounds local
+pool loops such as the same action signature repeating via
+`--session-loop-repeated-action-limit`.
 
 `--kv-bits 8` is not a prefill-compute speedup by itself. Its value is that GLM MLA int8 KV cache reduces long-context KV memory and keeps 200K+ prompts inside the intended memory envelope. The native DSA indexer score/top-k route remains compatible with this setting because it uses the DSA indexer cache, not the GLM MLA KV cache.
 
 Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that writes and reuses disk prompt checkpoints, including frontier checkpoints. Disable final exact checkpoints for this long-running server profile: 190K-token exact checkpoints are around 11GB each on the tested setup and can spend tens of seconds writing only to be pruned immediately. The measured cold-prefill sweep now favors `--prefill-step-size 8192`, `--prefill-max-qk-tokens 67108864`, and adaptive GLM DSA prefill disabled (`--glm-dsa-adaptive-prefill-step-size 0`). The QK cap shrinks only the chunks whose query-by-context product would get too large; the 8192-token first chunk crosses the native sparse handoff immediately, then later chunks shrink automatically as the cap requires. Keep `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` at its default/effective 131072 handoff for the Python selected-KV sparse path; lowering that handoff increased runtime and memory in the tested 128K runs. The vendored native DSA indexer route is enabled by default through `MLX_LM_GLM_DSA_NATIVE_INDEXER` and can replace the Python/MLX indexer score plus top-k path for supported GLM-5.2 M3 chunks at context 4096 and above. The vendored native sparse MLA route has its own lower handoff, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 6144). `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1` lets it consume int8 GLM MLA KV cache by temporarily dequantizing the full latent KV cache for the native kernel; the recommended `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144` has been profiled through 204800 tokens with all chunks on the native sparse route and no dense fallback. Keep larger values bounded until your target context length is profiled. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery or memory pressure appears on your real prompt distribution, retry with `--prefill-step-size 4096` first, then 2048 and 1024.
+
+`--checkpoint-async-save-backlog-limit 2` bounds queued post-response continued
+and delta checkpoint saves. These saves can hold large prompt-cache snapshots in
+unified memory while the next request is already decoding. If the client drives
+many tool-call turns faster than checkpoints can be written, the server skips
+new async checkpoint saves once the queue reaches the limit instead of letting
+snapshot backlog grow into Metal out-of-memory aborts. Skipped saves are safe:
+they only lose an opportunistic future warm prefix, not the current response.
 
 Post-response continued/delta checkpoint saves run asynchronously by default so
 the generation worker can accept the next request without waiting for disk I/O.

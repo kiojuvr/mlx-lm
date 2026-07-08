@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock as mock
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -62,6 +63,7 @@ from mlx_lm.models.cache import (
     load_prompt_checkpoint_with_metadata_prefix,
     load_prompt_cache,
     make_prompt_cache,
+    materialize_prompt_cache,
     prompt_checkpoint_budget_from_env,
     prompt_checkpoint_file,
     prompt_checkpoint_lcp_block_hash_chain,
@@ -156,6 +158,29 @@ class TestPromptCacheDeltaUtilities(unittest.TestCase):
             self.assertTrue(mx.array_equal(actual.state[0], original.state[0]).item())
             self.assertTrue(mx.array_equal(actual.state[1], original.state[1]).item())
 
+    def test_materialize_prompt_cache_preserves_quantized_glm_mla_slice(self):
+        full = [
+            CacheList(
+                self._glm_mla_cache(8, head_dim=64).to_quantized(
+                    group_size=64,
+                    bits=8,
+                ),
+                self._kv_cache(8, head_dim=64),
+            )
+        ]
+        delta = slice_prompt_cache(full, 5, 8)
+        materialized = materialize_prompt_cache(delta)
+
+        self.assertIsNot(materialized[0], delta[0])
+        self.assertEqual(prompt_cache_token_length(materialized), 3)
+        merged = concat_prompt_caches(slice_prompt_cache(full, 0, 5), materialized)
+        self.assertEqual(prompt_cache_token_length(merged), 8)
+        for (_, actual_value), (_, expected_value) in zip(
+            tree_flatten(merged[0].state),
+            tree_flatten(full[0].state),
+        ):
+            self.assertTrue(mx.array_equal(actual_value, expected_value).item())
+
 
 class TestPromptCacheCheckpoint(unittest.TestCase):
 
@@ -201,6 +226,20 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 os.environ[name] = old_value
 
         self.addCleanup(restore_env)
+
+    def test_save_manifest_uses_unique_temp_file(self):
+        self._set_home_to_test_dir()
+        ensure_glm52_local_cache_dirs()
+        manifest = {"version": 1, "entries": {}}
+
+        with mock.patch("mlx_lm.models.cache.os.replace") as replace:
+            save_prompt_checkpoint_manifest(manifest)
+
+        tmp_file, manifest_file = replace.call_args.args
+        self.assertEqual(manifest_file, prompt_checkpoint_manifest_file())
+        self.assertNotEqual(tmp_file, prompt_checkpoint_manifest_file() + ".tmp")
+        self.assertTrue(os.path.basename(tmp_file).startswith(".manifest.json."))
+        self.assertFalse(os.path.exists(tmp_file))
 
     def test_prune_removes_delta_before_referenced_base(self):
         self._set_home_to_test_dir()

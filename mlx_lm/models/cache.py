@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import tempfile
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
@@ -802,10 +803,23 @@ def load_prompt_checkpoint_manifest(return_stats=False):
 
 def save_prompt_checkpoint_manifest(manifest):
     ensure_glm52_local_cache_dirs()
-    tmp_file = prompt_checkpoint_manifest_file() + ".tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, sort_keys=True, separators=(",", ":"))
-    os.replace(tmp_file, prompt_checkpoint_manifest_file())
+    manifest_file = prompt_checkpoint_manifest_file()
+    manifest_dir = os.path.dirname(manifest_file)
+    fd, tmp_file = tempfile.mkstemp(
+        prefix=f".{PROMPT_CHECKPOINT_MANIFEST_NAME}.",
+        suffix=".tmp",
+        dir=manifest_dir,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, sort_keys=True, separators=(",", ":"))
+        os.replace(tmp_file, manifest_file)
+    finally:
+        try:
+            os.unlink(tmp_file)
+        except FileNotFoundError:
+            pass
     invalidate_prompt_checkpoint_manager()
 
 
@@ -3228,6 +3242,25 @@ def _state_sequence_length(state):
     return 0
 
 
+def _materialize_sequence_state(state):
+    return tree_map(
+        lambda x: mx.contiguous(x)
+        if hasattr(x, "shape") and hasattr(x, "dtype")
+        else x,
+        state,
+    )
+
+
+def _eval_sequence_state(state):
+    leaves = [
+        value
+        for _, value in tree_flatten(state)
+        if hasattr(value, "shape") and hasattr(value, "dtype")
+    ]
+    if leaves:
+        mx.eval(*leaves)
+
+
 def _new_cache_like(cache, state):
     if isinstance(cache, CacheList):
         raise TypeError("CacheList must be handled recursively")
@@ -3266,6 +3299,17 @@ def slice_prompt_cache(cache: List[Any], start_tokens: int, end_tokens: Optional
         )
 
     return [slice_one(c) for c in cache]
+
+
+def materialize_prompt_cache(cache: List[Any]):
+    def materialize_one(c):
+        if isinstance(c, CacheList):
+            return CacheList(*(materialize_one(subcache) for subcache in c.caches))
+        state = _materialize_sequence_state(c.state)
+        _eval_sequence_state(state)
+        return _new_cache_like(c, state)
+
+    return [materialize_one(c) for c in cache]
 
 
 def concat_prompt_caches(left_cache: List[Any], right_cache: List[Any]):
