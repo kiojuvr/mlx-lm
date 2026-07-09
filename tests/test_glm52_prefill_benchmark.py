@@ -117,14 +117,19 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
     def test_configure_decode_profile_sets_env(self):
         env_key = benchmark.glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ENV
         isolate_key = benchmark.glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ISOLATE_ENV
+        native_decode_key = (
+            benchmark.glm_moe_dsa.GLM_DSA_NATIVE_DECODE_INDEXER_ENV
+        )
         old_env = os.environ.get(env_key)
         old_isolate = os.environ.get(isolate_key)
+        old_native_decode = os.environ.get(native_decode_key)
         args = Namespace(
             fast_prefill="default",
             native_sparse_prefill="default",
             native_sparse_quantized_kv="default",
             native_sparse_quantized_kv_max_context=None,
             native_indexer="default",
+            native_decode_indexer="enabled",
             native_q8_vup="default",
             native_q4_vup="default",
             q_a_dense_cache="default",
@@ -145,9 +150,11 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         try:
             os.environ.pop(env_key, None)
             os.environ.pop(isolate_key, None)
+            os.environ.pop(native_decode_key, None)
             benchmark.configure_glm_dsa_fast_prefill(args)
             self.assertEqual(os.environ.get(env_key), "1")
             self.assertEqual(os.environ.get(isolate_key), "1")
+            self.assertEqual(os.environ.get(native_decode_key), "1")
         finally:
             if old_env is None:
                 os.environ.pop(env_key, None)
@@ -157,6 +164,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 os.environ.pop(isolate_key, None)
             else:
                 os.environ[isolate_key] = old_isolate
+            if old_native_decode is None:
+                os.environ.pop(native_decode_key, None)
+            else:
+                os.environ[native_decode_key] = old_native_decode
 
     def test_collect_decode_profile_reports_stage_fields(self):
         old_profile = benchmark.glm_moe_dsa.get_glm_dsa_decode_profile
@@ -735,6 +746,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "source": "indexer-test",
                 "import_error": None,
                 "scores_available": True,
+                "decode_scores_available": True,
                 "topk_available": True,
                 "min_context": 4096,
             }
@@ -930,6 +942,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "source": "indexer-test",
                 "import_error": None,
                 "scores_available": True,
+                "decode_scores_available": True,
                 "topk_available": True,
                 "min_context": 4096,
             }
@@ -1105,6 +1118,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "source": None,
                 "import_error": "ImportError('missing indexer')",
                 "scores_available": False,
+                "decode_scores_available": False,
                 "topk_available": False,
                 "min_context": 4096,
             }
@@ -1168,6 +1182,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 "source": None,
                 "import_error": "missing-indexer",
                 "scores_available": False,
+                "decode_scores_available": False,
                 "topk_available": False,
                 "min_context": 4096,
             }

@@ -235,6 +235,105 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int causal_q_offset_;
 };
 
+class DSAIndexerDecodeScoresPrimitive : public Primitive {
+ public:
+  explicit DSAIndexerDecodeScoresPrimitive(Stream stream) : Primitive(stream) {}
+
+  static bool unsupported(
+      const array& q,
+      const array& k,
+      const array& weights,
+      Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    if (q.dtype() != k.dtype() || q.dtype() != weights.dtype()) {
+      return true;
+    }
+    if (q.dtype() != float16 && q.dtype() != bfloat16) {
+      return true;
+    }
+    if (!row_contiguous(q) || !row_contiguous(k) ||
+        !row_contiguous(weights)) {
+      return true;
+    }
+    if (q.ndim() != 4 || k.ndim() != 4 || weights.ndim() != 3) {
+      return true;
+    }
+    if (q.shape(1) != 32 || q.shape(2) != 1 || q.shape(3) != 128 ||
+        k.shape(1) != 1 || k.shape(3) != 128 ||
+        weights.shape(1) != 1 || weights.shape(2) != 32) {
+      return true;
+    }
+    if (q.shape(0) != k.shape(0) || q.shape(0) != weights.shape(0)) {
+      return true;
+    }
+    return k.shape(2) < 4096;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("DSAIndexerDecodeScoresPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+    const auto& weights = inputs[2];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int H = 32;
+    constexpr int D = 128;
+    constexpr int keys_per_tg = 4;
+    const int B = q.shape(0);
+    const int N = k.shape(2);
+
+    std::string base_name;
+    concatenate(
+        base_name,
+        "steel_dsa_indexer_score_decode_",
+        type_to_name(q),
+        "_h",
+        H,
+        "_d",
+        D,
+        "_keys",
+        keys_per_tg);
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto& compute_encoder = metal::get_command_encoder(s);
+    auto kernel = d.get_kernel(base_name, lib);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(weights, 2);
+    compute_encoder.set_output_array(out, 3);
+    compute_encoder.set_bytes(N, 4);
+
+    MTL::Size group_dims = MTL::Size(32, keys_per_tg, 1);
+    MTL::Size grid_dims = MTL::Size((N + keys_per_tg - 1) / keys_per_tg, B, 1);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(OMLXDSAIndexerDecodeScores)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& /* other */) const override {
+    return true;
+  }
+  auto state() const {
+    return std::make_tuple();
+  }
+};
+
 class DSATopKIndicesPrimitive : public Primitive {
  public:
   DSATopKIndicesPrimitive(
@@ -472,6 +571,57 @@ array dsa_indexer_scores(
           unused_causal_prefix_topk,
           skip_causal_future_store,
           causal_q_offset),
+      std::move(inputs));
+}
+
+array dsa_indexer_scores_decode(
+    const array& queries,
+    const array& keys,
+    const array& weights,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4 || weights.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_decode] expected q/k rank "
+        << "4 and weights rank 3, got " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.shape(0) != keys.shape(0) ||
+      queries.shape(0) != weights.shape(0) || queries.shape(1) != 32 ||
+      queries.shape(2) != 1 || queries.shape(3) != 128 ||
+      keys.shape(1) != 1 || keys.shape(3) != 128 ||
+      weights.shape(1) != 1 || weights.shape(2) != 32) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_decode] incompatible q, k, "
+        << "weights shapes: " << queries.shape() << ", " << keys.shape()
+        << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto final_type = result_type(queries, keys, weights);
+  if (final_type != float16 && final_type != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_decode] expected float16 or "
+        << "bfloat16 inputs, got " << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(astype(queries, final_type, stream), stream);
+  auto k = ensure_row_contiguous(astype(keys, final_type, stream), stream);
+  auto w = ensure_row_contiguous(astype(weights, final_type, stream), stream);
+
+  std::vector<array> inputs = {q, k, w};
+  if (DSAIndexerDecodeScoresPrimitive::unsupported(q, k, w, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_decode] unsupported M3 GLM shape.");
+  }
+
+  Shape out_shape{q.shape(0), 1, 1, k.shape(2)};
+  return array(
+      std::move(out_shape),
+      final_type,
+      std::make_shared<DSAIndexerDecodeScoresPrimitive>(stream),
       std::move(inputs));
 }
 

@@ -26,6 +26,13 @@ NB_MODULE(_ext, m) {
       "causal_q_offset"_a = -1,
       "stream"_a = nb::none());
   m.def(
+      "dsa_indexer_scores_decode",
+      &omlx::glm_kernels::dsa_indexer_scores_decode,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
       "scores"_a,

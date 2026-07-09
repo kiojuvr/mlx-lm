@@ -18,6 +18,12 @@ mx::array dsa_indexer_scores(
     int causal_q_offset = -1,
     mx::StreamOrDevice s = {});
 
+mx::array dsa_indexer_scores_decode(
+    const mx::array& queries,
+    const mx::array& keys,
+    const mx::array& weights,
+    mx::StreamOrDevice s = {});
+
 mx::array dsa_topk_indices(
     const mx::array& scores,
     int topk,

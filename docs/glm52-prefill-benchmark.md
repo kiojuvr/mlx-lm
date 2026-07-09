@@ -113,14 +113,14 @@ projection/V-up toggles did not improve decode in that sweep:
 | native q4 q_a + q_b | 11.804 | 11.603 |
 | q_a dense cache | 15.635 | 15.363 |
 | native q4 V-up | 15.839 | 15.565 |
+| native decode DSA indexer, opt-in | 15.657 | 15.383 |
 
 The current decode path already gathers the selected `topk=2048` quantized MLA
 latent KV entries before dequantizing them when GLM DSA top-k indices are
 available. In an 8K decode profile, selected latent KV dequantization was a
 contributor but not the dominant cost. The next decode-side implementation
-targets are therefore a fused selected gather/dequant/attention kernel, a
-decode-specific native DSA indexer path for `L == 1`, or MTP/speculative decode
-integration.
+targets are therefore a fused selected gather/dequant/attention kernel or
+MTP/speculative decode integration.
 
 Two exact low-risk decode variants were tested and not adopted:
 
@@ -132,6 +132,11 @@ Two exact low-risk decode variants were tested and not adopted:
   about 16.52 tok/s with the current Python/MLX decode indexer. A useful native
   decode indexer would need an actual single-query kernel rather than relying on
   the prefill score kernel's padded path.
+- A true single-query native DSA decode score kernel passes the model-free smoke
+  check, but the 8K exact-hit 64-token A/B measured 15.66 tok/s versus 15.99
+  tok/s with the current default path. It is kept as an opt-in probe behind
+  `MLX_LM_GLM_DSA_NATIVE_DECODE_INDEXER=1` or benchmark
+  `--native-decode-indexer enabled`, and remains default-off.
 
 ## GLM DSA Sparse Prefill Fast Path
 
@@ -261,12 +266,25 @@ inputs, and effective context at or above 4096. It remains compatible with GLM
 MLA int8 KV cache because it reads the separate DSA indexer cache rather than
 the quantized MLA latent KV cache.
 
+The native extension also exposes a single-query decode score symbol. It is not
+part of the default route: enable it only for measurement with:
+
+```sh
+MLX_LM_GLM_DSA_NATIVE_DECODE_INDEXER=1 python ...
+```
+
+or in the benchmark with `--native-decode-indexer enabled`. It was slower than
+the current default in the 8K exact-hit decode-context A/B above.
+
 Benchmark rows report:
 
 - `glm_dsa_native_indexer`
+- `glm_dsa_native_indexer_decode`
+- `glm_dsa_native_indexer_decode_env`
 - `glm_dsa_native_indexer_available`
 - `glm_dsa_native_indexer_source`
 - `glm_dsa_native_indexer_scores_available`
+- `glm_dsa_native_indexer_decode_scores_available`
 - `glm_dsa_native_indexer_topk_available`
 - `glm_dsa_native_indexer_hits`
 - `glm_dsa_native_indexer_fallback_reasons`
@@ -284,8 +302,10 @@ python benchmarks/glm52_prefill_benchmark.py \
 The expected result is `native_smoke_passed=True` with
 `native_smoke_source='mlx_lm.custom_kernels.glm_moe_dsa'`. The same run also
 checks native DSA indexer score/top-k; expect
-`native_indexer_smoke_passed=True`. It also checks the native q8 V-up projection
-for quantized GLM DSA `unembed_out` weights; expect
+`native_indexer_smoke_passed=True`. It also checks the opt-in decode score
+symbol without loading the model; expect
+`native_indexer_decode_smoke_passed=True`. It also checks the native q8 V-up
+projection for quantized GLM DSA `unembed_out` weights; expect
 `native_q8_vup_smoke_passed=True`.
 
 Add timing runs to compare native q8 V-up with the MLX `quantized_matmul`

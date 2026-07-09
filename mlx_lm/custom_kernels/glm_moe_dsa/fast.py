@@ -25,6 +25,7 @@ else:
 
 NATIVE_SYMBOLS = (
     "dsa_indexer_scores",
+    "dsa_indexer_scores_decode",
     "dsa_topk_indices",
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
@@ -95,6 +96,28 @@ def dsa_indexer_scores(
         unused_causal_prefix_topk=unused_causal_prefix_topk,
         skip_causal_future_store=skip_causal_future_store,
         causal_q_offset=causal_q_offset,
+        stream=stream or mx.gpu,
+    )
+
+
+def dsa_indexer_scores_decode(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None:
+        return _ext.dsa_indexer_scores_decode(
+            queries,
+            keys,
+            weights,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.dsa_indexer_scores_decode(
+        queries,
+        keys,
+        weights,
         stream=stream or mx.gpu,
     )
 

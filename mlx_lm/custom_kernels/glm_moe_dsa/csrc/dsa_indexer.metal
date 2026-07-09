@@ -25,6 +25,12 @@ struct OMLXDSATopKParams {
       "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,              \
       dsa_indexer_score, itype, bm, bn, bk, wm, wn)
 
+#define instantiate_dsa_indexer_score_decode(iname, itype, h, d, keys)  \
+  instantiate_kernel(                                                   \
+      "steel_dsa_indexer_score_decode_" #iname                          \
+      "_h" #h "_d" #d "_keys" #keys,                                    \
+      dsa_indexer_score_decode, itype, h, d, keys)
+
 #define instantiate_dsa_topk_indices(iname, itype, topk, threads)       \
   instantiate_kernel(                                                   \
       "steel_dsa_topk_indices_" #iname "_topk" #topk "_t" #threads,    \
@@ -36,6 +42,8 @@ struct OMLXDSATopKParams {
 
 instantiate_dsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
 instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
+instantiate_dsa_indexer_score_decode(float16, half, 32, 128, 4);
+instantiate_dsa_indexer_score_decode(bfloat16, bfloat16_t, 32, 128, 4);
 
 instantiate_dsa_topk_indices(float16, half, 2048, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 2048, 1024);

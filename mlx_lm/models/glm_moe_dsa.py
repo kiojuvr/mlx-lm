@@ -47,6 +47,7 @@ GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV = (
 )
 GLM_DSA_SPARSE_MLA_TILE_ENV = "MLX_LM_GLM_DSA_SPARSE_MLA_TILE"
 GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
+GLM_DSA_NATIVE_DECODE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_DECODE_INDEXER"
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
 GLM_DSA_NATIVE_Q4_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_VUP"
 GLM_DSA_Q_A_DENSE_CACHE_ENV = "MLX_LM_GLM_DSA_Q_A_DENSE_CACHE"
@@ -146,6 +147,10 @@ def _native_sparse_prefill_quantized_kv_enabled() -> bool:
 
 def _native_indexer_enabled() -> bool:
     return _env_flag(GLM_DSA_NATIVE_INDEXER_ENV, True)
+
+
+def _native_decode_indexer_enabled() -> bool:
+    return _env_flag(GLM_DSA_NATIVE_DECODE_INDEXER_ENV, False)
 
 
 def _native_q8_vup_enabled() -> bool:
@@ -754,6 +759,15 @@ def _native_indexer_available():
     )
 
 
+def _native_decode_indexer_available():
+    fast, _source, _error = _native_indexer_fast_module()
+    if fast is None:
+        return False
+    return fast.has_symbol("dsa_indexer_scores_decode") and fast.has_symbol(
+        "dsa_topk_indices"
+    )
+
+
 def _native_indexer_scores(
     queries: mx.array,
     keys: mx.array,
@@ -787,6 +801,19 @@ def _native_indexer_scores(
 
     _B, _H, L, _D = queries.shape
     K = keys.shape[2]
+    if L == 1:
+        if not fast.has_symbol("dsa_indexer_scores_decode"):
+            return None
+        try:
+            return fast.dsa_indexer_scores_decode(
+                queries,
+                keys,
+                weights,
+                stream=mx.gpu,
+            )
+        except Exception:
+            return None
+
     q_pad = (-L) % 64
     k_pad = (-K) % 64
     if causal and causal_q_offset < 0 and (q_pad or k_pad):
@@ -871,13 +898,18 @@ def get_glm_dsa_native_sparse_prefill_status():
 def get_glm_dsa_native_indexer_status():
     fast, source, import_error = _native_indexer_fast_module()
     scores_available = fast is not None and fast.has_symbol("dsa_indexer_scores")
+    decode_scores_available = fast is not None and fast.has_symbol(
+        "dsa_indexer_scores_decode"
+    )
     topk_available = fast is not None and fast.has_symbol("dsa_topk_indices")
     return {
         "enabled": _native_indexer_enabled(),
+        "decode_enabled": _native_decode_indexer_enabled(),
         "available": scores_available and topk_available,
         "source": source if scores_available and topk_available else None,
         "import_error": repr(import_error) if import_error is not None else None,
         "scores_available": scores_available,
+        "decode_scores_available": decode_scores_available,
         "topk_available": topk_available,
         "min_context": 4096,
     }
@@ -1250,7 +1282,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if B != 1:
             return False, "batch_size_not_one"
         if L <= 1:
-            return False, "decode"
+            if not _native_decode_indexer_enabled():
+                return False, "decode"
+            if not _native_decode_indexer_available():
+                return False, "decode_missing_symbol"
         if H != 32:
             return False, f"unsupported_index_heads:{H}"
         if D != 128:

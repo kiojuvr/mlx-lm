@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <metal_simdgroup>
+
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 
 using namespace mlx::steel;
@@ -311,5 +313,46 @@ dsa_indexer_score(
         ai++;
       }
     }
+  }
+}
+
+template <typename T, int H, int D, int KEYS_PER_TG>
+[[kernel, max_total_threads_per_threadgroup(KEYS_PER_TG * 32)]] void
+dsa_indexer_score_decode(
+    const device T* Q [[buffer(0)]],
+    const device T* K [[buffer(1)]],
+    const device T* W [[buffer(2)]],
+    device T* O [[buffer(3)]],
+    const constant int& N [[buffer(4)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]]) {
+  const int key = int(tid.x) * KEYS_PER_TG + int(simd_group_id);
+  const int b = int(tid.y);
+  if (key >= N) {
+    return;
+  }
+
+  const device T* q_base = Q + size_t(b) * H * D;
+  const device T* k_base = K + size_t(b) * N * D + size_t(key) * D;
+  const device T* w_base = W + size_t(b) * H;
+
+  float score = 0.0f;
+  STEEL_PRAGMA_UNROLL
+  for (int h = 0; h < H; ++h) {
+    float dot = 0.0f;
+    STEEL_PRAGMA_UNROLL
+    for (int d = int(simd_lane_id); d < D; d += 32) {
+      dot += static_cast<float>(q_base[size_t(h) * D + d]) *
+          static_cast<float>(k_base[d]);
+    }
+    dot = simd_sum(dot);
+    if (simd_lane_id == 0) {
+      score += max(dot, 0.0f) * static_cast<float>(w_base[h]);
+    }
+  }
+
+  if (simd_lane_id == 0) {
+    O[size_t(b) * N + key] = static_cast<T>(score);
   }
 }
