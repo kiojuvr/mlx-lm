@@ -125,7 +125,7 @@ python -m mlx_lm server \
   --prefill-step-size 8192 \
   --prefill-max-qk-tokens 67108864 \
   --glm-dsa-adaptive-prefill-step-size 0 \
-  --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
+  --checkpoint-cache-dir /Volumes/USB-SSD-RAID-0/mlx-lm/prompt-checkpoints \
   --checkpoint-save-exact disabled \
   --checkpoint-prefill-frontier-save disabled \
   --checkpoint-delta-chunk-tokens 8192 \
