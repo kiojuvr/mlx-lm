@@ -149,14 +149,16 @@ Recent OpenCode task log, July 9, 2026. This run primarily measured
 server-cache-covered suffix prefill; disk checkpoint candidates were found, but
 the already-live server cache covered the useful prefixes.
 
-Prefill / first-token measurements:
+Prefill / first-token measurements. Prefill TPS is fresh prefill tokens divided
+by summed prefill chunk time; first-token time includes lookup, scheduling, and
+the final decode step overhead around those chunks.
 
-| Workload | Prompt tokens | Reused tokens | Fresh prompt tokens | Prefill chunks | First token |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Cold small first request | 3,458 | 0 | 3,458 | 22.308s | 22.859s |
-| Mostly cached tool turn | 12,918 | 12,654 | 264 | 2.735s | 2.945s |
-| Larger suffix turn | 43,143 | 32,699 | 10,444 | 71.657s | 71.960s |
-| Final long decode turn | 44,417 | 44,086 | 331 | 3.279s | 3.549s |
+| Workload | Prompt tokens | Reused tokens | Fresh prompt tokens | Prefill chunks | Prefill TPS | First token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cold small first request | 3,458 | 0 | 3,458 | 22.308s | 155.0 | 22.859s |
+| Mostly cached tool turn | 12,918 | 12,654 | 264 | 2.735s | 96.2 | 2.945s |
+| Larger suffix turn | 43,143 | 32,699 | 10,444 | 71.657s | 145.7 | 71.960s |
+| Final long decode turn | 44,417 | 44,086 | 331 | 3.279s | 100.6 | 3.549s |
 
 Decode measurements:
 
