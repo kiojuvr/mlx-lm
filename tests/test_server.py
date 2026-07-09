@@ -38,8 +38,10 @@ from mlx_lm.server import (
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+    DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
     GlobalSessionLoopGuard,
@@ -110,6 +112,12 @@ class DummyModelProvider:
                 ),
                 "checkpoint_continued_interval_tokens": (
                     DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
+                ),
+                "checkpoint_prefill_frontier_save": (
+                    DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE
+                ),
+                "checkpoint_delta_chunk_tokens": (
+                    DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS
                 ),
                 "checkpoint_max_age_seconds": (
                     DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS
@@ -410,6 +418,12 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
             "checkpoint_continued_interval_tokens": (
                 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
             ),
+            "checkpoint_prefill_frontier_save": (
+                DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE
+            ),
+            "checkpoint_delta_chunk_tokens": (
+                DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS
+            ),
             "checkpoint_max_age_seconds": DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
             "checkpoint_post_response_save_mode": "async",
             "checkpoint_async_save_shutdown_timeout": (
@@ -476,20 +490,34 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
 
         self.assertEqual(lengths, [])
 
-    def test_continued_frontier_args_align_interval_up(self):
+    def test_continued_frontier_args_disabled_by_default(self):
         self.assertEqual(
             _prompt_checkpoint_continued_frontier_args(self._args()),
+            (0, 0),
+        )
+
+    def test_continued_frontier_args_align_interval_up_when_enabled(self):
+        self.assertEqual(
+            _prompt_checkpoint_continued_frontier_args(
+                self._args(checkpoint_prefill_frontier_save="enabled")
+            ),
             (10_240, 10_240),
         )
         self.assertEqual(
             _prompt_checkpoint_continued_frontier_args(
-                self._args(checkpoint_boundary_align_tokens=0)
+                self._args(
+                    checkpoint_prefill_frontier_save="enabled",
+                    checkpoint_boundary_align_tokens=0,
+                )
             ),
             (10_000, 10_000),
         )
         self.assertEqual(
             _prompt_checkpoint_continued_frontier_args(
-                self._args(checkpoint_continued_interval_tokens=0)
+                self._args(
+                    checkpoint_prefill_frontier_save="enabled",
+                    checkpoint_continued_interval_tokens=0,
+                )
             ),
             (0, 0),
         )
@@ -723,6 +751,168 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(prompt_cache_token_length(captured["cache"]), 2)
         self.assertEqual(captured["kwargs"]["prefix_tokens"], cache_key)
 
+    def test_save_delta_prompt_checkpoint_skips_existing_valid_delta(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=cli_args,
+        )
+        tokenizer = types.SimpleNamespace(
+            decode=lambda tokens, **kwargs: "".join(f"<{token}>" for token in tokens)
+        )
+        prompt_cache = [KVCache()]
+        keys = mx.array(list(range(10)), dtype=mx.float32).reshape(1, 1, 5, 2)
+        prompt_cache[0].update_and_fetch(keys, keys + 100)
+        existing_delta = materialize_prompt_cache(slice_prompt_cache(prompt_cache, 3, 5))
+        cache_key = [1, 2, 3, 4, 5]
+        base_tokens = [1, 2, 3]
+        base_checkpoint = RenderedPromptCheckpoint(
+            prompt_cache=[],
+            prefix_tokens=base_tokens,
+            suffix_tokens=[],
+            kind="frontier",
+            rendered_prefix_bytes=9,
+            checkpoint_path="/tmp/base-3.safetensors",
+        )
+        existing_metadata = {
+            "checkpoint_label": "delta",
+            PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY: "base-3.safetensors",
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY: prompt_prefix_hash(
+                base_tokens
+            ),
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY: "3",
+            PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY: "3",
+            PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY: "5",
+        }
+
+        with mock.patch(
+            "mlx_lm.server.prompt_checkpoint_file",
+            return_value="/tmp/delta-5.safetensors",
+        ), mock.patch(
+            "mlx_lm.server.os.path.exists",
+            return_value=True,
+        ), mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint",
+            return_value=(existing_delta, existing_metadata),
+        ) as load_checkpoint, mock.patch(
+            "mlx_lm.server.save_prompt_checkpoint",
+            side_effect=AssertionError("valid existing delta should be reused"),
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest, mock.patch(
+            "mlx_lm.server.prune_prompt_checkpoints"
+        ) as prune:
+            saved = generator._save_delta_prompt_checkpoint(
+                tokenizer,
+                prompt_cache,
+                cache_key,
+                base_checkpoint=base_checkpoint,
+            )
+
+        self.assertTrue(saved)
+        load_checkpoint.assert_called_once()
+        update_manifest.assert_called_once()
+        self.assertEqual(update_manifest.call_args.kwargs["kind"], "delta")
+        prune.assert_called_once()
+
+    def test_save_delta_prompt_checkpoint_chunks_long_delta(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+            checkpoint_delta_chunk_tokens=2,
+        )
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=cli_args,
+        )
+        tokenizer = types.SimpleNamespace(
+            decode=lambda tokens, **kwargs: "".join(f"<{token}>" for token in tokens)
+        )
+        prompt_cache = [KVCache()]
+        keys = mx.array(list(range(14)), dtype=mx.float32).reshape(1, 1, 7, 2)
+        prompt_cache[0].update_and_fetch(keys, keys + 100)
+        cache_key = [1, 2, 3, 4, 5, 6, 7]
+        base_checkpoint = RenderedPromptCheckpoint(
+            prompt_cache=[],
+            prefix_tokens=[1, 2, 3],
+            suffix_tokens=[],
+            kind="frontier",
+            rendered_prefix_bytes=9,
+            checkpoint_path="/tmp/base-3.safetensors",
+        )
+        saved = []
+
+        def fake_checkpoint_file(prefix_tokens):
+            return f"/tmp/delta-{len(prefix_tokens)}.safetensors"
+
+        def fake_save_prompt_checkpoint(file_name, cache, **kwargs):
+            saved.append(
+                {
+                    "file_name": file_name,
+                    "cache_tokens": prompt_cache_token_length(cache),
+                    "prefix_tokens": kwargs["prefix_tokens"],
+                    "metadata": kwargs["metadata"],
+                }
+            )
+            return dict(kwargs["metadata"])
+
+        with mock.patch(
+            "mlx_lm.server.prompt_checkpoint_file",
+            fake_checkpoint_file,
+        ), mock.patch(
+            "mlx_lm.server.save_prompt_checkpoint",
+            fake_save_prompt_checkpoint,
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest, mock.patch(
+            "mlx_lm.server.prune_prompt_checkpoints"
+        ) as prune:
+            ok = generator._save_delta_prompt_checkpoint(
+                tokenizer,
+                prompt_cache,
+                cache_key,
+                base_checkpoint=base_checkpoint,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            [entry["file_name"] for entry in saved],
+            [
+                "/tmp/delta-5.safetensors",
+                "/tmp/delta-7.safetensors",
+            ],
+        )
+        self.assertEqual([entry["cache_tokens"] for entry in saved], [2, 2])
+        self.assertEqual(saved[0]["prefix_tokens"], cache_key[:5])
+        self.assertEqual(
+            saved[0]["metadata"][PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY],
+            "base-3.safetensors",
+        )
+        self.assertEqual(
+            saved[0]["metadata"][
+                PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY
+            ],
+            "3",
+        )
+        self.assertEqual(saved[1]["prefix_tokens"], cache_key)
+        self.assertEqual(
+            saved[1]["metadata"][PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY],
+            "delta-5.safetensors",
+        )
+        self.assertEqual(
+            saved[1]["metadata"][
+                PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY
+            ],
+            "5",
+        )
+        self.assertEqual(update_manifest.call_count, 2)
+        self.assertEqual(prune.call_count, 2)
+
     def test_load_delta_prompt_checkpoint_concatenates_base_and_delta(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
@@ -752,15 +942,21 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
             PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY: "5",
         }
 
-        def fake_load(path, **kwargs):
+        def fake_load_with_metadata_prefix(path, **kwargs):
             if path.endswith("delta-5.safetensors"):
                 return kv_cache(6, 2), target_tokens, metadata
+            raise AssertionError(path)
+
+        def fake_load(path, **kwargs):
             if path.endswith("base-3.safetensors"):
-                return kv_cache(0, 3), base_tokens, {}
+                return kv_cache(0, 3), {}
             raise AssertionError(path)
 
         with mock.patch(
             "mlx_lm.server.load_prompt_checkpoint_with_metadata_prefix",
+            fake_load_with_metadata_prefix,
+        ), mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint",
             fake_load,
         ):
             merged, cached_tokens, stored_tokens, loaded_metadata, base_path, base = (
@@ -771,8 +967,80 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(cached_tokens, target_tokens)
         self.assertEqual(stored_tokens, target_tokens)
         self.assertIs(loaded_metadata, metadata)
-        self.assertEqual(base_path, "/tmp/base-3.safetensors")
-        self.assertEqual(base, base_tokens)
+        self.assertEqual(base_path, "/tmp/delta-5.safetensors")
+        self.assertEqual(base, target_tokens)
+
+    def test_load_delta_prompt_checkpoint_concatenates_delta_chain(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            cli_args=self._args(kv_bits=None, kv_group_size=64, quantized_kv_start=0),
+        )
+
+        def kv_cache(start, length):
+            cache = KVCache()
+            values = mx.array(
+                list(range(start, start + length * 2)),
+                dtype=mx.float32,
+            ).reshape(1, 1, length, 2)
+            cache.update_and_fetch(values, values + 100)
+            return [cache]
+
+        base_tokens = [1, 2, 3]
+        mid_tokens = [1, 2, 3, 4, 5]
+        target_tokens = [1, 2, 3, 4, 5, 6, 7]
+        mid_metadata = {
+            "checkpoint_label": "delta",
+            PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY: "base-3.safetensors",
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY: prompt_prefix_hash(
+                base_tokens
+            ),
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY: "3",
+            PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY: "3",
+            PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY: "5",
+        }
+        target_metadata = {
+            "checkpoint_label": "delta",
+            PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY: "delta-5.safetensors",
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY: prompt_prefix_hash(
+                mid_tokens
+            ),
+            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY: "5",
+            PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY: "5",
+            PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY: "7",
+        }
+
+        def fake_load_with_metadata_prefix(path, **kwargs):
+            if path.endswith("delta-7.safetensors"):
+                return kv_cache(10, 2), target_tokens, target_metadata
+            if path.endswith("delta-5.safetensors"):
+                return kv_cache(6, 2), mid_tokens, mid_metadata
+            raise AssertionError(path)
+
+        def fake_load(path, **kwargs):
+            if path.endswith("delta-5.safetensors"):
+                return kv_cache(6, 2), mid_metadata
+            if path.endswith("base-3.safetensors"):
+                return kv_cache(0, 3), {"checkpoint_label": "frontier"}
+            raise AssertionError(path)
+
+        with mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint_with_metadata_prefix",
+            fake_load_with_metadata_prefix,
+        ), mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint",
+            fake_load,
+        ):
+            merged, cached_tokens, stored_tokens, loaded_metadata, base_path, base = (
+                generator._load_delta_prompt_checkpoint("/tmp/delta-7.safetensors")
+            )
+
+        self.assertEqual(prompt_cache_token_length(merged), 7)
+        self.assertEqual(cached_tokens, target_tokens)
+        self.assertEqual(stored_tokens, target_tokens)
+        self.assertIs(loaded_metadata, target_metadata)
+        self.assertEqual(base_path, "/tmp/delta-7.safetensors")
+        self.assertEqual(base, target_tokens)
 
     def test_shutdown_flush_saves_current_model_continued_checkpoint(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
@@ -1196,6 +1464,14 @@ class TestServerCLI(unittest.TestCase):
             DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
         )
         self.assertEqual(
+            args.checkpoint_prefill_frontier_save,
+            DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE,
+        )
+        self.assertEqual(
+            args.checkpoint_delta_chunk_tokens,
+            DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS,
+        )
+        self.assertEqual(
             args.checkpoint_max_age_seconds,
             DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
         )
@@ -1322,6 +1598,10 @@ class TestServerCLI(unittest.TestCase):
                 "1024",
                 "--checkpoint-continued-interval-tokens",
                 "8192",
+                "--checkpoint-prefill-frontier-save",
+                "enabled",
+                "--checkpoint-delta-chunk-tokens",
+                "4096",
                 "--checkpoint-max-age-seconds",
                 "3600",
                 "--checkpoint-save-exact",
@@ -1346,6 +1626,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.checkpoint_boundary_trim_tokens, 16)
         self.assertEqual(args.checkpoint_boundary_align_tokens, 1024)
         self.assertEqual(args.checkpoint_continued_interval_tokens, 8192)
+        self.assertEqual(args.checkpoint_prefill_frontier_save, "enabled")
+        self.assertEqual(args.checkpoint_delta_chunk_tokens, 4096)
         self.assertEqual(args.checkpoint_max_age_seconds, 3600)
         self.assertEqual(args.checkpoint_save_exact, "disabled")
         self.assertEqual(args.checkpoint_post_response_save_mode, "sync")
@@ -1484,6 +1766,12 @@ class TestServerCLI(unittest.TestCase):
             checkpoint_continued_interval_tokens=(
                 DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
             ),
+            checkpoint_prefill_frontier_save=(
+                DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE
+            ),
+            checkpoint_delta_chunk_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS
+            ),
             checkpoint_save_exact="disabled",
             kv_bits=8,
             kv_group_size=64,
@@ -1589,8 +1877,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["prompt_checkpoint_store_prefix_lengths"], [3])
         self.assertTrue(captured["prompt_checkpoint_allow_existing_cache"])
         self.assertFalse(captured["prompt_checkpoint_save_exact"])
-        self.assertEqual(captured["prompt_checkpoint_frontier_min_tokens"], 10_240)
-        self.assertEqual(captured["prompt_checkpoint_frontier_stride_tokens"], 10_240)
+        self.assertEqual(captured["prompt_checkpoint_frontier_min_tokens"], 0)
+        self.assertEqual(captured["prompt_checkpoint_frontier_stride_tokens"], 0)
         self.assertEqual(captured["prefill_max_qk_tokens"], 67_108_864)
         self.assertEqual(captured["glm_dsa_adaptive_prefill_step_size"], 8192)
         self.assertEqual(captured["glm_dsa_adaptive_prefill_after_tokens"], 4096)

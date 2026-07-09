@@ -53,6 +53,7 @@ from .models.cache import (
     PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY,
     PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY,
+    PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY,
     DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
     PromptCacheCheckpointError,
     can_trim_prompt_cache,
@@ -61,6 +62,7 @@ from .models.cache import (
     expected_glm_mla_kv_settings_metadata,
     expected_prompt_cache_layout_signature,
     find_prompt_checkpoint_rendered_prefix,
+    load_prompt_checkpoint,
     load_prompt_checkpoint_with_metadata_prefix,
     make_prompt_cache,
     materialize_prompt_cache,
@@ -91,6 +93,8 @@ DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS = 65_536
 DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT = 2
+DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE = "disabled"
+DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS = 8192
 
 
 def get_system_fingerprint():
@@ -400,6 +404,14 @@ def _prompt_checkpoint_async_save_backlog_limit(args):
     )
 
 
+def _prompt_checkpoint_delta_chunk_tokens(args):
+    return _prompt_checkpoint_policy_int(
+        args,
+        "checkpoint_delta_chunk_tokens",
+        DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS,
+    )
+
+
 def _prompt_checkpoint_boundary_store_length(
     token_count,
     *,
@@ -481,6 +493,15 @@ def _prompt_checkpoint_continued_step(args):
 
 
 def _prompt_checkpoint_continued_frontier_args(args):
+    if (
+        getattr(
+            args,
+            "checkpoint_prefill_frontier_save",
+            DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE,
+        )
+        != "enabled"
+    ):
+        return 0, 0
     continued_step = _prompt_checkpoint_continued_step(args)
     if continued_step <= 0:
         return 0, 0
@@ -1478,7 +1499,15 @@ class ResponseGenerator:
         except (TypeError, ValueError):
             return default
 
-    def _load_delta_prompt_checkpoint(self, checkpoint_path):
+    def _load_delta_prompt_checkpoint(self, checkpoint_path, _seen=None):
+        checkpoint_path = os.path.abspath(checkpoint_path)
+        if _seen is None:
+            _seen = set()
+        if checkpoint_path in _seen:
+            raise PromptCacheCheckpointError("delta checkpoint chain cycle")
+        if len(_seen) >= 256:
+            raise PromptCacheCheckpointError("delta checkpoint chain too deep")
+        _seen.add(checkpoint_path)
         expected_settings = expected_glm_mla_kv_settings_metadata(
             self.model_provider.model,
             kv_bits=self.cli_args.kv_bits,
@@ -1548,9 +1577,10 @@ class ResponseGenerator:
             quantized_kv_start=self.cli_args.quantized_kv_start,
             cache_token_length=base_prefix_length,
         )
-        base_cache, loaded_base_tokens, _ = (
-            load_prompt_checkpoint_with_metadata_prefix(
+        base_cache, base_metadata = (
+            load_prompt_checkpoint(
                 base_path,
+                prefix_tokens=base_tokens,
                 checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
                 model=self.model_provider.model,
                 expected_glm_mla_kv_quantization=expected_quantization,
@@ -1559,16 +1589,22 @@ class ResponseGenerator:
                 return_metadata=True,
             )
         )
-        if loaded_base_tokens != base_tokens:
-            raise PromptCacheCheckpointError("delta checkpoint base tokens mismatch")
+        if base_metadata.get("checkpoint_label") == "delta":
+            base_cache, loaded_base_tokens, _, _, _, _ = (
+                self._load_delta_prompt_checkpoint(base_path, _seen=_seen)
+            )
+            if loaded_base_tokens != base_tokens:
+                raise PromptCacheCheckpointError(
+                    "delta checkpoint chain base tokens mismatch"
+                )
 
         return (
             concat_prompt_caches(base_cache, delta_cache),
             target_tokens[:cache_tokens],
             target_tokens,
             metadata,
-            base_path,
-            base_tokens,
+            checkpoint_path,
+            target_tokens[:cache_tokens],
         )
 
     def _load_rendered_prompt_checkpoint(self, tokenizer, rendered_prompt):
@@ -2033,90 +2069,313 @@ class ResponseGenerator:
             )
             return False
 
-        prefix_tokens = cache_key[:target_length]
-        metadata = {
-            "checkpoint_label": "delta",
-            PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY: os.path.basename(
-                base_path
-            ),
-            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY: prompt_prefix_hash(
-                base_tokens
-            ),
-            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY: str(base_length),
-            PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY: str(base_length),
-            PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY: str(target_length),
-            PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY: (
-                prompt_checkpoint_prefix_tokens_metadata(prefix_tokens)
-            ),
-        }
-        rendered_prefix = None
-        if rendered_continuation is not None:
-            rendered_continuation_bytes = rendered_prompt_bytes(rendered_continuation)
-            try:
-                rendered_prefix = self._decode_checkpoint_prefix(
-                    tokenizer,
-                    prefix_tokens,
-                )
-            except Exception:
-                rendered_prefix = None
-            rendered_prefix_bytes = rendered_prompt_bytes(rendered_prefix)
-            if (
-                not rendered_prefix_bytes
-                or rendered_continuation_bytes is None
-                or not rendered_continuation_bytes.startswith(rendered_prefix_bytes)
-            ):
-                rendered_prefix = None
-        if rendered_prefix is not None:
-            metadata.update(prompt_checkpoint_rendered_prefix_metadata(rendered_prefix))
+        rendered_continuation_bytes = (
+            rendered_prompt_bytes(rendered_continuation)
+            if rendered_continuation is not None
+            else None
+        )
 
-        checkpoint_path = prompt_checkpoint_file(prefix_tokens)
-        try:
-            checkpoint_metadata = save_prompt_checkpoint(
-                checkpoint_path,
+        def delta_metadata(prefix_tokens, base_tokens, base_path, base_length, end):
+            metadata = {
+                "checkpoint_label": "delta",
+                PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY: os.path.basename(
+                    base_path
+                ),
+                PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY: (
+                    prompt_prefix_hash(base_tokens)
+                ),
+                PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY: str(
+                    base_length
+                ),
+                PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY: str(
+                    base_length
+                ),
+                PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY: str(end),
+                PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY: (
+                    prompt_checkpoint_prefix_tokens_metadata(prefix_tokens)
+                ),
+            }
+            rendered_prefix = None
+            if rendered_continuation_bytes is not None:
+                try:
+                    rendered_prefix = self._decode_checkpoint_prefix(
+                        tokenizer,
+                        prefix_tokens,
+                    )
+                except Exception:
+                    rendered_prefix = None
+                rendered_prefix_bytes = rendered_prompt_bytes(rendered_prefix)
+                if (
+                    not rendered_prefix_bytes
+                    or not rendered_continuation_bytes.startswith(
+                        rendered_prefix_bytes
+                    )
+                ):
+                    rendered_prefix = None
+            if rendered_prefix is not None:
+                metadata.update(
+                    prompt_checkpoint_rendered_prefix_metadata(rendered_prefix)
+                )
+            return metadata, rendered_prefix is not None
+
+        def save_one_delta(
+            chunk_cache,
+            *,
+            prefix_tokens,
+            base_tokens,
+            base_path,
+            base_length,
+            end,
+            chunk_materialize_seconds,
+            chunk_index=1,
+            chunk_count=1,
+            protected_files=None,
+        ):
+            metadata, has_rendered_metadata = delta_metadata(
+                prefix_tokens,
+                base_tokens,
+                base_path,
+                base_length,
+                end,
+            )
+            checkpoint_path = prompt_checkpoint_file(prefix_tokens)
+            if os.path.exists(checkpoint_path):
+                try:
+                    existing_cache, existing_metadata = load_prompt_checkpoint(
+                        checkpoint_path,
+                        prefix_tokens=prefix_tokens,
+                        checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                        model=self.model_provider.model,
+                        expected_glm_mla_kv_settings=(
+                            expected_glm_mla_kv_settings_metadata(
+                                self.model_provider.model,
+                                kv_bits=self.cli_args.kv_bits,
+                                kv_group_size=self.cli_args.kv_group_size,
+                                quantized_kv_start=(
+                                    self.cli_args.quantized_kv_start
+                                ),
+                            )
+                        ),
+                        return_metadata=True,
+                    )
+                    if (
+                        existing_metadata.get("checkpoint_label") == "delta"
+                        and existing_metadata.get(
+                            PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY
+                        )
+                        == os.path.basename(base_path)
+                        and self._checkpoint_metadata_int(
+                            existing_metadata,
+                            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY,
+                            0,
+                        )
+                        == base_length
+                        and self._checkpoint_metadata_int(
+                            existing_metadata,
+                            PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY,
+                            0,
+                        )
+                        == base_length
+                        and self._checkpoint_metadata_int(
+                            existing_metadata,
+                            PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY,
+                            0,
+                        )
+                        == end
+                        and existing_metadata.get(
+                            PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY
+                        )
+                        == prompt_prefix_hash(base_tokens)
+                        and prompt_cache_token_length(existing_cache)
+                        == end - base_length
+                        and (
+                            not has_rendered_metadata
+                            or existing_metadata.get(
+                                PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY
+                            )
+                        )
+                    ):
+                        update_prompt_checkpoint_manifest(
+                            checkpoint_path,
+                            prefix_length=end,
+                            kind="delta",
+                            metadata=existing_metadata,
+                        )
+                        prune_prompt_checkpoints(
+                            protected_files=protected_files
+                            or [
+                                os.path.basename(base_path),
+                                os.path.basename(checkpoint_path),
+                            ],
+                            max_age_seconds=_prompt_checkpoint_max_age_seconds(
+                                self.cli_args
+                            ),
+                        )
+                        _prompt_checkpoint_debug(
+                            "save delta skipped existing valid "
+                            f"file={os.path.basename(checkpoint_path)} "
+                            f"target_length={end} "
+                            f"base_length={base_length} "
+                            f"delta_tokens={end - base_length} "
+                            f"chunk_index={chunk_index} "
+                            f"chunk_count={chunk_count}"
+                        )
+                        return checkpoint_path
+                except PromptCacheCheckpointError:
+                    _prompt_checkpoint_debug(
+                        "save delta existing rejected "
+                        f"file={os.path.basename(checkpoint_path)} "
+                        f"target_length={end} "
+                        f"base_length={base_length} "
+                        f"chunk_index={chunk_index} "
+                        f"chunk_count={chunk_count}"
+                    )
+            try:
+                checkpoint_metadata = save_prompt_checkpoint(
+                    checkpoint_path,
+                    chunk_cache,
+                    prefix_tokens=prefix_tokens,
+                    checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                    model=self.model_provider.model,
+                    kv_bits=self.cli_args.kv_bits,
+                    kv_group_size=self.cli_args.kv_group_size,
+                    quantized_kv_start=self.cli_args.quantized_kv_start,
+                    metadata=metadata,
+                )
+                update_prompt_checkpoint_manifest(
+                    checkpoint_path,
+                    prefix_length=end,
+                    kind="delta",
+                    metadata=checkpoint_metadata,
+                )
+                prune_prompt_checkpoints(
+                    protected_files=protected_files
+                    or [
+                        os.path.basename(base_path),
+                        os.path.basename(checkpoint_path),
+                    ],
+                    max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
+                )
+                _prompt_checkpoint_debug(
+                    "save delta success "
+                    f"file={os.path.basename(checkpoint_path)} "
+                    f"target_length={end} "
+                    f"base_length={base_length} "
+                    f"delta_tokens={end - base_length} "
+                    f"materialize_seconds={chunk_materialize_seconds:.6f} "
+                    f"rendered_metadata={int(has_rendered_metadata)} "
+                    f"chunk_index={chunk_index} "
+                    f"chunk_count={chunk_count}"
+                )
+                return checkpoint_path
+            except Exception as exc:
+                _prompt_checkpoint_debug(
+                    "save delta failure swallowed "
+                    f"file={os.path.basename(checkpoint_path)} "
+                    f"target_length={end} "
+                    f"base_length={base_length} "
+                    f"delta_tokens={end - base_length} "
+                    f"materialize_seconds={chunk_materialize_seconds:.6f} "
+                    f"error={type(exc).__name__} "
+                    f"message={str(exc)!r} "
+                    f"chunk_index={chunk_index} "
+                    f"chunk_count={chunk_count}"
+                )
+                return None
+
+        chunk_tokens = _prompt_checkpoint_delta_chunk_tokens(self.cli_args)
+        if chunk_tokens <= 0 or delta_tokens <= chunk_tokens:
+            checkpoint_path = save_one_delta(
                 delta_cache,
-                prefix_tokens=prefix_tokens,
-                checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
-                model=self.model_provider.model,
-                kv_bits=self.cli_args.kv_bits,
-                kv_group_size=self.cli_args.kv_group_size,
-                quantized_kv_start=self.cli_args.quantized_kv_start,
-                metadata=metadata,
+                prefix_tokens=cache_key[:target_length],
+                base_tokens=base_tokens,
+                base_path=base_path,
+                base_length=base_length,
+                end=target_length,
+                chunk_materialize_seconds=materialize_seconds,
             )
-            update_prompt_checkpoint_manifest(
-                checkpoint_path,
-                prefix_length=target_length,
-                kind="delta",
-                metadata=checkpoint_metadata,
+            return checkpoint_path is not None
+
+        chunk_specs = []
+        for start in range(base_length, target_length, chunk_tokens):
+            end = min(start + chunk_tokens, target_length)
+            chunk_specs.append((start, end))
+
+        current_base_path = base_path
+        current_base_tokens = base_tokens
+        current_base_length = base_length
+        protected_files = [os.path.basename(base_path)]
+        saved_count = 0
+        for chunk_index, (start, end) in enumerate(chunk_specs, 1):
+            offset_start = start - base_length
+            offset_end = end - base_length
+            try:
+                chunk_cache = slice_prompt_cache(delta_cache, offset_start, offset_end)
+                chunk_t0 = time.perf_counter()
+                chunk_cache = materialize_prompt_cache(chunk_cache)
+                chunk_materialize_seconds = time.perf_counter() - chunk_t0
+            except Exception as exc:
+                _prompt_checkpoint_debug(
+                    "save delta chunk skipped slice/materialize failure "
+                    f"target_length={end} "
+                    f"base_length={current_base_length} "
+                    f"delta_tokens={end - current_base_length} "
+                    f"chunk_index={chunk_index} "
+                    f"chunk_count={len(chunk_specs)} "
+                    f"error={type(exc).__name__} "
+                    f"message={str(exc)!r}"
+                )
+                break
+            chunk_length = end - start
+            if prompt_cache_token_length(chunk_cache) != chunk_length:
+                _prompt_checkpoint_debug(
+                    "save delta chunk skipped cache length mismatch "
+                    f"target_length={end} "
+                    f"base_length={current_base_length} "
+                    f"delta_tokens={chunk_length} "
+                    f"delta_cache_length={prompt_cache_token_length(chunk_cache)} "
+                    f"chunk_index={chunk_index} "
+                    f"chunk_count={len(chunk_specs)}"
+                )
+                break
+
+            checkpoint_path = save_one_delta(
+                chunk_cache,
+                prefix_tokens=cache_key[:end],
+                base_tokens=current_base_tokens,
+                base_path=current_base_path,
+                base_length=current_base_length,
+                end=end,
+                chunk_materialize_seconds=(
+                    materialize_seconds + chunk_materialize_seconds
+                    if chunk_index == 1
+                    else chunk_materialize_seconds
+                ),
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_specs),
+                protected_files=protected_files
+                + [os.path.basename(prompt_checkpoint_file(cache_key[:end]))],
             )
-            prune_prompt_checkpoints(
-                protected_files=[
-                    os.path.basename(base_path),
-                    os.path.basename(checkpoint_path),
-                ],
-                max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
-            )
-            _prompt_checkpoint_debug(
-                "save delta success "
-                f"file={os.path.basename(checkpoint_path)} "
-                f"target_length={target_length} "
-                f"base_length={base_length} "
-                f"delta_tokens={target_length - base_length} "
-                f"materialize_seconds={materialize_seconds:.6f} "
-                f"rendered_metadata={int(rendered_prefix is not None)}"
-            )
-            return True
-        except Exception as exc:
-            _prompt_checkpoint_debug(
-                "save delta failure swallowed "
-                f"file={os.path.basename(checkpoint_path)} "
-                f"target_length={target_length} "
-                f"base_length={base_length} "
-                f"delta_tokens={target_length - base_length} "
-                f"materialize_seconds={materialize_seconds:.6f} "
-                f"error={type(exc).__name__} "
-                f"message={str(exc)!r}"
-            )
-            return False
+            if checkpoint_path is None:
+                break
+            saved_count += 1
+            protected_files.append(os.path.basename(checkpoint_path))
+            current_base_path = checkpoint_path
+            current_base_tokens = cache_key[:end]
+            current_base_length = end
+
+        complete = saved_count == len(chunk_specs)
+        _prompt_checkpoint_debug(
+            "save delta chunked complete "
+            f"target_length={target_length} "
+            f"base_length={base_length} "
+            f"delta_tokens={delta_tokens} "
+            f"chunk_tokens={chunk_tokens} "
+            f"saved_chunks={saved_count} "
+            f"total_chunks={len(chunk_specs)} "
+            f"complete={int(complete)}"
+        )
+        return saved_count > 0
 
     def _tokenize(self, tokenizer, request, args, return_rendered=False):
         """Tokenize a request and split the prompt into segments.
@@ -5057,10 +5316,33 @@ def setup_arg_parser():
         type=int,
         default=DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS,
         help=(
-            "Approximate token interval for automatic long-prompt frontier "
-            "checkpoints. The effective interval is rounded up to "
-            "--checkpoint-boundary-align-tokens. Use 0 to disable "
+            "Approximate token interval for continued checkpoints and optional "
+            "prefill frontier checkpoints. The effective interval is rounded "
+            "up to --checkpoint-boundary-align-tokens. Use 0 to disable "
             f"(default: {DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-prefill-frontier-save",
+        choices=["enabled", "disabled"],
+        default=DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE,
+        help=(
+            "Save long-prompt frontier checkpoints synchronously during prefill. "
+            "This can block active streaming responses while multi-GB checkpoint "
+            "files are written, so the long-running server default is disabled "
+            f"(default: {DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE})."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-delta-chunk-tokens",
+        type=int,
+        default=DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS,
+        help=(
+            "Maximum tokens per saved delta checkpoint chunk. Positive values "
+            "store long post-response deltas as a chain of smaller delta files "
+            "so future saves can extend the deepest checkpoint instead of "
+            "rewriting one huge suffix. Use 0 to keep the legacy single-file "
+            f"delta behavior (default: {DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS})."
         ),
     )
     parser.add_argument(
