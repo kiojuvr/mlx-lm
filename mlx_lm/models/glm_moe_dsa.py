@@ -2305,14 +2305,27 @@ class Model(DSV32Model):
     def sanitize(self, weights):
         # Native MTP layers need a separate generation path. Keep baseline GLM
         # loading compatible with updated checkpoints that include MTP weights.
+        mtp_layer_start = self.args.num_hidden_layers
+
+        def is_mtp_weight(key):
+            if (
+                key.startswith(("mtp.", "mtp_", "model.mtp"))
+                or ".mtp." in key
+                or ".mtp_" in key
+            ):
+                return True
+            parts = key.split(".")
+            if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+                try:
+                    return int(parts[2]) >= mtp_layer_start
+                except ValueError:
+                    return False
+            return False
+
         return {
             k: v
             for k, v in weights.items()
-            if not (
-                k.startswith(("mtp.", "mtp_", "model.mtp"))
-                or ".mtp." in k
-                or ".mtp_" in k
-            )
+            if not is_mtp_weight(k)
         }
 
     def make_cache(self):

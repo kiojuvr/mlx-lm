@@ -1637,8 +1637,19 @@ class TestModels(unittest.TestCase):
         from mlx_lm.models import glm_moe_dsa
 
         model = glm_moe_dsa.Model.__new__(glm_moe_dsa.Model)
+        model.args = type("Args", (), {"num_hidden_layers": 78})()
         weights = {
             "model.embed_tokens.weight": mx.ones((1,), dtype=mx.float32),
+            "model.layers.77.self_attn.q_a_proj.weight": mx.ones(
+                (1,), dtype=mx.float32
+            ),
+            "model.layers.78.self_attn.q_a_proj.weight": mx.zeros(
+                (1,), dtype=mx.float32
+            ),
+            "model.layers.78.shared_head.norm.weight": mx.zeros(
+                (1,), dtype=mx.float32
+            ),
+            "model.layers.not_an_int.weight": mx.ones((1,), dtype=mx.float32),
             "model.mtp_layers.0.norm.weight": mx.zeros((1,), dtype=mx.float32),
             "mtp.fc.weight": mx.zeros((1,), dtype=mx.float32),
             "model.foo.mtp_block.weight": mx.zeros((1,), dtype=mx.float32),
@@ -1646,7 +1657,14 @@ class TestModels(unittest.TestCase):
 
         sanitized = model.sanitize(weights)
 
-        self.assertEqual(list(sanitized), ["model.embed_tokens.weight"])
+        self.assertEqual(
+            list(sanitized),
+            [
+                "model.embed_tokens.weight",
+                "model.layers.77.self_attn.q_a_proj.weight",
+                "model.layers.not_an_int.weight",
+            ],
+        )
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4
