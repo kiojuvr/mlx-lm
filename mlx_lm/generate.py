@@ -601,6 +601,7 @@ def generate_step(
     prompt_checkpoint: bool = True,
     prompt_checkpoint_full_prompt: Optional[Sequence[int]] = None,
     prompt_checkpoint_initial_cached_tokens: int = 0,
+    prompt_checkpoint_initial_cache_source: str = "server-cache",
     prompt_checkpoint_store_prefix_lengths: Optional[Sequence[int]] = None,
     prompt_checkpoint_allow_existing_cache: bool = False,
     prompt_checkpoint_save_exact: bool = True,
@@ -662,6 +663,10 @@ def generate_step(
           the uncached suffix.
         prompt_checkpoint_initial_cached_tokens (int): Number of leading full
           prompt tokens already represented by ``prompt_cache``.
+        prompt_checkpoint_initial_cache_source (str): Human-readable source for
+          ``prompt_checkpoint_initial_cached_tokens``. Server code uses this to
+          distinguish RAM prompt cache reuse from disk rendered-checkpoint reuse
+          in checkpoint accounting logs.
         prompt_checkpoint_store_prefix_lengths (Sequence[int], optional):
           Stable prefix lengths to save while prefill reaches those frontiers.
         prompt_checkpoint_allow_existing_cache (bool): Treat a supplied
@@ -751,6 +756,31 @@ def generate_step(
     prompt_checkpoint_initial_cached_tokens = max(
         0, min(int(prompt_checkpoint_initial_cached_tokens), total_prompt_tokens)
     )
+    prompt_checkpoint_initial_cache_source = str(
+        prompt_checkpoint_initial_cache_source or "server-cache"
+    )
+    if not prompt_checkpoint_existing_cache or prompt_checkpoint_initial_cached_tokens <= 0:
+        prompt_checkpoint_initial_cache_source = "none"
+    prompt_checkpoint_initial_cache_is_disk = (
+        prompt_checkpoint_initial_cache_source.startswith("disk-")
+    )
+
+    def _prompt_checkpoint_initial_resolution():
+        if prompt_checkpoint_initial_cache_source.startswith("disk-rendered-"):
+            return prompt_checkpoint_initial_cache_source.replace(
+                "disk-rendered-", "rendered-", 1
+            )
+        if prompt_checkpoint_initial_cache_is_disk:
+            return prompt_checkpoint_initial_cache_source
+        return "server-cache"
+
+    def _prompt_checkpoint_initial_cache_counts():
+        if not prompt_checkpoint_existing_cache:
+            return 0, 0
+        if prompt_checkpoint_initial_cache_is_disk:
+            return 0, prompt_checkpoint_initial_cached_tokens
+        return prompt_checkpoint_initial_cached_tokens, 0
+
     if (
         prompt_checkpoint_existing_cache
         and len(prompt) == 0
@@ -763,8 +793,13 @@ def generate_step(
             raise ValueError("Fully cached prompt cannot be resumed with this cache.")
         prompt = mx.array(checkpoint_full_prompt[-1:])
         prompt_checkpoint_initial_cached_tokens = total_prompt_tokens - 1
+    (
+        prompt_checkpoint_server_cached_tokens,
+        prompt_checkpoint_initial_disk_cached_tokens,
+    ) = _prompt_checkpoint_initial_cache_counts()
     if prompt_checkpoint_existing_cache:
         prompt_checkpoint_cached_tokens = prompt_checkpoint_initial_cached_tokens
+        prompt_checkpoint_disk_cached_tokens = prompt_checkpoint_initial_disk_cached_tokens
 
     def _checkpoint_cache_token_length_for_prefix(prefix_length):
         return (
@@ -788,7 +823,10 @@ def generate_step(
     _prompt_checkpoint_debug(
         "request "
         f"total_prompt_tokens={total_prompt_tokens} "
-        f"server_cached_tokens={prompt_checkpoint_initial_cached_tokens if prompt_checkpoint_existing_cache else 0} "
+        f"server_cached_tokens={prompt_checkpoint_server_cached_tokens} "
+        f"disk_cached_tokens={prompt_checkpoint_disk_cached_tokens} "
+        f"initial_cached_tokens={prompt_checkpoint_initial_cached_tokens if prompt_checkpoint_existing_cache else 0} "
+        f"initial_cache_source={prompt_checkpoint_initial_cache_source} "
         f"prefill_step_size={prefill_step_size}"
     )
 
@@ -802,10 +840,14 @@ def generate_step(
         prompt_checkpoint_resolution = "explicit-cache"
         _prompt_checkpoint_debug("skip explicit prompt_cache active")
     elif prompt_checkpoint_existing_cache:
-        prompt_checkpoint_resolution = "server-cache"
+        if prompt_checkpoint_initial_cache_is_disk:
+            prompt_checkpoint_resolution = _prompt_checkpoint_initial_resolution()
+        else:
+            prompt_checkpoint_resolution = "server-cache"
         _prompt_checkpoint_debug(
-            "server prompt_cache coexistence "
-            f"cached_tokens={prompt_checkpoint_initial_cached_tokens}"
+            "initial prompt_cache coexistence "
+            f"cached_tokens={prompt_checkpoint_initial_cached_tokens} "
+            f"cache_source={prompt_checkpoint_initial_cache_source}"
         )
     elif total_prompt_tokens <= 1:
         prompt_checkpoint_resolution = "too-short"
@@ -828,7 +870,10 @@ def generate_step(
             "lookup "
             f"file={prompt_checkpoint_basename} "
             f"prefix_length={total_prompt_tokens} "
-            f"server_cached_tokens={prompt_checkpoint_initial_cached_tokens}"
+            f"server_cached_tokens={prompt_checkpoint_server_cached_tokens} "
+            f"disk_cached_tokens={prompt_checkpoint_disk_cached_tokens} "
+            f"initial_cached_tokens={prompt_checkpoint_initial_cached_tokens if prompt_checkpoint_existing_cache else 0} "
+            f"initial_cache_source={prompt_checkpoint_initial_cache_source}"
         )
         lookup_t0 = time.perf_counter()
         all_candidates, prompt_checkpoint_lookup_stats = (
@@ -980,11 +1025,14 @@ def generate_step(
                 )
         elif all_candidates:
             prompt_checkpoint_resolution = "server-cache-covered"
+            if prompt_checkpoint_initial_cache_is_disk:
+                prompt_checkpoint_resolution = _prompt_checkpoint_initial_resolution()
             _prompt_checkpoint_debug(
-                "miss covered by server prompt_cache "
+                "candidate covered by initial prompt_cache "
                 f"file={os.path.basename(all_candidates[0][2])} "
                 f"prefix_length={all_candidates[0][0]} "
-                f"cached_tokens={prompt_checkpoint_initial_cached_tokens}"
+                f"cached_tokens={prompt_checkpoint_initial_cached_tokens} "
+                f"cache_source={prompt_checkpoint_initial_cache_source}"
             )
         else:
             prompt_checkpoint_resolution = "miss"
@@ -999,14 +1047,19 @@ def generate_step(
         "miss",
     ):
         if prompt_checkpoint_initial_cached_tokens > 0:
-            prompt_checkpoint_resolution = "server-cache"
+            if prompt_checkpoint_initial_cache_is_disk:
+                prompt_checkpoint_resolution = _prompt_checkpoint_initial_resolution()
+            else:
+                prompt_checkpoint_resolution = "server-cache"
     fresh_prompt_tokens = max(total_prompt_tokens - prompt_checkpoint_cached_tokens, 0)
     fresh_prefill_tokens = max(fresh_prompt_tokens - 1, 0)
     _prompt_checkpoint_debug(
         "prefill summary "
         f"total_prompt_tokens={total_prompt_tokens} "
-        f"server_cached_tokens={prompt_checkpoint_initial_cached_tokens if prompt_checkpoint_existing_cache else 0} "
+        f"server_cached_tokens={prompt_checkpoint_server_cached_tokens} "
         f"disk_cached_tokens={prompt_checkpoint_disk_cached_tokens} "
+        f"initial_cached_tokens={prompt_checkpoint_initial_cached_tokens if prompt_checkpoint_existing_cache else 0} "
+        f"initial_cache_source={prompt_checkpoint_initial_cache_source} "
         f"fresh_prompt_tokens={fresh_prompt_tokens} "
         f"fresh_prefill_tokens={fresh_prefill_tokens} "
         f"prefill_step_size={prefill_step_size} "
@@ -1758,10 +1811,9 @@ def stream_generate(
             _prompt_checkpoint_debug("skip speculative path active")
         else:
             _prompt_checkpoint_debug("checkpoint disabled")
-        kwargs.pop("prompt_checkpoint", None)
-        kwargs.pop("prompt_checkpoint_save_exact", None)
-        kwargs.pop("prompt_checkpoint_rendered_prompt", None)
-        kwargs.pop("prompt_checkpoint_decode_prefix", None)
+        for key in list(kwargs):
+            if key == "prompt_checkpoint" or key.startswith("prompt_checkpoint_"):
+                kwargs.pop(key, None)
         kwargs.pop("glm_dsa_adaptive_prefill_step_size", None)
         kwargs.pop("glm_dsa_adaptive_prefill_after_tokens", None)
         kwargs.pop("glm_dsa_adaptive_prefill_min_remaining_tokens", None)

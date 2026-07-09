@@ -1874,6 +1874,9 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["prompt_cache"], ["server-cache"])
         self.assertEqual(captured["prompt_checkpoint_full_prompt"], prompt)
         self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 2)
+        self.assertEqual(
+            captured["prompt_checkpoint_initial_cache_source"], "server-cache"
+        )
         self.assertEqual(captured["prompt_checkpoint_store_prefix_lengths"], [3])
         self.assertTrue(captured["prompt_checkpoint_allow_existing_cache"])
         self.assertFalse(captured["prompt_checkpoint_save_exact"])
@@ -1888,6 +1891,143 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["kv_bits"], 8)
         self.assertEqual(captured["kv_group_size"], 64)
         self.assertEqual(captured["quantized_kv_start"], 4096)
+
+    def test_single_request_marks_rendered_checkpoint_cache_source(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = types.SimpleNamespace(
+            prefill_step_size=2048,
+            prefill_max_qk_tokens=67_108_864,
+            glm_dsa_adaptive_prefill_step_size=8192,
+            glm_dsa_adaptive_prefill_after_tokens=4096,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=2048,
+            checkpoint_min_tokens=DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS,
+            checkpoint_cold_max_tokens=DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
+            checkpoint_boundary_trim_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_TRIM_TOKENS
+            ),
+            checkpoint_boundary_align_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS
+            ),
+            checkpoint_continued_interval_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_CONTINUED_INTERVAL_TOKENS
+            ),
+            checkpoint_prefill_frontier_save=(
+                DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE
+            ),
+            checkpoint_delta_chunk_tokens=(
+                DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS
+            ),
+            checkpoint_save_exact="disabled",
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=4096,
+        )
+        tokenizer = types.SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+            eos_token_id=0,
+            encode=lambda text: [0],
+        )
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            tokenizer=tokenizer,
+            draft_model=None,
+            model_key=("model", None, None),
+            cli_args=cli_args,
+        )
+        prompt = [1, 2, 3, 4, 5]
+        rendered_checkpoint = RenderedPromptCheckpoint(
+            prompt_cache=["disk-cache"],
+            prefix_tokens=prompt[:3],
+            suffix_tokens=prompt[3:],
+            kind="prefix",
+            rendered_prefix_bytes=3,
+            checkpoint_path="/tmp/prefix-3.safetensors",
+        )
+
+        class FakePromptCache:
+            def fetch_nearest_cache(self, model_key, tokens):
+                return None, tokens
+
+            def insert_cache(self, model_key, tokens, cache):
+                self.inserted = (model_key, tokens, cache)
+
+        class FakeStateMachine:
+            def make_state(self):
+                return "normal"
+
+            def match(self, state, token):
+                return state, None, "normal"
+
+        generator.prompt_cache = FakePromptCache()
+        generator._log_cache_stats = lambda: None
+        generator._render_prompt_text = lambda tokenizer, request, args: "rendered"
+        generator._load_rendered_prompt_checkpoint = lambda tokenizer, rendered: (
+            rendered_checkpoint
+        )
+        generator._make_state_machine = lambda *args, **kwargs: (
+            FakeStateMachine(),
+            {},
+        )
+        captured = {}
+
+        def fake_stream_generate(**kwargs):
+            captured.update(kwargs)
+            yield types.SimpleNamespace(
+                finish_reason="length",
+                token=0,
+                text="",
+                logprobs=mx.array([0.0]),
+            )
+
+        rqueue = Queue()
+        request = object()
+        args = types.SimpleNamespace(
+            seed=None,
+            stop_words=[],
+            max_tokens=1,
+            num_draft_tokens=3,
+            top_logprobs=0,
+            sampling=types.SimpleNamespace(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                xtc_probability=0.0,
+                xtc_threshold=0.0,
+            ),
+            logits=types.SimpleNamespace(
+                logit_bias=None,
+                repetition_penalty=None,
+                repetition_context_size=20,
+                presence_penalty=0.0,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
+            ),
+        )
+        with mock.patch(
+            "mlx_lm.server.stream_generate", fake_stream_generate
+        ), mock.patch.object(
+            generator, "_save_continued_prompt_checkpoint", return_value=False
+        ), mock.patch.object(
+            generator, "_save_delta_prompt_checkpoint", return_value=False
+        ):
+            generator._serve_single((rqueue, request, args))
+
+        queued = []
+        while not rqueue.empty():
+            queued.append(rqueue.get())
+        self.assertFalse(any(isinstance(item, Exception) for item in queued))
+        self.assertEqual(captured["prompt"], prompt[3:])
+        self.assertEqual(captured["prompt_cache"], ["disk-cache"])
+        self.assertEqual(captured["prompt_checkpoint_full_prompt"], prompt)
+        self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 3)
+        self.assertEqual(
+            captured["prompt_checkpoint_initial_cache_source"],
+            "disk-rendered-prefix",
+        )
 
     def test_tokenize_segments_system_prefix_without_chat_template(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)

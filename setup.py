@@ -65,7 +65,6 @@ setup(
     description="LLMs with MLX and the Hugging Face Hub",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    readme="README.md",
     author_email="mlx@group.apple.com",
     author="MLX Contributors",
     url="https://github.com/ml-explore/mlx-lm",

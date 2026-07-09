@@ -30,8 +30,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 (
                     "prompt checkpoint: prefill summary "
                     "total_prompt_tokens=8192 server_cached_tokens=0 "
-                    "disk_cached_tokens=6144 fresh_prompt_tokens=2048 "
-                    "fresh_prefill_tokens=2047 prefill_step_size=2048 "
+                    "disk_cached_tokens=6144 initial_cached_tokens=6144 "
+                    "initial_cache_source=disk-rendered-prefix "
+                    "fresh_prompt_tokens=2048 fresh_prefill_tokens=2047 "
+                    "prefill_step_size=2048 "
                     "prefill_max_qk_tokens=67108864 "
                     "glm_dsa_adaptive_prefill_step_size=8192 "
                     "glm_dsa_adaptive_prefill_after_tokens=4096 "
@@ -58,6 +60,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
 
         self.assertEqual(summary["checkpoint_total_prompt_tokens"], 8192)
         self.assertEqual(summary["disk_cached_tokens"], 6144)
+        self.assertEqual(summary["initial_cached_tokens"], 6144)
+        self.assertEqual(summary["initial_cache_source"], "disk-rendered-prefix")
         self.assertEqual(summary["fresh_prompt_tokens"], 2048)
         self.assertEqual(summary["fresh_prefill_tokens"], 2047)
         self.assertEqual(summary["checkpoint_resolution"], "prefix")

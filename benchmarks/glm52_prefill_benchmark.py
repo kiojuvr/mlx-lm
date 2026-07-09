@@ -305,6 +305,8 @@ def extract_checkpoint_summary(messages):
         "checkpoint_total_prompt_tokens": None,
         "server_cached_tokens": None,
         "disk_cached_tokens": None,
+        "initial_cached_tokens": None,
+        "initial_cache_source": None,
         "fresh_prompt_tokens": None,
         "fresh_prefill_tokens": None,
         "checkpoint_prefill_step_size": None,
@@ -405,6 +407,8 @@ def extract_checkpoint_summary(messages):
                 if output_key not in summary:
                     continue
                 if output_key == "checkpoint_resolution":
+                    summary[output_key] = value
+                elif output_key == "initial_cache_source":
                     summary[output_key] = value
                 elif output_key == "checkpoint_lookup_seconds":
                     summary[output_key] = float(value)
@@ -1587,6 +1591,8 @@ def run_batch_once(model, tokenizer, text, args, case_name):
         "checkpoint_total_prompt_tokens": None,
         "server_cached_tokens": None,
         "disk_cached_tokens": None,
+        "initial_cached_tokens": None,
+        "initial_cache_source": None,
         "fresh_prompt_tokens": None,
         "fresh_prefill_tokens": None,
         "checkpoint_prefill_step_size": None,
@@ -1727,6 +1733,8 @@ def run_queued_once(model, tokenizer, _text, args, case_name):
         "checkpoint_total_prompt_tokens": None,
         "server_cached_tokens": None,
         "disk_cached_tokens": None,
+        "initial_cached_tokens": None,
+        "initial_cache_source": None,
         "fresh_prompt_tokens": None,
         "fresh_prefill_tokens": None,
         "checkpoint_prefill_step_size": None,
@@ -1796,6 +1804,8 @@ def print_table(rows, output_format):
         "stored_prefix_tokens",
         "expected_reused_prefix_tokens",
         "disk_cached_tokens",
+        "initial_cached_tokens",
+        "initial_cache_source",
         "fresh_prompt_tokens",
         "fresh_prefill_tokens",
         "checkpoint_expected_match",

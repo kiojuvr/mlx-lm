@@ -1573,8 +1573,9 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
             )
 
         output = "\n".join(logs.output)
-        self.assertIn("server prompt_cache coexistence", output)
-        self.assertIn("miss covered by server prompt_cache", output)
+        self.assertIn("initial prompt_cache coexistence", output)
+        self.assertIn("cache_source=server-cache", output)
+        self.assertIn("candidate covered by initial prompt_cache", output)
         self.assertIn("resolution=server-cache-covered", output)
         self.assertNotIn("prompt checkpoint: frontier hit", output)
         self.assertEqual(progress[0], (13, len(prompt_b)))
@@ -1869,10 +1870,50 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
                 )
             )
         output = "\n".join(logs.output)
-        self.assertIn("server prompt_cache coexistence", output)
+        self.assertIn("initial prompt_cache coexistence", output)
+        self.assertIn("cache_source=server-cache", output)
         self.assertNotIn("skip explicit prompt_cache active", output)
         self.assertIn("prompt checkpoint: prefix hit", output)
         self.assertEqual(progress[0], (len(stable_prefix), len(prompt_b)))
+
+    def test_disk_rendered_initial_cache_logs_disk_accounting(self):
+        self._set_home_to_test_dir()
+        self._set_prompt_checkpoint_debug()
+        model = self._make_glm_moe_dsa_model()
+        prompt_tokens = [1, 2, 3, 4, 5]
+
+        prompt_cache = make_prompt_cache(model)
+        logits = model(mx.array([prompt_tokens[:3]]), cache=prompt_cache)
+        mx.eval(logits, [c.state for c in prompt_cache])
+
+        progress = []
+        with self.assertLogs("mlx_lm.generate", level="INFO") as logs:
+            list(
+                generate_step(
+                    mx.array(prompt_tokens[3:]),
+                    model,
+                    max_tokens=1,
+                    prefill_step_size=2,
+                    prompt_cache=prompt_cache,
+                    prompt_checkpoint_full_prompt=prompt_tokens,
+                    prompt_checkpoint_initial_cached_tokens=3,
+                    prompt_checkpoint_initial_cache_source="disk-rendered-prefix",
+                    prompt_checkpoint_allow_existing_cache=True,
+                    prompt_progress_callback=lambda processed, total: progress.append(
+                        (processed, total)
+                    ),
+                )
+            )
+
+        output = "\n".join(logs.output)
+        self.assertIn("initial prompt_cache coexistence", output)
+        self.assertIn("cache_source=disk-rendered-prefix", output)
+        self.assertIn("server_cached_tokens=0", output)
+        self.assertIn("disk_cached_tokens=3", output)
+        self.assertIn("initial_cached_tokens=3", output)
+        self.assertIn("initial_cache_source=disk-rendered-prefix", output)
+        self.assertIn("resolution=rendered-prefix", output)
+        self.assertEqual(progress[0], (3, len(prompt_tokens)))
 
     def test_empty_prompt_with_explicit_prompt_cache_rejects_checkpoint_kwargs(self):
         model = self._make_glm_moe_dsa_model()

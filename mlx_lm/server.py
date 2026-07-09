@@ -2901,6 +2901,7 @@ class ResponseGenerator:
                 self.model_provider.model_key, prompt
             )
             ram_cache_count = len(prompt) - len(ram_rest)
+            prompt_cache_source = "none"
             if (
                 rendered_checkpoint is not None
                 and rendered_checkpoint.cached_tokens >= ram_cache_count
@@ -2908,10 +2909,13 @@ class ResponseGenerator:
                 cache = rendered_checkpoint.prompt_cache
                 ctx.prompt_cache_count = rendered_checkpoint.cached_tokens
                 rest = prompt[ctx.prompt_cache_count :]
+                prompt_cache_source = f"disk-rendered-{rendered_checkpoint.kind}"
             else:
                 cache = ram_cache
                 ctx.prompt_cache_count = ram_cache_count
                 rest = ram_rest
+                if ctx.prompt_cache_count > 0:
+                    prompt_cache_source = "server-cache"
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -2942,11 +2946,12 @@ class ResponseGenerator:
             )
             logging.info(
                 "generation request: prompt_tokens=%s max_tokens=%s "
-                "stop_words=%s prompt_cached_tokens=%s",
+                "stop_words=%s prompt_cached_tokens=%s prompt_cache_source=%s",
                 prompt_token_count,
                 args.max_tokens,
                 len(args.stop_words),
                 ctx.prompt_cache_count,
+                prompt_cache_source,
             )
 
             # Process the prompt and generate tokens
@@ -2980,6 +2985,7 @@ class ResponseGenerator:
                 quantized_kv_start=self.cli_args.quantized_kv_start,
                 prompt_checkpoint_full_prompt=prompt,
                 prompt_checkpoint_initial_cached_tokens=ctx.prompt_cache_count,
+                prompt_checkpoint_initial_cache_source=prompt_cache_source,
                 prompt_checkpoint_store_prefix_lengths=checkpoint_prefix_lengths,
                 prompt_checkpoint_allow_existing_cache=True,
                 prompt_checkpoint_save_exact=prompt_checkpoint_save_exact,
