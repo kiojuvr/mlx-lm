@@ -114,6 +114,157 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(benchmark.format_output_cell({"decode": 156}), '{"decode":156}')
         self.assertEqual(benchmark.format_output_cell(None), "")
 
+    def test_configure_decode_profile_sets_env(self):
+        env_key = benchmark.glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ENV
+        isolate_key = benchmark.glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ISOLATE_ENV
+        old_env = os.environ.get(env_key)
+        old_isolate = os.environ.get(isolate_key)
+        args = Namespace(
+            fast_prefill="default",
+            native_sparse_prefill="default",
+            native_sparse_quantized_kv="default",
+            native_sparse_quantized_kv_max_context=None,
+            native_indexer="default",
+            native_q8_vup="default",
+            native_q4_vup="default",
+            q_a_dense_cache="default",
+            native_q4_qa="default",
+            native_q4_qa_tile="default",
+            native_sparse_mla_tile="default",
+            native_q4_qb="default",
+            native_q4_qb_tile="default",
+            fast_prefill_query_chunk=None,
+            fast_prefill_key_block=None,
+            fast_prefill_min_context=None,
+            native_sparse_prefill_min_context=None,
+            prefill_profile=False,
+            prefill_profile_isolate="default",
+            decode_profile=True,
+            decode_profile_isolate="enabled",
+        )
+        try:
+            os.environ.pop(env_key, None)
+            os.environ.pop(isolate_key, None)
+            benchmark.configure_glm_dsa_fast_prefill(args)
+            self.assertEqual(os.environ.get(env_key), "1")
+            self.assertEqual(os.environ.get(isolate_key), "1")
+        finally:
+            if old_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_env
+            if old_isolate is None:
+                os.environ.pop(isolate_key, None)
+            else:
+                os.environ[isolate_key] = old_isolate
+
+    def test_collect_decode_profile_reports_stage_fields(self):
+        old_profile = benchmark.glm_moe_dsa.get_glm_dsa_decode_profile
+        isolate_key = benchmark.glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ISOLATE_ENV
+        old_isolate = os.environ.get(isolate_key)
+
+        def fake_profile():
+            return {
+                "stages": {
+                    "attention": {"seconds": 0.25, "count": 2},
+                    "total_decode_model": {"seconds": 0.75, "count": 3},
+                }
+            }
+
+        benchmark.glm_moe_dsa.get_glm_dsa_decode_profile = fake_profile
+        os.environ[isolate_key] = "1"
+        try:
+            profile = benchmark.collect_glm_dsa_decode_profile(
+                Namespace(decode_profile=True, decode_profile_isolate="enabled")
+            )
+        finally:
+            benchmark.glm_moe_dsa.get_glm_dsa_decode_profile = old_profile
+            if old_isolate is None:
+                os.environ.pop(isolate_key, None)
+            else:
+                os.environ[isolate_key] = old_isolate
+
+        self.assertTrue(profile["glm_dsa_decode_profile"])
+        self.assertEqual(profile["glm_dsa_decode_profile_isolate"], "enabled")
+        self.assertEqual(profile["glm_dsa_decode_profile_isolate_env"], "1")
+        self.assertEqual(profile["glm_dsa_decode_attention_seconds"], 0.25)
+        self.assertEqual(profile["glm_dsa_decode_attention_count"], 2)
+        self.assertEqual(profile["glm_dsa_decode_total_decode_model_seconds"], 0.75)
+        self.assertEqual(profile["glm_dsa_decode_total_decode_model_count"], 3)
+
+    def test_run_decode_context_disables_checkpoints_by_default(self):
+        old_stream_generate = benchmark.stream_generate
+        old_collect_profile = benchmark.collect_glm_dsa_profile
+        old_collect_decode_profile = benchmark.collect_glm_dsa_decode_profile
+        old_reset_profile = benchmark.reset_glm_dsa_profile
+        calls = []
+
+        def fake_stream_generate(**kwargs):
+            calls.append(kwargs)
+            yield Namespace(
+                prompt_tps=100.0,
+                generation_tokens=1,
+                generation_tps=20.0,
+                peak_memory=1.25,
+                finish_reason=None,
+            )
+            yield Namespace(
+                prompt_tps=100.0,
+                generation_tokens=2,
+                generation_tps=20.0,
+                peak_memory=1.5,
+                finish_reason="length",
+            )
+
+        args = Namespace(
+            target_tokens=3,
+            max_tokens=2,
+            prefill_step_size=4,
+            prefill_max_qk_tokens=0,
+            glm_dsa_adaptive_prefill_step_size=0,
+            glm_dsa_adaptive_prefill_after_tokens=0,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=0,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+            no_prompt_checkpoint=False,
+            decode_context_use_checkpoints=False,
+            checkpoint_store_prefix_lengths=[2],
+            checkpoint_save_exact="enabled",
+            checkpoint_frontier_min_tokens=8192,
+            checkpoint_frontier_stride_tokens=16384,
+            resolved_checkpoint_cache_dir="/tmp/checkpoints",
+        )
+        benchmark.stream_generate = fake_stream_generate
+        benchmark.collect_glm_dsa_profile = lambda _args: {}
+        benchmark.collect_glm_dsa_decode_profile = lambda _args: {}
+        benchmark.reset_glm_dsa_profile = lambda: None
+        try:
+            row = benchmark.run_decode_context_once(
+                object(),
+                object(),
+                [1, 2, 3, 4],
+                args,
+                "decode-test",
+            )
+        finally:
+            benchmark.stream_generate = old_stream_generate
+            benchmark.collect_glm_dsa_profile = old_collect_profile
+            benchmark.collect_glm_dsa_decode_profile = old_collect_decode_profile
+            benchmark.reset_glm_dsa_profile = old_reset_profile
+
+        self.assertEqual(row["mode"], "decode-context")
+        self.assertEqual(row["prompt_tokens"], 3)
+        self.assertEqual(row["generated_tokens"], 2)
+        self.assertIsNone(row["prefill_seconds"])
+        self.assertIsNone(row["prefill_tps"])
+        self.assertEqual(row["decode_tps"], 20.0)
+        self.assertAlmostEqual(row["decode_seconds"], 0.1)
+        self.assertFalse(row["decode_context_use_checkpoints"])
+        self.assertEqual(row["checkpoint_resolution"], "disabled")
+        self.assertFalse(calls[0]["prompt_checkpoint"])
+        self.assertIsNone(calls[0]["prompt_checkpoint_store_prefix_lengths"])
+
     def test_main_rejects_empty_model_argument(self):
         old_argv = sys.argv
         sys.argv = [

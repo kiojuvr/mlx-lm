@@ -629,10 +629,18 @@ def configure_glm_dsa_fast_prefill(args):
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV] = "1"
     elif prefill_profile_isolate == "disabled":
         os.environ[glm_moe_dsa.GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV] = "0"
+    if getattr(args, "decode_profile", False):
+        os.environ[glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ENV] = "1"
+    decode_profile_isolate = getattr(args, "decode_profile_isolate", "default")
+    if decode_profile_isolate == "enabled":
+        os.environ[glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ISOLATE_ENV] = "1"
+    elif decode_profile_isolate == "disabled":
+        os.environ[glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ISOLATE_ENV] = "0"
 
 
 def reset_glm_dsa_profile():
     glm_moe_dsa.reset_glm_dsa_prefill_profile()
+    glm_moe_dsa.reset_glm_dsa_decode_profile()
 
 
 def collect_glm_dsa_profile(args):
@@ -802,6 +810,27 @@ def collect_glm_dsa_profile(args):
         ],
         **native_sparse_prefill_route_diagnostics(args, profile, native_status),
         "glm_dsa_native_q8_vup": getattr(args, "native_q8_vup", "default"),
+        **stage_values,
+    }
+
+
+def collect_glm_dsa_decode_profile(args):
+    profile = glm_moe_dsa.get_glm_dsa_decode_profile()
+    decode_profile = bool(getattr(args, "decode_profile", False))
+    stage_values = {}
+    for stage, values in profile["stages"].items():
+        key = f"glm_dsa_decode_{stage}_seconds"
+        stage_values[key] = values["seconds"] if decode_profile else None
+        stage_values[f"glm_dsa_decode_{stage}_count"] = values["count"]
+    return {
+        "glm_dsa_decode_profile": decode_profile,
+        "glm_dsa_decode_profile_isolate": getattr(
+            args, "decode_profile_isolate", "default"
+        ),
+        "glm_dsa_decode_profile_isolate_env": os.environ.get(
+            glm_moe_dsa.GLM_DSA_DECODE_PROFILE_ISOLATE_ENV,
+            "default-off",
+        ),
         **stage_values,
     }
 
@@ -1504,6 +1533,158 @@ def run_once(model, tokenizer, prompt, args, case_name):
     }
 
 
+def run_decode_context_once(model, tokenizer, prompt, args, case_name):
+    tokenize_t0 = time.perf_counter()
+    tokens = prompt_to_tokens(tokenizer, prompt)
+    if args.target_tokens is not None:
+        tokens = tokens[: args.target_tokens]
+    tokenize_seconds = time.perf_counter() - tokenize_t0
+
+    capture = CheckpointLogCapture()
+    logger = logging.getLogger("mlx_lm.generate")
+    old_level = logger.level
+    old_debug = os.environ.get(PROMPT_CHECKPOINT_DEBUG_ENV)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(capture)
+    os.environ[PROMPT_CHECKPOINT_DEBUG_ENV] = "1"
+
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    mx.clear_cache()
+    mx.synchronize()
+    reset_glm_dsa_profile()
+    prefill_config = prefill_config_summary(args)
+
+    checkpoint_enabled = (
+        bool(getattr(args, "decode_context_use_checkpoints", False))
+        and not getattr(args, "no_prompt_checkpoint", False)
+    )
+    request_t0 = time.perf_counter()
+    first_response_seconds = None
+    response = None
+    try:
+        for response in stream_generate(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=tokens,
+            max_tokens=args.max_tokens,
+            prefill_step_size=args.prefill_step_size,
+            prefill_max_qk_tokens=prefill_config["prefill_max_qk_tokens"],
+            glm_dsa_adaptive_prefill_step_size=(
+                prefill_config["glm_dsa_adaptive_prefill_step_size"]
+            ),
+            glm_dsa_adaptive_prefill_after_tokens=(
+                prefill_config["glm_dsa_adaptive_prefill_after_tokens"]
+            ),
+            glm_dsa_adaptive_prefill_min_remaining_tokens=(
+                prefill_config["glm_dsa_adaptive_prefill_min_remaining_tokens"]
+            ),
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            prompt_checkpoint=checkpoint_enabled,
+            prompt_checkpoint_store_prefix_lengths=(
+                getattr(args, "checkpoint_store_prefix_lengths", None)
+                if checkpoint_enabled
+                else None
+            ),
+            prompt_checkpoint_save_exact=(
+                checkpoint_enabled
+                and getattr(args, "checkpoint_save_exact", None) == "enabled"
+            ),
+            prompt_checkpoint_frontier_min_tokens=(
+                getattr(args, "checkpoint_frontier_min_tokens", 8192)
+            ),
+            prompt_checkpoint_frontier_stride_tokens=(
+                getattr(args, "checkpoint_frontier_stride_tokens", 16384)
+            ),
+        ):
+            if first_response_seconds is None:
+                first_response_seconds = time.perf_counter() - request_t0
+        mx.synchronize()
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(old_level)
+        if old_debug is None:
+            os.environ.pop(PROMPT_CHECKPOINT_DEBUG_ENV, None)
+        else:
+            os.environ[PROMPT_CHECKPOINT_DEBUG_ENV] = old_debug
+
+    request_seconds = time.perf_counter() - request_t0
+    if response is None or first_response_seconds is None:
+        raise RuntimeError(
+            f"{case_name}: decode-context generation produced no response"
+        )
+
+    generated_tokens = int(response.generation_tokens)
+    generation_tps = float(response.generation_tps)
+    generation_seconds = (
+        generated_tokens / generation_tps if generation_tps > 0 else None
+    )
+    continuation_seconds = max(request_seconds - first_response_seconds, 0.0)
+    continuation_tokens = max(generated_tokens - 1, 0)
+    continuation_tps = (
+        continuation_tokens / continuation_seconds
+        if continuation_tokens and continuation_seconds > 0
+        else None
+    )
+    checkpoint = extract_checkpoint_summary(capture.messages)
+    if not checkpoint_enabled:
+        checkpoint["checkpoint_resolution"] = "disabled"
+    prefill_seconds = (
+        checkpoint.get("checkpoint_prefill_chunk_seconds_total")
+        if checkpoint.get("checkpoint_prefill_chunks")
+        else None
+    )
+    fresh_prefill_tokens = checkpoint.get("fresh_prefill_tokens")
+    prefill_tps = (
+        fresh_prefill_tokens / prefill_seconds
+        if fresh_prefill_tokens is not None and prefill_seconds
+        else None
+    )
+
+    return {
+        "case": case_name,
+        "mode": "decode-context",
+        "batch_size": 1,
+        "requested_total_tokens": args.target_tokens,
+        "stored_prefix_tokens": None,
+        "expected_reused_prefix_tokens": None,
+        "checkpoint_expected_match": None,
+        "checkpoint_cache_dir": getattr(args, "resolved_checkpoint_cache_dir", None),
+        "checkpoint_save_exact": (
+            getattr(args, "checkpoint_save_exact", None)
+            if checkpoint_enabled
+            else "disabled"
+        ),
+        "decode_context_use_checkpoints": checkpoint_enabled,
+        "prompt_tokens": len(tokens),
+        "generated_tokens": generated_tokens,
+        "tokenize_seconds": tokenize_seconds,
+        "ttft_seconds": first_response_seconds,
+        "prompt_tps": response.prompt_tps,
+        "prefill_seconds": prefill_seconds,
+        "prefill_tps": prefill_tps,
+        "generation_seconds": generation_seconds,
+        "generation_tps": generation_tps,
+        "decode_seconds": generation_seconds,
+        "decode_tps": generation_tps,
+        "decode_continuation_seconds": continuation_seconds,
+        "decode_continuation_tps": continuation_tps,
+        "request_seconds": request_seconds,
+        "request_tps": (
+            generated_tokens / request_seconds if request_seconds > 0 else None
+        ),
+        "peak_memory_gb": response.peak_memory,
+        "progress_events": None,
+        "finish_reason": response.finish_reason,
+        **prefill_config,
+        **checkpoint,
+        **collect_glm_dsa_profile(args),
+        **collect_glm_dsa_decode_profile(args),
+    }
+
+
 def run_batch_once(model, tokenizer, text, args, case_name):
     tokenize_t0 = time.perf_counter()
     prompts = []
@@ -1770,6 +1951,10 @@ def summarize_repeats(rows):
             first["prompt_tps_median"] = statistics.median(
                 r["prompt_tps"] for r in case_rows
             )
+            for key in ("generation_tps", "decode_tps", "request_tps"):
+                values = [r.get(key) for r in case_rows if r.get(key) is not None]
+                if values:
+                    first[f"{key}_median"] = statistics.median(values)
         summaries.append(first)
     return summaries
 
@@ -1856,6 +2041,18 @@ def print_table(rows, output_format):
         "ttft_p50_seconds",
         "ttft_p95_seconds",
         "prompt_tps",
+        "prefill_seconds",
+        "prefill_tps",
+        "generated_tokens",
+        "generation_seconds",
+        "generation_tps",
+        "decode_seconds",
+        "decode_tps",
+        "decode_continuation_seconds",
+        "decode_continuation_tps",
+        "request_seconds",
+        "request_tps",
+        "decode_context_use_checkpoints",
         "kv_bits",
         "kv_group_size",
         "quantized_kv_start",
@@ -1877,6 +2074,9 @@ def print_table(rows, output_format):
         "glm_dsa_prefill_profile",
         "glm_dsa_prefill_profile_isolate",
         "glm_dsa_prefill_profile_isolate_env",
+        "glm_dsa_decode_profile",
+        "glm_dsa_decode_profile_isolate",
+        "glm_dsa_decode_profile_isolate_env",
         "glm_dsa_fast_prefill",
         "glm_dsa_fast_prefill_env",
         "glm_dsa_fast_prefill_query_chunk",
@@ -2011,6 +2211,27 @@ def print_table(rows, output_format):
         "glm_dsa_attention_seconds",
         "glm_dsa_native_sparse_attention_seconds",
         "glm_dsa_total_prefill_seconds",
+        "glm_dsa_decode_input_layernorm_seconds",
+        "glm_dsa_decode_q_projection_seconds",
+        "glm_dsa_decode_q_a_projection_seconds",
+        "glm_dsa_decode_q_a_layernorm_seconds",
+        "glm_dsa_decode_q_b_projection_seconds",
+        "glm_dsa_decode_kv_cache_update_seconds",
+        "glm_dsa_decode_dsa_indexer_topk_seconds",
+        "glm_dsa_decode_latent_kv_dequantization_seconds",
+        "glm_dsa_decode_latent_kv_projection_seconds",
+        "glm_dsa_decode_native_q8_vup_seconds",
+        "glm_dsa_decode_native_q4_vup_seconds",
+        "glm_dsa_decode_attention_seconds",
+        "glm_dsa_decode_o_projection_seconds",
+        "glm_dsa_decode_post_attention_layernorm_seconds",
+        "glm_dsa_decode_mlp_seconds",
+        "glm_dsa_decode_total_decode_attention_seconds",
+        "glm_dsa_decode_total_decode_layer_seconds",
+        "glm_dsa_decode_total_decode_model_seconds",
+        "glm_dsa_decode_total_decode_attention_count",
+        "glm_dsa_decode_total_decode_layer_count",
+        "glm_dsa_decode_total_decode_model_count",
     ]
     delimiter = "," if output_format == "csv" else "\t"
     writer = csv.writer(sys.stdout, delimiter=delimiter, lineterminator="\n")
@@ -2435,6 +2656,7 @@ def main():
             "controlled-lcp",
             "policy-sweep",
             "prefill-sweep",
+            "decode-context",
             "native-smoke",
         ),
         default="single",
@@ -2544,6 +2766,15 @@ def main():
             "Allow prompt checkpoint load/save during --mode prefill-sweep. "
             "By default prefill-sweep disables checkpoints to measure cold "
             "prefill step behavior."
+        ),
+    )
+    parser.add_argument(
+        "--decode-context-use-checkpoints",
+        action="store_true",
+        help=(
+            "Allow prompt checkpoint load/save during --mode decode-context. "
+            "By default decode-context disables checkpoints so prefill/decode "
+            "measurements are not mixed with disk-cache hits."
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=1)
@@ -2878,6 +3109,24 @@ def main():
             "in q_projection sub-stage timings."
         ),
     )
+    parser.add_argument(
+        "--decode-profile",
+        action="store_true",
+        help=(
+            "Synchronize and report GLM DSA decode stage timings. This adds "
+            "profiling overhead and is intended for measurement runs."
+        ),
+    )
+    parser.add_argument(
+        "--decode-profile-isolate",
+        choices=("default", "enabled", "disabled"),
+        default="default",
+        help=(
+            "Control profiling-only input synchronization before selected GLM "
+            "DSA decode stages. Enabling it reduces lazy-evaluation attribution "
+            "drift in sub-stage timings."
+        ),
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--no-prompt-checkpoint", action="store_true")
     parser.add_argument(
@@ -2899,6 +3148,8 @@ def main():
         and args.prefill_stop_after_tokens <= 0
     ):
         parser.error("--prefill-stop-after-tokens must be positive when set.")
+    if args.mode == "decode-context" and args.max_tokens <= 0:
+        parser.error("--max-tokens must be positive in --mode decode-context.")
     if args.mode == "native-smoke":
         if args.native_smoke_q_len <= 1:
             parser.error("--native-smoke-q-len must be greater than 1.")
@@ -2953,6 +3204,8 @@ def main():
                 runner = run_queued_once
             elif args.mode == "batch":
                 runner = run_batch_once
+            elif args.mode == "decode-context":
+                runner = run_decode_context_once
             else:
                 runner = run_once
             if args.prompt_file:
