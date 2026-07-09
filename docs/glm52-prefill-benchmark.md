@@ -122,6 +122,17 @@ targets are therefore a fused selected gather/dequant/attention kernel, a
 decode-specific native DSA indexer path for `L == 1`, or MTP/speculative decode
 integration.
 
+Two exact low-risk decode variants were tested and not adopted:
+
+- Reusing the existing selected sparse attention helper for `L == 1` decode
+  measured about 15.52 tok/s versus about 16.49 tok/s for the current generic
+  SDPA path.
+- Allowing the existing native DSA indexer wrapper to handle decode by padding
+  `L == 1` to the kernel's 64-row score tile measured about 15.03 tok/s versus
+  about 16.52 tok/s with the current Python/MLX decode indexer. A useful native
+  decode indexer would need an actual single-query kernel rather than relying on
+  the prefill score kernel's padded path.
+
 ## GLM DSA Sparse Prefill Fast Path
 
 This branch adds an exact, GLM-5.2-specific sparse prefill path for DSA/MLA
