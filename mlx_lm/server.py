@@ -40,6 +40,9 @@ from .generate import (
     BatchGenerator,
     DEFAULT_PREFILL_MAX_QK_TOKENS,
     SequenceStateMachine,
+    _format_prefill_chunk_fields,
+    _glm_dsa_decode_profile_fields,
+    _glm_dsa_decode_profile_snapshot,
     _prompt_checkpoint_debug,
     stream_generate,
 )
@@ -2958,6 +2961,7 @@ class ResponseGenerator:
             generation_started_at = time.perf_counter()
             first_generated_token_at = None
             draft_tokens = 0
+            decode_profile_before = _glm_dsa_decode_profile_snapshot()
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -3094,6 +3098,21 @@ class ResponseGenerator:
                 decode_tps,
                 draft_tokens,
             )
+            decode_profile_after = _glm_dsa_decode_profile_snapshot()
+            decode_profile_fields = _glm_dsa_decode_profile_fields(
+                decode_profile_before,
+                decode_profile_after,
+            )
+            decode_profile_suffix = _format_prefill_chunk_fields(
+                decode_profile_fields
+            )
+            if decode_profile_suffix:
+                logging.info(
+                    "glm dsa decode profile: prompt_tokens=%s generated_tokens=%s %s",
+                    prompt_token_count,
+                    generated_tokens,
+                    decode_profile_suffix,
+                )
 
             rendered_continuation = None
             if rendered_prompt is not None and generated_text_parts:

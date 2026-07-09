@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from collections import Counter
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -55,8 +56,11 @@ GLM_DSA_NATIVE_Q4_QB_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB"
 GLM_DSA_NATIVE_Q4_QB_TILE_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_QB_TILE"
 GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
+GLM_DSA_DECODE_PROFILE_ENV = "MLX_LM_GLM_DSA_DECODE_PROFILE"
+GLM_DSA_DECODE_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_DECODE_PROFILE_ISOLATE"
 
 _PROFILE_STAGES = (
+    "input_layernorm",
     "q_projection",
     "q_a_projection",
     "q_a_dense_cache_dequantization",
@@ -77,7 +81,17 @@ _PROFILE_STAGES = (
     "sparse_gather",
     "attention",
     "native_sparse_attention",
+    "o_projection",
+    "post_attention_layernorm",
+    "mlp",
     "total_prefill",
+)
+_DECODE_PROFILE_STAGES = tuple(
+    stage for stage in _PROFILE_STAGES if stage != "total_prefill"
+) + (
+    "total_decode_attention",
+    "total_decode_layer",
+    "total_decode_model",
 )
 _DEFAULT_FAST_PREFILL_QUERY_CHUNK = 16
 _DEFAULT_FAST_PREFILL_KEY_BLOCK = 8192
@@ -86,6 +100,8 @@ _DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT = 6144
 _FAST_PREFILL_LARGE_TOPK_WARNING = 1024
 _LOGGER = logging.getLogger(__name__)
 _GLM_DSA_PREFILL_PROFILE = None
+_GLM_DSA_DECODE_PROFILE = None
+_GLM_DSA_PROFILE_SCOPE = ContextVar("glm_dsa_profile_scope", default=None)
 _WARNED_FAST_PREFILL_LARGE_TOPK = False
 _NATIVE_SPARSE_MLA_LOOKUP_DONE = False
 _NATIVE_SPARSE_MLA_KERNEL = None
@@ -158,6 +174,14 @@ def _prefill_profile_enabled() -> bool:
 
 def _prefill_profile_isolate_enabled() -> bool:
     return _env_flag(GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV, False)
+
+
+def _decode_profile_enabled() -> bool:
+    return _env_flag(GLM_DSA_DECODE_PROFILE_ENV, False)
+
+
+def _decode_profile_isolate_enabled() -> bool:
+    return _env_flag(GLM_DSA_DECODE_PROFILE_ISOLATE_ENV, False)
 
 
 def _fast_prefill_debug_enabled() -> bool:
@@ -252,9 +276,23 @@ def _new_profile():
     }
 
 
+def _new_decode_profile():
+    return {
+        "stages": {
+            stage: {"seconds": 0.0, "count": 0}
+            for stage in _DECODE_PROFILE_STAGES
+        },
+    }
+
+
 def reset_glm_dsa_prefill_profile():
     global _GLM_DSA_PREFILL_PROFILE
     _GLM_DSA_PREFILL_PROFILE = _new_profile()
+
+
+def reset_glm_dsa_decode_profile():
+    global _GLM_DSA_DECODE_PROFILE
+    _GLM_DSA_DECODE_PROFILE = _new_decode_profile()
 
 
 def get_glm_dsa_prefill_profile(reset: bool = False):
@@ -307,10 +345,33 @@ def get_glm_dsa_prefill_profile(reset: bool = False):
     return profile
 
 
+def get_glm_dsa_decode_profile(reset: bool = False):
+    global _GLM_DSA_DECODE_PROFILE
+    if _GLM_DSA_DECODE_PROFILE is None:
+        reset_glm_dsa_decode_profile()
+    profile = {
+        "stages": {
+            stage: dict(values)
+            for stage, values in _GLM_DSA_DECODE_PROFILE["stages"].items()
+        },
+    }
+    if reset:
+        reset_glm_dsa_decode_profile()
+    return profile
+
+
 def _record_stage(stage: str, seconds: float):
     if _GLM_DSA_PREFILL_PROFILE is None:
         reset_glm_dsa_prefill_profile()
     values = _GLM_DSA_PREFILL_PROFILE["stages"][stage]
+    values["seconds"] += seconds
+    values["count"] += 1
+
+
+def _record_decode_stage(stage: str, seconds: float):
+    if _GLM_DSA_DECODE_PROFILE is None:
+        reset_glm_dsa_decode_profile()
+    values = _GLM_DSA_DECODE_PROFILE["stages"][stage]
     values["seconds"] += seconds
     values["count"] += 1
 
@@ -911,15 +972,39 @@ def _eval_profile_value(value):
 
 
 def _profile_stage(stage: str, fn, *, inputs=None):
-    if not _prefill_profile_enabled():
-        return fn()
-    if inputs is not None and _prefill_profile_isolate_enabled():
+    scope = _GLM_DSA_PROFILE_SCOPE.get()
+    if scope == "decode":
+        if not _decode_profile_enabled():
+            return fn()
+        isolate = _decode_profile_isolate_enabled()
+        record_stage = _record_decode_stage
+    else:
+        if not _prefill_profile_enabled():
+            return fn()
+        isolate = _prefill_profile_isolate_enabled()
+        record_stage = _record_stage
+
+    if inputs is not None and isolate:
         _eval_profile_value(inputs)
     start = time.perf_counter()
     value = fn()
     _eval_profile_value(value)
-    _record_stage(stage, time.perf_counter() - start)
+    record_stage(stage, time.perf_counter() - start)
     return value
+
+
+def _profile_scope_enabled(scope: str) -> bool:
+    if scope == "decode":
+        return _decode_profile_enabled()
+    if scope == "prefill":
+        return _prefill_profile_enabled()
+    return False
+
+
+def _set_profile_scope(scope: Optional[str]):
+    if scope is None or not _profile_scope_enabled(scope):
+        return None
+    return _GLM_DSA_PROFILE_SCOPE.set(scope)
 
 
 def _scalar_int(value):
@@ -2006,7 +2091,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
     ):
         B, L, D = x.shape
         profile_total = _prefill_profile_enabled() and L > 1
-        total_start = time.perf_counter() if profile_total else None
+        profile_decode_total = _GLM_DSA_PROFILE_SCOPE.get() == "decode"
+        total_start = (
+            time.perf_counter() if profile_total or profile_decode_total else None
+        )
 
         def project_q():
             q_a = _profile_stage(
@@ -2223,8 +2311,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 output = self._unembed_out_project(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        output = self.o_proj(output)
-        if profile_total:
+        output = _profile_stage(
+            "o_projection", lambda: self.o_proj(output), inputs=output
+        )
+        if profile_decode_total:
+            _eval_profile_value(output)
+            _record_decode_stage(
+                "total_decode_attention", time.perf_counter() - total_start
+            )
+        elif profile_total:
             _eval_profile_value(output)
             _record_stage("total_prefill", time.perf_counter() - total_start)
         return output, topk_indices
@@ -2242,12 +2337,28 @@ class GlmMoeDsaDecoderLayer(DeepseekV32DecoderLayer):
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
     ):
+        profile_decode_total = _GLM_DSA_PROFILE_SCOPE.get() == "decode"
+        total_start = time.perf_counter() if profile_decode_total else None
+        normed_x = _profile_stage(
+            "input_layernorm", lambda: self.input_layernorm(x), inputs=x
+        )
         r, topk_indices = self.self_attn(
-            self.input_layernorm(x), mask, cache, prev_topk_indices
+            normed_x, mask, cache, prev_topk_indices
         )
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r, topk_indices
+        normed_h = _profile_stage(
+            "post_attention_layernorm",
+            lambda: self.post_attention_layernorm(h),
+            inputs=h,
+        )
+        r = _profile_stage("mlp", lambda: self.mlp(normed_h), inputs=normed_h)
+        output = h + r
+        if profile_decode_total:
+            _eval_profile_value(output)
+            _record_decode_stage(
+                "total_decode_layer", time.perf_counter() - total_start
+            )
+        return output, topk_indices
 
 
 class GlmMoeDsaModel(DeepseekV32Model):
@@ -2263,6 +2374,9 @@ class GlmMoeDsaModel(DeepseekV32Model):
         x: mx.array,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        profile_token = _set_profile_scope("decode" if x.shape[1] == 1 else None)
+        profile_decode_total = profile_token is not None
+        total_start = time.perf_counter() if profile_decode_total else None
         h = self.embed_tokens(x)
 
         pipeline_rank = self.pipeline_rank
@@ -2294,7 +2408,14 @@ class GlmMoeDsaModel(DeepseekV32Model):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(h)
+        h = self.norm(h)
+        if profile_decode_total:
+            _eval_profile_value(h)
+            _record_decode_stage(
+                "total_decode_model", time.perf_counter() - total_start
+            )
+            _GLM_DSA_PROFILE_SCOPE.reset(profile_token)
+        return h
 
 
 class Model(DSV32Model):

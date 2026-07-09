@@ -100,6 +100,26 @@ _GLM_DSA_CHUNK_STAGE_KEYS = (
     "attention",
     "native_sparse_attention",
 )
+_GLM_DSA_DECODE_STAGE_KEYS = (
+    "input_layernorm",
+    "q_projection",
+    "q_a_projection",
+    "q_a_layernorm",
+    "q_b_projection",
+    "kv_cache_update",
+    "dsa_indexer_topk",
+    "latent_kv_dequantization",
+    "latent_kv_projection",
+    "native_q8_vup",
+    "native_q4_vup",
+    "attention",
+    "o_projection",
+    "post_attention_layernorm",
+    "mlp",
+    "total_decode_attention",
+    "total_decode_layer",
+    "total_decode_model",
+)
 
 
 def _glm_dsa_prefill_profile_snapshot():
@@ -169,6 +189,49 @@ def _glm_dsa_prefill_profile_chunk_fields(before, after):
             fields[f"glm_dsa_{stage}_seconds"] = seconds
         if count:
             fields[f"glm_dsa_{stage}_count"] = count
+    return fields
+
+
+def _glm_dsa_decode_profile_snapshot():
+    module = sys.modules.get("mlx_lm.models.glm_moe_dsa")
+    getter = getattr(module, "get_glm_dsa_decode_profile", None)
+    if getter is None:
+        return None
+    try:
+        profile = getter(reset=False)
+    except Exception:
+        return None
+    stages = profile.get("stages", {})
+    return {
+        "stages": {
+            stage: {
+                "seconds": float(stages.get(stage, {}).get("seconds", 0.0)),
+                "count": int(stages.get(stage, {}).get("count", 0)),
+            }
+            for stage in _GLM_DSA_DECODE_STAGE_KEYS
+        },
+    }
+
+
+def _glm_dsa_decode_profile_fields(before, after):
+    if before is None or after is None:
+        return {}
+    fields = {}
+    before_stages = before.get("stages", {})
+    after_stages = after.get("stages", {})
+    for stage in _GLM_DSA_DECODE_STAGE_KEYS:
+        before_stage = before_stages.get(stage, {})
+        after_stage = after_stages.get(stage, {})
+        seconds = float(after_stage.get("seconds", 0.0)) - float(
+            before_stage.get("seconds", 0.0)
+        )
+        count = int(after_stage.get("count", 0)) - int(
+            before_stage.get("count", 0)
+        )
+        if seconds:
+            fields[f"glm_dsa_decode_{stage}_seconds"] = seconds
+        if count:
+            fields[f"glm_dsa_decode_{stage}_count"] = count
     return fields
 
 

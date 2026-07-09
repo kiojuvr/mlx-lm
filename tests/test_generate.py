@@ -12,6 +12,7 @@ from mlx_lm.generate import (
     SequenceStateMachine,
     _effective_prefill_step_size,
     _glm_dsa_adaptive_prefill_step_size,
+    _glm_dsa_decode_profile_fields,
     _format_prefill_chunk_fields,
     _glm_dsa_prefill_profile_chunk_fields,
     batch_generate,
@@ -135,6 +136,35 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(fields["glm_dsa_native_indexer_scores_seconds"], 0.125)
         self.assertIn(
             'glm_dsa_native_sparse_prefill_fallback_reasons={"runtime_error":2}',
+            _format_prefill_chunk_fields(fields),
+        )
+
+    def test_glm_dsa_decode_profile_fields_report_deltas(self):
+        before = {
+            "stages": {
+                "q_projection": {"seconds": 1.0, "count": 10},
+                "mlp": {"seconds": 2.0, "count": 10},
+                "total_decode_model": {"seconds": 3.0, "count": 5},
+            },
+        }
+        after = {
+            "stages": {
+                "q_projection": {"seconds": 1.25, "count": 12},
+                "mlp": {"seconds": 2.75, "count": 12},
+                "total_decode_model": {"seconds": 3.5, "count": 6},
+            },
+        }
+
+        fields = _glm_dsa_decode_profile_fields(before, after)
+
+        self.assertEqual(fields["glm_dsa_decode_q_projection_seconds"], 0.25)
+        self.assertEqual(fields["glm_dsa_decode_q_projection_count"], 2)
+        self.assertEqual(fields["glm_dsa_decode_mlp_seconds"], 0.75)
+        self.assertEqual(fields["glm_dsa_decode_mlp_count"], 2)
+        self.assertEqual(fields["glm_dsa_decode_total_decode_model_seconds"], 0.5)
+        self.assertEqual(fields["glm_dsa_decode_total_decode_model_count"], 1)
+        self.assertIn(
+            "glm_dsa_decode_mlp_seconds=0.750000",
             _format_prefill_chunk_fields(fields),
         )
 
