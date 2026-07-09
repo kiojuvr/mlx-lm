@@ -90,18 +90,86 @@ Example local path when downloaded through LM Studio:
 
     ~/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw
 
-### Generate example
+### Installation
 
+The local stable setup uses a `uv`-managed CPython 3.13.14 virtual environment.
+This venv does not need the `pip` module installed; use `uv pip` from outside
+the environment to install or refresh packages:
+
+```sh
+uv python install 3.13.14
+uv venv --python 3.13.14 /Users/kioju/.venvs/mlx-glm52
+source /Users/kioju/.venvs/mlx-glm52/bin/activate
 ```
-MLX_METAL_FAST_SYNCH=1 python -m mlx_lm generate \
-  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
-  --prompt "Hello. Briefly introduce yourself." \
-  --max-tokens 32 \
-  --kv-bits 8 \
-  --kv-group-size 64 \
-  --quantized-kv-start 4096 \
-  --temp 0.4 \
-  --top-p 0.95
+
+Install the known-good dependency set:
+
+```sh
+uv pip install --python /Users/kioju/.venvs/mlx-glm52/bin/python \
+  mlx==0.31.2 \
+  mlx-lm==0.31.3 \
+  transformers==5.12.1 \
+  safetensors==0.8.0 \
+  numpy==2.4.6 \
+  tokenizers==0.22.2 \
+  sentencepiece==0.2.1 \
+  protobuf==7.35.1 \
+  huggingface-hub==1.20.1
+```
+
+Install this checkout as the active editable `mlx-lm` package. Add
+`MLX_LM_WITH_CUSTOM_KERNEL=1` when the vendored GLM custom kernels should be
+built into the editable install:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+MLX_LM_WITH_CUSTOM_KERNEL=1 \
+uv pip install --python /Users/kioju/.venvs/mlx-glm52/bin/python --no-deps -e .
+```
+
+If the checkout does not already have a local `.venv` link, create one for
+shorter commands:
+
+```sh
+ln -sfn /Users/kioju/.venvs/mlx-glm52 .venv
+```
+
+### Benchmark snapshot
+
+Current local measurements use a single-device M3 Ultra 512GB Mac Studio, the
+3.5bpw dynamic-quantized GLM-5.2 MLX checkpoint above, MLX 0.31.2, int8 GLM MLA
+KV cache, native sparse MLA over quantized KV, and the serving command below.
+
+The updated checkpoint includes native MTP-layer weights. This fork currently
+loads GLM checkpoints that contain those weights, but baseline `mlx_lm`
+generation does not yet run an MTP/speculative decode path. Treat the decode
+numbers below as single-stream baseline decode, not MTP-accelerated decode.
+
+Recent OpenCode task log, July 9, 2026. This run primarily measured
+server-cache-covered suffix prefill; disk checkpoint candidates were found, but
+the already-live server cache covered the useful prefixes.
+
+Prefill / first-token measurements:
+
+| Workload | Prompt tokens | Reused tokens | Fresh prompt tokens | Prefill chunks | First token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cold small first request | 3,458 | 0 | 3,458 | 22.308s | 22.859s |
+| Mostly cached tool turn | 12,918 | 12,654 | 264 | 2.735s | 2.945s |
+| Larger suffix turn | 43,143 | 32,699 | 10,444 | 71.657s | 71.960s |
+| Final long decode turn | 44,417 | 44,086 | 331 | 3.279s | 3.549s |
+
+Decode measurements:
+
+| Workload | Prompt tokens | Generated tokens | Decode seconds | Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Final long completed turn | 44,417 | 5,041 | 320.230 | 15.742 |
+| Short tool-call turns | 12,918 to 43,945 | 141 to 474 | 8.849 to 29.032 | about 15.9 to 16.3 |
+
+The final long turn logged steady decode progress at roughly 15.7 tok/s:
+
+```text
+generation progress: prompt_tokens=44417 generated_tokens=4096 decode_seconds=260.206 decode_tps=15.741
+generation complete: prompt_tokens=44417 generated_tokens=5041 decode_seconds=320.230 decode_tps=15.742
 ```
 
 ### Recommended GLM-5.2 serving settings
