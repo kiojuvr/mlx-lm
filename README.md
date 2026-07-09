@@ -166,6 +166,7 @@ Decode measurements:
 | --- | ---: | ---: | ---: | ---: |
 | Final long completed turn | 44,417 | 5,041 | 320.230 | 15.742 |
 | Short tool-call turns | 12,918 to 43,945 | 141 to 474 | 8.849 to 29.032 | about 15.9 to 16.3 |
+| 8K synthetic decode-context exact-hit baseline | 8,192 | 64 | 3.897 | 16.420 |
 
 The final long turn logged steady decode progress at roughly 15.7 tok/s:
 
@@ -593,12 +594,12 @@ before pruning starts.
 - With GLM MLA `--kv-bits 8`, the server can use the continuous `BatchGenerator` path. It will not merge quantized and unquantized GLM MLA caches in the same active batch, so fresh short requests may wait for an incompatible quantized batch instead of being quantized earlier than `--quantized-kv-start`. Compatible queued requests can still bypass that waiting request and join the active batch.
 - Other model families with `--kv-bits` still use the single-request `stream_generate` path unless they grow batch-compatible quantized cache support.
 - Prompt checkpointing is trusted single-model local cache reuse. It validates prefix, cache structure, GLM DSA metadata, and GLM MLA KV settings, but it does not prove full model weight, tokenizer, adapter, or artifact identity.
-- Long-context decode currently dequantizes the full MLA latent cache on read. Sparse or block-wise dequantization is future work.
+- Long-context decode with GLM DSA top-k already gathers the selected quantized MLA latent KV entries before dequantization. A faster decode path likely needs fused selected gather/dequant/attention or MTP/speculative decode rather than another full-cache dequant guard.
 - If generation behaves unexpectedly after changing model/runtime settings, clear the GLM-5.2 local runtime cache first.
 
-### Prefill benchmark
+### Prefill and decode benchmarks
 
-See `docs/glm52-prefill-benchmark.md` for the GLM-5.2 prefill benchmark command, measured fields, and current batching notes. The benchmark script lives at `benchmarks/glm52_prefill_benchmark.py`. Use `--mode single` with `--max-tokens 1` for TTFT / checkpoint measurements, and `--mode queued --max-tokens 8` or similar to expose admission wait time under serving load.
+See `docs/glm52-prefill-benchmark.md` for the GLM-5.2 prefill/decode benchmark commands, measured fields, and current batching notes. The benchmark script lives at `benchmarks/glm52_prefill_benchmark.py`. Use `--mode single` with `--max-tokens 1` for TTFT / checkpoint measurements, `--mode decode-context --max-tokens 64` for long-context decode TPS, and `--mode queued --max-tokens 8` or similar to expose admission wait time under serving load.
 
 ## MLX LM 
 

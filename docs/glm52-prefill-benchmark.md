@@ -45,6 +45,11 @@ The benchmark reports:
 - optional GLM DSA stage timings for q projection, KV cache update,
   DSA top-k, latent KV dequantization, latent K/V projection, sparse gather,
   attention, and total prefill
+- decode-context fields: generated tokens, generation/decode TPS,
+  continuation-only decode TPS, prefill seconds, and prefill TPS
+- optional GLM DSA decode stage timings for q projection, KV cache update,
+  DSA top-k, selected latent KV dequantization, latent attention, MLP, and total
+  decode model/layer/attention time
 
 Use `--no-prompt-checkpoint` for cold prefill measurements. Use
 `--checkpoint-cache-dir "$(mktemp -d)"` when measuring checkpoint behavior so a
@@ -55,6 +60,67 @@ prompt checkpoint file location.
 Use `--checkpoint-save-exact disabled` or `--no-save-exact-checkpoint` when you
 want configured prefix/frontier checkpoints without also saving the final exact
 full-prompt checkpoint.
+
+## GLM DSA Decode Context Benchmark
+
+Use `--mode decode-context` to measure long-context decode separately from
+single-token TTFT probes:
+
+```sh
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --mode decode-context \
+  --lengths 8192 \
+  --max-tokens 64 \
+  --prefill-step-size 2048 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 0 \
+  --output-format csv \
+  --json-output glm52-decode-context-8k.json
+```
+
+Decode-context runs disable prompt checkpoints by default so cold prefill and
+decode are visible in the same row. Add `--decode-context-use-checkpoints` with a
+private `--checkpoint-cache-dir` when measuring exact-hit decode after seeding
+the prompt cache.
+
+The useful fields for decode work are:
+
+- `generated_tokens`
+- `decode_seconds`
+- `decode_tps`
+- `decode_continuation_seconds`
+- `decode_continuation_tps`
+- `prefill_seconds`
+- `prefill_tps`
+- `checkpoint_resolution`
+
+Use `--decode-profile --decode-profile-isolate enabled` for synchronized GLM DSA
+decode stage attribution. This adds substantial overhead, so use the profile for
+relative bottleneck attribution, not absolute TPS.
+
+On the tested M3 Ultra 512GB setup with the MTP-weight checkpoint loaded through
+the baseline non-speculative path, an 8K exact-hit decode-context sweep with 64
+generated tokens measured about 16.42 decode tok/s. Existing experimental q4
+projection/V-up toggles did not improve decode in that sweep:
+
+| Case | Decode TPS | Continuation TPS |
+| --- | ---: | ---: |
+| baseline exact hit | 16.420 | 16.133 |
+| native q4 q_a | 14.111 | 13.868 |
+| native q4 q_b | 13.274 | 13.046 |
+| native q4 q_a + q_b | 11.804 | 11.603 |
+| q_a dense cache | 15.635 | 15.363 |
+| native q4 V-up | 15.839 | 15.565 |
+
+The current decode path already gathers the selected `topk=2048` quantized MLA
+latent KV entries before dequantizing them when GLM DSA top-k indices are
+available. In an 8K decode profile, selected latent KV dequantization was a
+contributor but not the dominant cost. The next decode-side implementation
+targets are therefore a fused selected gather/dequant/attention kernel, a
+decode-specific native DSA indexer path for `L == 1`, or MTP/speculative decode
+integration.
 
 ## GLM DSA Sparse Prefill Fast Path
 
