@@ -1139,6 +1139,12 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     )
 
 
+def _format_float_or_none(value, digits=3):
+    if value is None:
+        return "n/a"
+    return f"{float(value):.{digits}f}"
+
+
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
@@ -3016,6 +3022,7 @@ class ResponseGenerator:
             generation_started_at = time.perf_counter()
             first_generated_token_at = None
             draft_tokens = 0
+            mtp_speculative_stats = {} if mtp_speculative else None
             decode_profile_before = _glm_dsa_decode_profile_snapshot()
             for gen in stream_generate(
                 model=model,
@@ -3027,6 +3034,7 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 mtp_speculative=mtp_speculative,
+                mtp_speculative_stats=mtp_speculative_stats,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
@@ -3154,6 +3162,33 @@ class ResponseGenerator:
                 decode_tps,
                 draft_tokens,
             )
+            if mtp_speculative_stats is not None:
+                logging.info(
+                    "mtp speculative complete: rounds=%s drafted_tokens=%s "
+                    "accepted_tokens=%s acceptance_rate=%s mean_accepted=%s "
+                    "target_forwards=%s target_input_tokens=%s "
+                    "target_tokens=%s emitted_tokens=%s "
+                    "emitted_per_target_forward=%s catchup_forwards=%s "
+                    "num_draft_tokens=%s",
+                    mtp_speculative_stats.get("rounds", 0),
+                    mtp_speculative_stats.get("drafted_tokens", 0),
+                    mtp_speculative_stats.get("accepted_tokens", 0),
+                    _format_float_or_none(
+                        mtp_speculative_stats.get("acceptance_rate")
+                    ),
+                    _format_float_or_none(
+                        mtp_speculative_stats.get("mean_accepted")
+                    ),
+                    mtp_speculative_stats.get("target_forwards", 0),
+                    mtp_speculative_stats.get("target_input_tokens", 0),
+                    mtp_speculative_stats.get("target_tokens", 0),
+                    mtp_speculative_stats.get("emitted_tokens", 0),
+                    _format_float_or_none(
+                        mtp_speculative_stats.get("emitted_per_target_forward")
+                    ),
+                    mtp_speculative_stats.get("catchup_forwards", 0),
+                    mtp_speculative_stats.get("num_draft_tokens", 0),
+                )
             decode_profile_after = _glm_dsa_decode_profile_snapshot()
             decode_profile_fields = _glm_dsa_decode_profile_fields(
                 decode_profile_before,

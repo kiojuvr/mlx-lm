@@ -100,6 +100,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 return logits, hidden, None
 
         model = DummyModel()
+        stats = {}
         old_make_cache = generate_module.cache.make_prompt_cache
         generate_module.cache.make_prompt_cache = lambda _model: model.target_cache
         try:
@@ -109,6 +110,7 @@ class TestGenerateUtilities(unittest.TestCase):
                     model,
                     max_tokens=5,
                     num_draft_tokens=3,
+                    mtp_speculative_stats=stats,
                 )
             )
         finally:
@@ -124,6 +126,17 @@ class TestGenerateUtilities(unittest.TestCase):
         )
         self.assertIn(2, model.target_cache[0].trimmed)
         self.assertIn(1, model.mtp_cache.trimmed)
+        self.assertEqual(stats["rounds"], 2)
+        self.assertEqual(stats["drafted_tokens"], 4)
+        self.assertEqual(stats["accepted_tokens"], 2)
+        self.assertEqual(stats["target_forwards"], 2)
+        self.assertEqual(stats["target_input_tokens"], 6)
+        self.assertEqual(stats["target_tokens"], 3)
+        self.assertEqual(stats["emitted_tokens"], 5)
+        self.assertEqual(stats["catchup_forwards"], 1)
+        self.assertAlmostEqual(stats["acceptance_rate"], 0.5)
+        self.assertAlmostEqual(stats["mean_accepted"], 1.0)
+        self.assertAlmostEqual(stats["emitted_per_target_forward"], 2.5)
 
     def test_effective_prefill_step_size_caps_long_context(self):
         step = _effective_prefill_step_size(

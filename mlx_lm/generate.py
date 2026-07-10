@@ -1643,6 +1643,7 @@ def mtp_speculative_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    mtp_speculative_stats: Optional[dict] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     Generate with a model's built-in GLM DSA MTP layer.
@@ -1699,6 +1700,36 @@ def mtp_speculative_generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
     )
+    stats = mtp_speculative_stats if mtp_speculative_stats is not None else {}
+    stats.clear()
+    stats.update(
+        {
+            "rounds": 0,
+            "target_forwards": 0,
+            "target_input_tokens": 0,
+            "drafted_tokens": 0,
+            "accepted_tokens": 0,
+            "target_tokens": 0,
+            "emitted_tokens": 0,
+            "catchup_forwards": 0,
+            "num_draft_tokens": int(num_draft_tokens),
+        }
+    )
+
+    def _update_stats():
+        drafted = stats["drafted_tokens"]
+        rounds = stats["rounds"]
+        target_forwards = stats["target_forwards"]
+        emitted_tokens = stats["emitted_tokens"]
+        stats["acceptance_rate"] = (
+            stats["accepted_tokens"] / drafted if drafted else None
+        )
+        stats["mean_accepted"] = (
+            stats["accepted_tokens"] / rounds if rounds else None
+        )
+        stats["emitted_per_target_forward"] = (
+            emitted_tokens / target_forwards if target_forwards else None
+        )
 
     def _append_history(tokens):
         nonlocal history
@@ -1773,6 +1804,9 @@ def mtp_speculative_generate_step(
     mx.eval(current)
     _append_history(current)
     emitted += 1
+    stats["emitted_tokens"] += 1
+    stats["target_tokens"] += 1
+    _update_stats()
     yield current.item(), logprobs, False
 
     while _can_emit():
@@ -1791,11 +1825,16 @@ def mtp_speculative_generate_step(
                 next_hidden = hidden[:, -1:, :]
                 _eval_target(logits, hidden)
                 mx.async_eval(next_token, next_logprobs, next_hidden)
+            stats["target_forwards"] += 1
+            stats["target_input_tokens"] += 1
             mx.eval(next_token)
             current = next_token
             previous_hidden = next_hidden
             _append_history(current)
             emitted += 1
+            stats["emitted_tokens"] += 1
+            stats["target_tokens"] += 1
+            _update_stats()
             yield current.item(), next_logprobs, False
             continue
 
@@ -1803,6 +1842,7 @@ def mtp_speculative_generate_step(
         draft_input = current
         draft_hidden = previous_hidden
         draft_history = history
+        stats["rounds"] += 1
         with mx.stream(generation_stream):
             for _ in range(num_draft):
                 mtp_logits, mtp_hidden, _topk = model.mtp_logits(
@@ -1817,6 +1857,7 @@ def mtp_speculative_generate_step(
                 )
                 _eval_mtp(mtp_logits, mtp_hidden)
                 mx.async_eval(proposal, mtp_hidden)
+                stats["drafted_tokens"] += 1
                 draft_tokens.append(proposal)
                 draft_input = proposal
                 draft_hidden = mtp_hidden[:, -1:, :]
@@ -1829,6 +1870,8 @@ def mtp_speculative_generate_step(
                 cache=target_cache,
             )
             quantize_cache_fn(target_cache)
+        stats["target_forwards"] += 1
+        stats["target_input_tokens"] += num_draft + 1
 
         accepted = 0
         target_tokens = []
@@ -1866,6 +1909,9 @@ def mtp_speculative_generate_step(
             current = target_tokens[i]
             _append_history(current)
             emitted += 1
+            stats["emitted_tokens"] += 1
+            stats["accepted_tokens"] += 1
+            _update_stats()
             yield current.item(), target_logprobs[i], True
 
         if not _can_emit():
@@ -1875,6 +1921,9 @@ def mtp_speculative_generate_step(
         previous_hidden = hidden[:, accepted : accepted + 1, :]
         _append_history(current)
         emitted += 1
+        stats["emitted_tokens"] += 1
+        stats["target_tokens"] += 1
+        _update_stats()
         yield current.item(), target_logprobs[accepted], False
 
         if accepted == num_draft:
@@ -1887,6 +1936,8 @@ def mtp_speculative_generate_step(
                 )
                 quantize_cache_fn(mtp_cache_holder)
                 _eval_mtp(catch_logits, catch_hidden)
+            stats["catchup_forwards"] += 1
+            _update_stats()
 
 
 def speculative_generate_step(
@@ -2147,6 +2198,7 @@ def stream_generate(
 
     if draft_model is None and not mtp_speculative:
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("mtp_speculative_stats", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -2185,6 +2237,7 @@ def stream_generate(
         kwargs.pop("glm_dsa_adaptive_prefill_min_remaining_tokens", None)
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        kwargs.pop("mtp_speculative_stats", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
