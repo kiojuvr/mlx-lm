@@ -1859,6 +1859,7 @@ class TestServerCLI(unittest.TestCase):
                     os.environ[PROMPT_CHECKPOINT_CACHE_DIR_ENV],
                     str(checkpoint_dir.resolve()),
                 )
+                self.assertTrue(checkpoint_dir.is_dir())
         finally:
             if old_value is None:
                 os.environ.pop(PROMPT_CHECKPOINT_CACHE_DIR_ENV, None)

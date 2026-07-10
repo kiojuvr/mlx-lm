@@ -336,6 +336,80 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(model.target_cache[0].offset, 3)
         self.assertEqual(model.mtp_cache.offset, 3)
 
+    def test_mtp_speculative_generate_step_syncs_quantized_combined_cache(self):
+        class DummyCache:
+            def __init__(self, offset=0, quantized=False):
+                self.offset = offset
+                self.quantized = quantized
+
+            @property
+            def state(self):
+                return mx.array([self.offset])
+
+            def size(self):
+                return self.offset
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                n = min(n, self.offset)
+                self.offset -= n
+                return n
+
+            def to_quantized(self, group_size=64, bits=8):
+                return DummyCache(offset=self.offset, quantized=True)
+
+        class DummyModel:
+            def __init__(self):
+                self.mtp = object()
+                self.layers = [object()]
+
+            def make_cache(self):
+                return [DummyCache()]
+
+            def make_mtp_cache(self):
+                return DummyCache()
+
+            def _logits(self, token, length):
+                logits = mx.where(
+                    mx.arange(16) == token,
+                    mx.array(1.0),
+                    mx.array(0.0),
+                )
+                return mx.broadcast_to(logits.reshape(1, 1, 16), (1, length, 16))
+
+            def forward_with_hidden(self, inputs, cache=None):
+                for c in cache:
+                    c.offset += inputs.shape[1]
+                hidden = mx.ones((1, inputs.shape[1], 4))
+                return self._logits(5, inputs.shape[1]), hidden
+
+            def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+                cache.offset += inputs.shape[1]
+                hidden = mx.ones((1, inputs.shape[1], 4))
+                return self._logits(6, inputs.shape[1]), hidden, None
+
+        model = DummyModel()
+        combined_cache = [DummyCache(), DummyCache()]
+        rows = list(
+            mtp_speculative_generate_step(
+                mx.array([1, 2, 3]),
+                model,
+                prompt_cache=combined_cache,
+                max_tokens=1,
+                prefill_step_size=1,
+                kv_bits=8,
+                quantized_kv_start=0,
+            )
+        )
+
+        self.assertEqual([token for token, _logprobs, _draft in rows], [5])
+        self.assertTrue(combined_cache[0].quantized)
+        self.assertTrue(combined_cache[1].quantized)
+        self.assertEqual(combined_cache[0].offset, 3)
+        self.assertEqual(combined_cache[1].offset, 3)
+
     def test_effective_prefill_step_size_caps_long_context(self):
         step = _effective_prefill_step_size(
             requested_step_size=1024,

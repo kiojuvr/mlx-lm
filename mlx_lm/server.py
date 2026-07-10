@@ -5267,6 +5267,7 @@ def configure_checkpoint_cache_dir(args):
     if checkpoint_cache_dir is None:
         return None
     resolved = Path(checkpoint_cache_dir).expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
     os.environ[PROMPT_CHECKPOINT_CACHE_DIR_ENV] = str(resolved)
     logging.info("Prompt checkpoint cache dir override: %s", resolved)
     return str(resolved)
@@ -5313,8 +5314,8 @@ def setup_arg_parser():
         action="store_true",
         help=(
             "Use the model's built-in GLM DSA MTP layer for speculative "
-            "decoding. Experimental; disables server batching and prompt "
-            "checkpoint reuse for served requests."
+            "decoding. Experimental; disables server batching and uses a "
+            "dedicated RAM/exact prompt-checkpoint cache layout."
         ),
     )
     parser.add_argument(

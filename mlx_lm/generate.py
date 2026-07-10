@@ -1669,6 +1669,7 @@ def mtp_speculative_generate_step(
     if prompt_history is not None:
         prompt_history = mx.array(prompt_history, dtype=mx.uint32).reshape(-1)
 
+    combined_prompt_cache = prompt_cache
     if prompt_cache is None:
         target_cache, mtp_cache_holder = cache.make_mtp_speculative_cache_pair(model)
         cached_prompt_tokens = 0
@@ -1737,6 +1738,12 @@ def mtp_speculative_generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
     )
+
+    def _quantize_runtime_cache(runtime_cache):
+        quantize_cache_fn(runtime_cache)
+        if combined_prompt_cache is not None:
+            combined_prompt_cache[:] = target_cache + mtp_cache_holder
+
     stats = mtp_speculative_stats if mtp_speculative_stats is not None else {}
     stats.clear()
     stats.update(
@@ -1814,13 +1821,13 @@ def mtp_speculative_generate_step(
                 chunk,
                 cache=target_cache,
             )
-            quantize_cache_fn(target_cache)
+            _quantize_runtime_cache(target_cache)
             mtp_logits, mtp_hidden, _topk = model.mtp_logits(
                 chunk,
                 target_hidden,
                 cache=mtp_cache_holder[0],
             )
-            quantize_cache_fn(mtp_cache_holder)
+            _quantize_runtime_cache(mtp_cache_holder)
             _eval_target(target_logits, target_hidden)
             _eval_mtp(mtp_logits, mtp_hidden)
             processed += n_to_process
@@ -1860,7 +1867,7 @@ def mtp_speculative_generate_step(
                     current[None],
                     cache=target_cache,
                 )
-                quantize_cache_fn(target_cache)
+                _quantize_runtime_cache(target_cache)
                 next_token, next_logprobs = _process_and_sample(
                     history, logits[:, -1, :]
                 )
@@ -1892,7 +1899,7 @@ def mtp_speculative_generate_step(
                     draft_hidden,
                     cache=mtp_cache_holder[0],
                 )
-                quantize_cache_fn(mtp_cache_holder)
+                _quantize_runtime_cache(mtp_cache_holder)
                 proposal, _proposal_logprobs = _process_and_sample(
                     draft_history,
                     mtp_logits[:, -1, :],
@@ -1911,7 +1918,7 @@ def mtp_speculative_generate_step(
                 target_inputs,
                 cache=target_cache,
             )
-            quantize_cache_fn(target_cache)
+            _quantize_runtime_cache(target_cache)
         stats["target_forwards"] += 1
         stats["target_input_tokens"] += num_draft + 1
 
@@ -1976,7 +1983,7 @@ def mtp_speculative_generate_step(
                     catch_prev_hidden,
                     cache=mtp_cache_holder[0],
                 )
-                quantize_cache_fn(mtp_cache_holder)
+                _quantize_runtime_cache(mtp_cache_holder)
                 _eval_mtp(catch_logits, catch_hidden)
             stats["catchup_forwards"] += 1
             _update_stats()
