@@ -623,6 +623,88 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(update_manifest.call_args.kwargs["prefix_length"], 4)
         prune.assert_called_once()
 
+    def test_mtp_speculative_exact_checkpoint_round_trips_rendered_lookup(self):
+        old_value = os.environ.get(PROMPT_CHECKPOINT_CACHE_DIR_ENV)
+
+        class ToyMTPModel:
+            def make_cache(self):
+                return [KVCache()]
+
+            def make_mtp_cache(self):
+                return KVCache()
+
+        class AsciiTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [ord(ch) for ch in text]
+
+            def decode(self, tokens, **kwargs):
+                return "".join(chr(token) for token in tokens)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                checkpoint_dir = Path(tmpdir) / "prompt-checkpoints"
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                configure_checkpoint_cache_dir(
+                    types.SimpleNamespace(checkpoint_cache_dir=checkpoint_dir)
+                )
+
+                model = ToyMTPModel()
+                cli_args = self._args(
+                    checkpoint_save_exact="enabled",
+                    checkpoint_cold_max_tokens=10,
+                    kv_bits=None,
+                    kv_group_size=64,
+                    quantized_kv_start=0,
+                    mtp_speculative=True,
+                )
+                generator = ResponseGenerator.__new__(ResponseGenerator)
+                generator.model_provider = types.SimpleNamespace(
+                    model=model,
+                    draft_model=None,
+                    cli_args=cli_args,
+                )
+                prompt_tokens = [ord(ch) for ch in "abcd"]
+                prompt_cache = [KVCache(), KVCache()]
+                for idx, prompt_cache_entry in enumerate(prompt_cache):
+                    start = idx * 100
+                    keys = mx.array(
+                        list(range(start, start + 8)),
+                        dtype=mx.float32,
+                    ).reshape(1, 1, 4, 2)
+                    prompt_cache_entry.update_and_fetch(keys, keys + 1000)
+
+                saved = generator._save_mtp_speculative_exact_prompt_checkpoint(
+                    prompt_cache,
+                    prompt_tokens,
+                    rendered_prompt="abcd",
+                )
+                self.assertTrue(saved)
+
+                loaded = generator._load_rendered_prompt_checkpoint(
+                    AsciiTokenizer(),
+                    "abcdXYZ",
+                )
+
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded.kind, "exact")
+                self.assertEqual(loaded.prefix_tokens, prompt_tokens)
+                self.assertEqual(loaded.suffix_tokens, [ord(ch) for ch in "XYZ"])
+                self.assertEqual(loaded.cached_tokens, len(prompt_tokens))
+                self.assertEqual(
+                    prompt_cache_token_length(loaded.prompt_cache),
+                    len(prompt_tokens),
+                )
+                self.assertTrue(
+                    os.path.basename(loaded.checkpoint_path).startswith(
+                        "mtp-speculative-"
+                    )
+                )
+        finally:
+            if old_value is None:
+                os.environ.pop(PROMPT_CHECKPOINT_CACHE_DIR_ENV, None)
+            else:
+                os.environ[PROMPT_CHECKPOINT_CACHE_DIR_ENV] = old_value
+
     def test_save_continued_prompt_checkpoint_trims_and_records_metadata(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         cli_args = self._args(
