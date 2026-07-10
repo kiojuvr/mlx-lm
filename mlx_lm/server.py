@@ -38,6 +38,8 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
+    DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE,
+    DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
     DEFAULT_PREFILL_MAX_QK_TOKENS,
     GLM_DSA_MTP_ENV,
     SequenceStateMachine,
@@ -3203,6 +3205,16 @@ class ResponseGenerator:
                 mtp_return_logprobs=(
                     getattr(args, "logprobs", False) or args.top_logprobs > 0
                 ),
+                mtp_adaptive_fallback_min_drafted_tokens=getattr(
+                    self.cli_args,
+                    "mtp_adaptive_fallback_min_drafted_tokens",
+                    DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
+                ),
+                mtp_adaptive_fallback_min_acceptance_rate=getattr(
+                    self.cli_args,
+                    "mtp_adaptive_fallback_min_acceptance_rate",
+                    DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE,
+                ),
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
@@ -3352,7 +3364,13 @@ class ResponseGenerator:
                     "mtp_prefill_logits_skipped=%s draft_logsumexp_skipped=%s "
                     "target_greedy_verify_batches=%s "
                     "target_greedy_verify_tokens=%s "
-                    "target_logsumexp_skipped=%s return_logprobs=%s",
+                    "target_logsumexp_skipped=%s return_logprobs=%s "
+                    "adaptive_fallback=%s "
+                    "adaptive_fallback_at_emitted_tokens=%s "
+                    "adaptive_fallback_acceptance_rate=%s "
+                    "adaptive_fallback_target_forwards=%s "
+                    "adaptive_fallback_mtp_cache_forwards=%s "
+                    "adaptive_fallback_mtp_logits_skipped=%s",
                     mtp_speculative_stats.get("rounds", 0),
                     mtp_speculative_stats.get("drafted_tokens", 0),
                     mtp_speculative_stats.get("accepted_tokens", 0),
@@ -3380,6 +3398,24 @@ class ResponseGenerator:
                     mtp_speculative_stats.get("target_greedy_verify_tokens", 0),
                     mtp_speculative_stats.get("target_logsumexp_skipped", 0),
                     mtp_speculative_stats.get("return_logprobs", True),
+                    mtp_speculative_stats.get("adaptive_fallback", False),
+                    mtp_speculative_stats.get(
+                        "adaptive_fallback_at_emitted_tokens"
+                    ),
+                    _format_float_or_none(
+                        mtp_speculative_stats.get(
+                            "adaptive_fallback_acceptance_rate"
+                        )
+                    ),
+                    mtp_speculative_stats.get(
+                        "adaptive_fallback_target_forwards", 0
+                    ),
+                    mtp_speculative_stats.get(
+                        "adaptive_fallback_mtp_cache_forwards", 0
+                    ),
+                    mtp_speculative_stats.get(
+                        "adaptive_fallback_mtp_logits_skipped", 0
+                    ),
                 )
             decode_profile_after = _glm_dsa_decode_profile_snapshot()
             decode_profile_fields = _glm_dsa_decode_profile_fields(
@@ -5351,6 +5387,22 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--mtp-adaptive-fallback-min-drafted-tokens",
+        type=int,
+        default=DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
+        help=(
+            "Fall back to regular target decode after this many MTP draft "
+            "tokens when acceptance is below the configured minimum. Use 0 "
+            "to disable adaptive fallback."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-adaptive-fallback-min-acceptance-rate",
+        type=float,
+        default=DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE,
+        help="Minimum MTP acceptance rate before adaptive fallback.",
     )
     parser.add_argument(
         "--trust-remote-code",

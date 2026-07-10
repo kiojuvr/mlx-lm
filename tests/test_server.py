@@ -1637,6 +1637,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.quantized_kv_start, 0)
         self.assertFalse(args.disable_batching)
         self.assertFalse(args.mtp_speculative)
+        self.assertEqual(args.mtp_adaptive_fallback_min_drafted_tokens, 16)
+        self.assertEqual(args.mtp_adaptive_fallback_min_acceptance_rate, 0.20)
         self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
         self.assertEqual(args.glm_dsa_adaptive_prefill_step_size, 0)
         self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 0)
@@ -1717,9 +1719,19 @@ class TestServerCLI(unittest.TestCase):
         self.assertTrue(args.disable_batching)
 
     def test_setup_arg_parser_mtp_speculative(self):
-        args = setup_arg_parser().parse_args(["--mtp-speculative"])
+        args = setup_arg_parser().parse_args(
+            [
+                "--mtp-speculative",
+                "--mtp-adaptive-fallback-min-drafted-tokens",
+                "24",
+                "--mtp-adaptive-fallback-min-acceptance-rate",
+                "0.3",
+            ]
+        )
 
         self.assertTrue(args.mtp_speculative)
+        self.assertEqual(args.mtp_adaptive_fallback_min_drafted_tokens, 24)
+        self.assertEqual(args.mtp_adaptive_fallback_min_acceptance_rate, 0.3)
 
     def test_setup_arg_parser_prefill_max_qk_tokens(self):
         args = setup_arg_parser().parse_args(["--prefill-max-qk-tokens", "0"])
@@ -2243,6 +2255,12 @@ class TestServerCLI(unittest.TestCase):
         self.assertIs(captured["prompt_cache"], mtp_cache)
         self.assertTrue(captured["mtp_speculative"])
         self.assertFalse(captured["mtp_return_logprobs"])
+        self.assertEqual(
+            captured["mtp_adaptive_fallback_min_drafted_tokens"], 16
+        )
+        self.assertEqual(
+            captured["mtp_adaptive_fallback_min_acceptance_rate"], 0.20
+        )
         self.assertEqual(captured["prompt_checkpoint_full_prompt"], prompt)
         self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 3)
         self.assertEqual(

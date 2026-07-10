@@ -65,6 +65,8 @@ PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN_ENV = (
 )
 PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN = 16
 DEFAULT_PREFILL_MAX_QK_TOKENS = 67_108_864
+DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS = 16
+DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE = 0.20
 
 
 def _prompt_checkpoint_debug(message):
@@ -566,6 +568,22 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--mtp-adaptive-fallback-min-drafted-tokens",
+        type=int,
+        default=DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
+        help=(
+            "Fall back to regular target decode after this many MTP draft "
+            "tokens when acceptance is below the configured minimum. Use 0 "
+            "to disable adaptive fallback."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-adaptive-fallback-min-acceptance-rate",
+        type=float,
+        default=DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE,
+        help="Minimum MTP acceptance rate before adaptive fallback.",
     )
     return parser
 
@@ -1649,6 +1667,12 @@ def mtp_speculative_generate_step(
     prompt_history: Optional[mx.array] = None,
     mtp_sampler_is_greedy: Optional[bool] = None,
     mtp_return_logprobs: bool = True,
+    mtp_adaptive_fallback_min_drafted_tokens: int = (
+        DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS
+    ),
+    mtp_adaptive_fallback_min_acceptance_rate: float = (
+        DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE
+    ),
 ) -> Generator[Tuple[mx.array, Optional[mx.array], bool], None, None]:
     """
     Generate with a model's built-in GLM DSA MTP layer.
@@ -1705,6 +1729,14 @@ def mtp_speculative_generate_step(
         raise ValueError("MTP speculative decoding requires a non-empty prompt.")
     if num_draft_tokens <= 0:
         raise ValueError("--num-draft-tokens must be positive.")
+    if mtp_adaptive_fallback_min_drafted_tokens < 0:
+        raise ValueError(
+            "mtp_adaptive_fallback_min_drafted_tokens must be non-negative."
+        )
+    if not 0.0 <= mtp_adaptive_fallback_min_acceptance_rate <= 1.0:
+        raise ValueError(
+            "mtp_adaptive_fallback_min_acceptance_rate must be between 0 and 1."
+        )
     if prompt_history is not None:
         if prompt_history.size < prompt.size:
             raise ValueError("prompt_history cannot be shorter than prompt.")
@@ -1782,6 +1814,18 @@ def mtp_speculative_generate_step(
             "target_greedy_verify_tokens": 0,
             "target_logsumexp_skipped": 0,
             "return_logprobs": not skip_target_logprobs,
+            "adaptive_fallback_min_drafted_tokens": int(
+                mtp_adaptive_fallback_min_drafted_tokens
+            ),
+            "adaptive_fallback_min_acceptance_rate": float(
+                mtp_adaptive_fallback_min_acceptance_rate
+            ),
+            "adaptive_fallback": False,
+            "adaptive_fallback_at_emitted_tokens": None,
+            "adaptive_fallback_acceptance_rate": None,
+            "adaptive_fallback_target_forwards": 0,
+            "adaptive_fallback_mtp_cache_forwards": 0,
+            "adaptive_fallback_mtp_logits_skipped": 0,
         }
     )
 
@@ -1908,6 +1952,11 @@ def mtp_speculative_generate_step(
 
     emitted = 0
     unbounded = max_tokens < 0
+    adaptive_fallback = False
+    adaptive_fallback_enabled = (
+        mtp_adaptive_fallback_min_drafted_tokens > 0
+        and mtp_adaptive_fallback_min_acceptance_rate > 0.0
+    )
 
     def _can_emit():
         return unbounded or emitted < max_tokens
@@ -1924,10 +1973,49 @@ def mtp_speculative_generate_step(
     yield current.item(), logprobs, False
 
     while _can_emit():
+        if (
+            adaptive_fallback_enabled
+            and not adaptive_fallback
+            and stats["drafted_tokens"]
+            >= mtp_adaptive_fallback_min_drafted_tokens
+        ):
+            acceptance_rate = (
+                stats["accepted_tokens"] / stats["drafted_tokens"]
+            )
+            if acceptance_rate < mtp_adaptive_fallback_min_acceptance_rate:
+                adaptive_fallback = True
+                stats["adaptive_fallback"] = True
+                stats["adaptive_fallback_at_emitted_tokens"] = emitted
+                stats["adaptive_fallback_acceptance_rate"] = acceptance_rate
         remaining = num_draft_tokens + 1 if unbounded else max_tokens - emitted
-        num_draft = min(num_draft_tokens, max(remaining - 1, 0))
+        num_draft = (
+            0
+            if adaptive_fallback
+            else min(num_draft_tokens, max(remaining - 1, 0))
+        )
         if num_draft == 0:
             with mx.stream(generation_stream):
+                fallback_mtp_logits = None
+                fallback_mtp_hidden = None
+                if adaptive_fallback:
+                    if callable(getattr(model, "mtp_prefill", None)):
+                        fallback_mtp_hidden, _topk = model.mtp_prefill(
+                            current[None],
+                            previous_hidden,
+                            cache=mtp_cache_holder[0],
+                        )
+                        stats["adaptive_fallback_mtp_logits_skipped"] += 1
+                    else:
+                        (
+                            fallback_mtp_logits,
+                            fallback_mtp_hidden,
+                            _topk,
+                        ) = model.mtp_logits(
+                            current[None],
+                            previous_hidden,
+                            cache=mtp_cache_holder[0],
+                        )
+                    _quantize_runtime_cache(mtp_cache_holder)
                 logits, hidden = model.forward_with_hidden(
                     current[None],
                     cache=target_cache,
@@ -1942,6 +2030,11 @@ def mtp_speculative_generate_step(
                     stats["target_logsumexp_skipped"] += 1
                 next_hidden = hidden[:, -1:, :]
                 _eval_target(logits, hidden)
+                if fallback_mtp_hidden is not None:
+                    if fallback_mtp_logits is None:
+                        _eval_mtp_prefill(fallback_mtp_hidden)
+                    else:
+                        _eval_mtp(fallback_mtp_logits, fallback_mtp_hidden)
                 mx.async_eval(
                     *(
                         (next_token, next_hidden)
@@ -1951,6 +2044,9 @@ def mtp_speculative_generate_step(
                 )
             stats["target_forwards"] += 1
             stats["target_input_tokens"] += 1
+            if adaptive_fallback:
+                stats["adaptive_fallback_target_forwards"] += 1
+                stats["adaptive_fallback_mtp_cache_forwards"] += 1
             mx.eval(next_token)
             current = next_token
             previous_hidden = next_hidden
@@ -2358,6 +2454,8 @@ def stream_generate(
         kwargs.pop("mtp_speculative_stats", None)
         kwargs.pop("mtp_sampler_is_greedy", None)
         kwargs.pop("mtp_return_logprobs", None)
+        kwargs.pop("mtp_adaptive_fallback_min_drafted_tokens", None)
+        kwargs.pop("mtp_adaptive_fallback_min_acceptance_rate", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -2397,6 +2495,8 @@ def stream_generate(
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         kwargs.pop("mtp_speculative_stats", None)
+        kwargs.pop("mtp_adaptive_fallback_min_drafted_tokens", None)
+        kwargs.pop("mtp_adaptive_fallback_min_acceptance_rate", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
@@ -4062,6 +4162,12 @@ def main():
         draft_model=draft_model,
         mtp_speculative=args.mtp_speculative,
         num_draft_tokens=args.num_draft_tokens,
+        mtp_adaptive_fallback_min_drafted_tokens=(
+            args.mtp_adaptive_fallback_min_drafted_tokens
+        ),
+        mtp_adaptive_fallback_min_acceptance_rate=(
+            args.mtp_adaptive_fallback_min_acceptance_rate
+        ),
     )
     if not args.verbose:
         print(response)

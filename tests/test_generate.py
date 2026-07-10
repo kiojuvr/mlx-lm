@@ -210,6 +210,102 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertFalse(stats["return_logprobs"])
         self.assertEqual(stats["target_logsumexp_skipped"], 4)
 
+    def test_mtp_speculative_falls_back_after_low_acceptance(self):
+        class DummyCache:
+            def __init__(self):
+                self.offset = 0
+
+            @property
+            def state(self):
+                return mx.array([self.offset])
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.offset = max(0, self.offset - n)
+                return n
+
+        class DummyModel:
+            def __init__(self):
+                self.mtp = object()
+                self.layers = [object()]
+                self.target_cache = [DummyCache()]
+                self.mtp_cache = DummyCache()
+                self.mtp_calls = 0
+                self.mtp_prefill_calls = 0
+
+            def make_mtp_cache(self):
+                return self.mtp_cache
+
+            def _logits(self, tokens):
+                rows = []
+                for token in tokens:
+                    logits = mx.where(
+                        mx.arange(32) == token,
+                        mx.array(1.0),
+                        mx.array(0.0),
+                    )
+                    rows.append(logits.reshape(1, 1, 32))
+                return mx.concatenate(rows, axis=1)
+
+            def forward_with_hidden(self, inputs, cache=None):
+                flat = [int(token) for token in inputs.reshape(-1).tolist()]
+                for target_cache in cache or []:
+                    target_cache.offset += len(flat)
+                outputs = [min(token + 1, 31) for token in flat]
+                hidden = mx.ones((1, len(flat), 4))
+                return self._logits(outputs), hidden
+
+            def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+                self.mtp_calls += 1
+                length = inputs.shape[1]
+                cache.offset += length
+                hidden = mx.ones((1, length, 4))
+                return self._logits([31] * length), hidden, None
+
+            def mtp_prefill(self, inputs, previous_hidden_states, cache=None):
+                self.mtp_prefill_calls += 1
+                cache.offset += inputs.shape[1]
+                return mx.ones((1, inputs.shape[1], 4)), None
+
+        model = DummyModel()
+        stats = {}
+        old_make_cache = generate_module.cache.make_prompt_cache
+        generate_module.cache.make_prompt_cache = lambda _model: model.target_cache
+        try:
+            rows = list(
+                mtp_speculative_generate_step(
+                    mx.array([1]),
+                    model,
+                    max_tokens=5,
+                    num_draft_tokens=2,
+                    mtp_speculative_stats=stats,
+                    mtp_adaptive_fallback_min_drafted_tokens=2,
+                    mtp_adaptive_fallback_min_acceptance_rate=0.5,
+                )
+            )
+        finally:
+            generate_module.cache.make_prompt_cache = old_make_cache
+
+        self.assertEqual(
+            [int(token) for token, _logprobs, _draft in rows],
+            [2, 3, 4, 5, 6],
+        )
+        self.assertEqual(model.mtp_calls, 2)
+        self.assertEqual(model.mtp_prefill_calls, 4)
+        self.assertTrue(stats["adaptive_fallback"])
+        self.assertEqual(stats["adaptive_fallback_at_emitted_tokens"], 2)
+        self.assertEqual(stats["adaptive_fallback_acceptance_rate"], 0.0)
+        self.assertEqual(stats["adaptive_fallback_target_forwards"], 3)
+        self.assertEqual(stats["adaptive_fallback_mtp_cache_forwards"], 3)
+        self.assertEqual(stats["adaptive_fallback_mtp_logits_skipped"], 3)
+        self.assertEqual(stats["rounds"], 1)
+        self.assertEqual(stats["drafted_tokens"], 2)
+        self.assertEqual(stats["accepted_tokens"], 0)
+        self.assertEqual(model.target_cache[0].offset, 5)
+        self.assertEqual(model.mtp_cache.offset, 5)
+
     def test_mtp_speculative_generate_step_uses_combined_prompt_cache(self):
         class DummyCache:
             def __init__(self, offset=0):

@@ -313,6 +313,16 @@ also batches draft-token comparison; `target_greedy_verify_batches` and
 ask for `logprobs` or `top_logprobs`, greedy MTP generation also skips target
 full-vocabulary normalization. `target_logsumexp_skipped` counts those emitted
 positions and `return_logprobs=false` confirms the practical server path.
+After 16 drafted tokens, the default adaptive guard falls back to regular
+one-token target decode when observed MTP acceptance remains below `0.20`. This
+fallback reuses the already-verified target cache and requires no re-prefill.
+It keeps the MTP cache aligned with a hidden/cache-only pass that skips the
+full-vocabulary projection, so the combined RAM cache remains reusable by the
+next tool turn while draft proposal and multi-token target verification stop.
+The completion log reports `adaptive_fallback`, the emitted-token position and
+acceptance rate at the transition, and subsequent target/cache forward counts.
+Set `--mtp-adaptive-fallback-min-drafted-tokens 0` to disable the guard while
+profiling raw MTP behavior.
 
 `--checkpoint-async-save-backlog-limit 2` bounds queued post-response continued
 and delta checkpoint saves. These saves can hold large prompt-cache snapshots in

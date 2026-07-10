@@ -314,6 +314,12 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "target_greedy_verify_tokens": 3,
                     "target_logsumexp_skipped": 2,
                     "return_logprobs": False,
+                    "adaptive_fallback": False,
+                    "adaptive_fallback_at_emitted_tokens": None,
+                    "adaptive_fallback_acceptance_rate": None,
+                    "adaptive_fallback_target_forwards": 0,
+                    "adaptive_fallback_mtp_cache_forwards": 0,
+                    "adaptive_fallback_mtp_logits_skipped": 0,
                 }
             )
             yield Namespace(
@@ -375,6 +381,12 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertTrue(calls[0]["mtp_speculative"])
         self.assertEqual(calls[0]["num_draft_tokens"], 2)
         self.assertFalse(calls[0]["mtp_return_logprobs"])
+        self.assertEqual(
+            calls[0]["mtp_adaptive_fallback_min_drafted_tokens"], 16
+        )
+        self.assertEqual(
+            calls[0]["mtp_adaptive_fallback_min_acceptance_rate"], 0.20
+        )
         self.assertFalse(calls[0]["prompt_checkpoint"])
         self.assertEqual(row["mtp_draft_tokens"], 2)
         self.assertEqual(row["mtp_speculative_rounds"], 1)
@@ -393,6 +405,13 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["mtp_speculative_target_greedy_verify_tokens"], 3)
         self.assertEqual(row["mtp_speculative_target_logsumexp_skipped"], 2)
         self.assertFalse(row["mtp_speculative_return_logprobs"])
+        self.assertFalse(row["mtp_speculative_adaptive_fallback"])
+        self.assertEqual(
+            row["mtp_speculative_adaptive_fallback_target_forwards"], 0
+        )
+        self.assertEqual(
+            row["mtp_speculative_adaptive_fallback_mtp_cache_forwards"], 0
+        )
 
     def test_decode_context_mtp_candidate_rows_restore_args(self):
         args = Namespace(

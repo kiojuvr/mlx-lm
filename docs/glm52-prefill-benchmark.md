@@ -166,6 +166,14 @@ benchmark mirrors the normal OpenCode request and does not request token
 log-probabilities, so greedy MTP rows also report
 `mtp_speculative_target_logsumexp_skipped` and
 `mtp_speculative_return_logprobs=false`.
+Production MTP also defaults to an adaptive low-acceptance guard: after 16 draft
+tokens, acceptance below `0.20` switches the rest of that request to regular
+one-token target decode without rebuilding the target cache. A vocabulary-head-
+free MTP cache update keeps the combined cache reusable for the next request.
+Benchmark rows expose
+`mtp_speculative_adaptive_fallback*`; set
+`--mtp-adaptive-fallback-min-drafted-tokens 0` for an unguarded draft-depth
+sweep.
 
 To sweep baseline and multiple MTP draft depths in one run, use
 `--decode-context-mtp-draft-token-candidates`. Candidate `0` is the non-MTP

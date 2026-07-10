@@ -1696,6 +1696,12 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             num_draft_tokens=getattr(args, "mtp_draft_tokens", 2),
             mtp_speculative_stats=mtp_speculative_stats,
             mtp_return_logprobs=False,
+            mtp_adaptive_fallback_min_drafted_tokens=getattr(
+                args, "mtp_adaptive_fallback_min_drafted_tokens", 16
+            ),
+            mtp_adaptive_fallback_min_acceptance_rate=getattr(
+                args, "mtp_adaptive_fallback_min_acceptance_rate", 0.20
+            ),
             prompt_checkpoint=checkpoint_enabled,
             prompt_checkpoint_store_prefix_lengths=(
                 getattr(args, "checkpoint_store_prefix_lengths", None)
@@ -1817,6 +1823,24 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             ),
             "mtp_speculative_return_logprobs": mtp_speculative_stats.get(
                 "return_logprobs"
+            ),
+            "mtp_speculative_adaptive_fallback": mtp_speculative_stats.get(
+                "adaptive_fallback"
+            ),
+            "mtp_speculative_adaptive_fallback_at_emitted_tokens": (
+                mtp_speculative_stats.get("adaptive_fallback_at_emitted_tokens")
+            ),
+            "mtp_speculative_adaptive_fallback_acceptance_rate": (
+                mtp_speculative_stats.get("adaptive_fallback_acceptance_rate")
+            ),
+            "mtp_speculative_adaptive_fallback_target_forwards": (
+                mtp_speculative_stats.get("adaptive_fallback_target_forwards")
+            ),
+            "mtp_speculative_adaptive_fallback_mtp_cache_forwards": (
+                mtp_speculative_stats.get("adaptive_fallback_mtp_cache_forwards")
+            ),
+            "mtp_speculative_adaptive_fallback_mtp_logits_skipped": (
+                mtp_speculative_stats.get("adaptive_fallback_mtp_logits_skipped")
             ),
         }
 
@@ -2674,6 +2698,12 @@ def print_table(rows, output_format):
         "mtp_speculative_target_greedy_verify_tokens",
         "mtp_speculative_target_logsumexp_skipped",
         "mtp_speculative_return_logprobs",
+        "mtp_speculative_adaptive_fallback",
+        "mtp_speculative_adaptive_fallback_at_emitted_tokens",
+        "mtp_speculative_adaptive_fallback_acceptance_rate",
+        "mtp_speculative_adaptive_fallback_target_forwards",
+        "mtp_speculative_adaptive_fallback_mtp_cache_forwards",
+        "mtp_speculative_adaptive_fallback_mtp_logits_skipped",
         "mtp_speculative_target_seconds",
         "mtp_speculative_draft_seconds",
         "checkpoint_resolution",
@@ -3482,6 +3512,21 @@ def main():
             "Number of MTP draft tokens per target verification round in "
             "--mode mtp-speculative."
         ),
+    )
+    parser.add_argument(
+        "--mtp-adaptive-fallback-min-drafted-tokens",
+        type=int,
+        default=16,
+        help=(
+            "Fall back to target-only decode after this many low-acceptance "
+            "MTP draft tokens. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-adaptive-fallback-min-acceptance-rate",
+        type=float,
+        default=0.20,
+        help="Minimum observed MTP acceptance rate before adaptive fallback.",
     )
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument(
