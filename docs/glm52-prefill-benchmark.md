@@ -161,7 +161,11 @@ full-prompt vocabulary projections.
 For greedy runs, `mtp_speculative_draft_logsumexp_skipped` counts MTP proposals
 that skipped an unnecessary full-vocabulary normalization.
 `mtp_speculative_target_greedy_verify_*` reports batched target verification
-when no history-dependent logits processors are active.
+when no history-dependent logits processors are active. The decode-context
+benchmark mirrors the normal OpenCode request and does not request token
+log-probabilities, so greedy MTP rows also report
+`mtp_speculative_target_logsumexp_skipped` and
+`mtp_speculative_return_logprobs=false`.
 
 To sweep baseline and multiple MTP draft depths in one run, use
 `--decode-context-mtp-draft-token-candidates`. Candidate `0` is the non-MTP

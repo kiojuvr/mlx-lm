@@ -3200,6 +3200,9 @@ class ResponseGenerator:
                 mtp_speculative=mtp_speculative,
                 mtp_speculative_stats=mtp_speculative_stats,
                 mtp_sampler_is_greedy=(args.sampling.temperature == 0),
+                mtp_return_logprobs=(
+                    getattr(args, "logprobs", False) or args.top_logprobs > 0
+                ),
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
@@ -3237,17 +3240,27 @@ class ResponseGenerator:
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
                 if match_sequence is not None and current_state is None:
                     finish_reason = "stop"
+                token_logprob = (
+                    gen.logprobs[gen.token].item()
+                    if gen.logprobs is not None
+                    else 0.0
+                )
+                top_logprobs = (
+                    _format_top_logprobs(
+                        gen.logprobs, args.top_logprobs, tokenizer
+                    )
+                    if gen.logprobs is not None and args.top_logprobs > 0
+                    else ()
+                )
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
                         current_state,
                         match_sequence,
-                        gen.logprobs[gen.token].item(),
+                        token_logprob,
                         finish_reason,
-                        _format_top_logprobs(
-                            gen.logprobs, args.top_logprobs, tokenizer
-                        ),
+                        top_logprobs,
                     )
                 )
                 cache_key.append(gen.token)
@@ -3338,7 +3351,8 @@ class ResponseGenerator:
                     "target_prefill_logits_skipped=%s mtp_prefill_tokens=%s "
                     "mtp_prefill_logits_skipped=%s draft_logsumexp_skipped=%s "
                     "target_greedy_verify_batches=%s "
-                    "target_greedy_verify_tokens=%s",
+                    "target_greedy_verify_tokens=%s "
+                    "target_logsumexp_skipped=%s return_logprobs=%s",
                     mtp_speculative_stats.get("rounds", 0),
                     mtp_speculative_stats.get("drafted_tokens", 0),
                     mtp_speculative_stats.get("accepted_tokens", 0),
@@ -3364,6 +3378,8 @@ class ResponseGenerator:
                     mtp_speculative_stats.get("draft_logsumexp_skipped", 0),
                     mtp_speculative_stats.get("target_greedy_verify_batches", 0),
                     mtp_speculative_stats.get("target_greedy_verify_tokens", 0),
+                    mtp_speculative_stats.get("target_logsumexp_skipped", 0),
+                    mtp_speculative_stats.get("return_logprobs", True),
                 )
             decode_profile_after = _glm_dsa_decode_profile_snapshot()
             decode_profile_fields = _glm_dsa_decode_profile_fields(

@@ -2242,6 +2242,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(captured["prompt"], rest)
         self.assertIs(captured["prompt_cache"], mtp_cache)
         self.assertTrue(captured["mtp_speculative"])
+        self.assertFalse(captured["mtp_return_logprobs"])
         self.assertEqual(captured["prompt_checkpoint_full_prompt"], prompt)
         self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 3)
         self.assertEqual(

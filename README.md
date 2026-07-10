@@ -309,7 +309,10 @@ prefill paths are active. Greedy requests also report
 `draft_logsumexp_skipped`, avoiding normalization work for MTP proposal logits
 that are never returned. Without logits processors, greedy target verification
 also batches draft-token comparison; `target_greedy_verify_batches` and
-`target_greedy_verify_tokens` report that path.
+`target_greedy_verify_tokens` report that path. When the OpenAI request does not
+ask for `logprobs` or `top_logprobs`, greedy MTP generation also skips target
+full-vocabulary normalization. `target_logsumexp_skipped` counts those emitted
+positions and `return_logprobs=false` confirms the practical server path.
 
 `--checkpoint-async-save-backlog-limit 2` bounds queued post-response continued
 and delta checkpoint saves. These saves can hold large prompt-cache snapshots in

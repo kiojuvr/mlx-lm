@@ -312,6 +312,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "draft_logsumexp_skipped": 2,
                     "target_greedy_verify_batches": 1,
                     "target_greedy_verify_tokens": 3,
+                    "target_logsumexp_skipped": 2,
+                    "return_logprobs": False,
                 }
             )
             yield Namespace(
@@ -372,6 +374,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertFalse(row["decode_context_use_checkpoints"])
         self.assertTrue(calls[0]["mtp_speculative"])
         self.assertEqual(calls[0]["num_draft_tokens"], 2)
+        self.assertFalse(calls[0]["mtp_return_logprobs"])
         self.assertFalse(calls[0]["prompt_checkpoint"])
         self.assertEqual(row["mtp_draft_tokens"], 2)
         self.assertEqual(row["mtp_speculative_rounds"], 1)
@@ -388,6 +391,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["mtp_speculative_draft_logsumexp_skipped"], 2)
         self.assertEqual(row["mtp_speculative_target_greedy_verify_batches"], 1)
         self.assertEqual(row["mtp_speculative_target_greedy_verify_tokens"], 3)
+        self.assertEqual(row["mtp_speculative_target_logsumexp_skipped"], 2)
+        self.assertFalse(row["mtp_speculative_return_logprobs"])
 
     def test_decode_context_mtp_candidate_rows_restore_args(self):
         args = Namespace(

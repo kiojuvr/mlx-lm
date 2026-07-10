@@ -134,12 +134,81 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(stats["target_input_tokens"], 6)
         self.assertEqual(stats["target_greedy_verify_batches"], 2)
         self.assertEqual(stats["target_greedy_verify_tokens"], 6)
+        self.assertEqual(stats["target_logsumexp_skipped"], 0)
+        self.assertTrue(stats["return_logprobs"])
         self.assertEqual(stats["target_tokens"], 3)
         self.assertEqual(stats["emitted_tokens"], 5)
         self.assertEqual(stats["catchup_forwards"], 1)
         self.assertAlmostEqual(stats["acceptance_rate"], 0.5)
         self.assertAlmostEqual(stats["mean_accepted"], 1.0)
         self.assertAlmostEqual(stats["emitted_per_target_forward"], 2.5)
+
+    def test_mtp_speculative_skips_unrequested_greedy_target_logprobs(self):
+        class DummyCache:
+            def __init__(self):
+                self.offset = 0
+
+            @property
+            def state(self):
+                return mx.array([self.offset])
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.offset = max(0, self.offset - n)
+                return n
+
+        class DummyModel:
+            def __init__(self):
+                self.mtp = object()
+                self.layers = [object()]
+                self.target_cache = [DummyCache()]
+                self.mtp_cache = DummyCache()
+
+            def make_mtp_cache(self):
+                return self.mtp_cache
+
+            def _logits(self, token, length):
+                logits = mx.where(
+                    mx.arange(32) == token,
+                    mx.array(1.0),
+                    mx.array(0.0),
+                )
+                return mx.broadcast_to(logits.reshape(1, 1, 32), (1, length, 32))
+
+            def forward_with_hidden(self, inputs, cache=None):
+                length = inputs.shape[1]
+                logits = self._logits(5, length)
+                hidden = mx.ones((1, length, 4))
+                return logits, hidden
+
+            def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+                length = inputs.shape[1]
+                return self._logits(5, length), mx.ones((1, length, 4)), None
+
+        model = DummyModel()
+        stats = {}
+        old_make_cache = generate_module.cache.make_prompt_cache
+        generate_module.cache.make_prompt_cache = lambda _model: model.target_cache
+        try:
+            rows = list(
+                mtp_speculative_generate_step(
+                    mx.array([1, 2, 3]),
+                    model,
+                    max_tokens=4,
+                    num_draft_tokens=2,
+                    mtp_speculative_stats=stats,
+                    mtp_return_logprobs=False,
+                )
+            )
+        finally:
+            generate_module.cache.make_prompt_cache = old_make_cache
+
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(logprobs is None for _token, logprobs, _draft in rows))
+        self.assertFalse(stats["return_logprobs"])
+        self.assertEqual(stats["target_logsumexp_skipped"], 4)
 
     def test_mtp_speculative_generate_step_uses_combined_prompt_cache(self):
         class DummyCache:

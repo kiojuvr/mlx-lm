@@ -1695,6 +1695,7 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             mtp_speculative=mtp_speculative,
             num_draft_tokens=getattr(args, "mtp_draft_tokens", 2),
             mtp_speculative_stats=mtp_speculative_stats,
+            mtp_return_logprobs=False,
             prompt_checkpoint=checkpoint_enabled,
             prompt_checkpoint_store_prefix_lengths=(
                 getattr(args, "checkpoint_store_prefix_lengths", None)
@@ -1810,6 +1811,12 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             ),
             "mtp_speculative_target_greedy_verify_tokens": (
                 mtp_speculative_stats.get("target_greedy_verify_tokens")
+            ),
+            "mtp_speculative_target_logsumexp_skipped": (
+                mtp_speculative_stats.get("target_logsumexp_skipped")
+            ),
+            "mtp_speculative_return_logprobs": mtp_speculative_stats.get(
+                "return_logprobs"
             ),
         }
 
@@ -2658,6 +2665,15 @@ def print_table(rows, output_format):
         "mtp_speculative_emitted_tokens",
         "mtp_speculative_emitted_per_target_forward",
         "mtp_speculative_catchup_forwards",
+        "mtp_speculative_target_prefill_tokens",
+        "mtp_speculative_target_prefill_logits_skipped",
+        "mtp_speculative_prefill_tokens",
+        "mtp_speculative_prefill_logits_skipped",
+        "mtp_speculative_draft_logsumexp_skipped",
+        "mtp_speculative_target_greedy_verify_batches",
+        "mtp_speculative_target_greedy_verify_tokens",
+        "mtp_speculative_target_logsumexp_skipped",
+        "mtp_speculative_return_logprobs",
         "mtp_speculative_target_seconds",
         "mtp_speculative_draft_seconds",
         "checkpoint_resolution",
