@@ -150,6 +150,26 @@ baseline decode-context row before interpreting decode TPS. The MTP row reports
 `emitted_per_target_forward`. If acceptance is low, the extra MTP draft work can
 make wall-clock decode slower even when target forwards are reduced.
 
+To sweep baseline and multiple MTP draft depths in one run, use
+`--decode-context-mtp-draft-token-candidates`. Candidate `0` is the non-MTP
+baseline; positive values enable MTP with that many draft tokens:
+
+```bash
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --mode decode-context \
+  --lengths 8192 \
+  --max-tokens 64 \
+  --prefill-step-size 8192 \
+  --prefill-max-qk-tokens 67108864 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 0 \
+  --decode-context-mtp-draft-token-candidates 0,1,2,4 \
+  --output-format csv \
+  --json-output glm52-decode-context-mtp-sweep-8k.json
+```
+
 Two exact low-risk decode variants were tested and not adopted:
 
 - Reusing the existing selected sparse attention helper for `L == 1` decode

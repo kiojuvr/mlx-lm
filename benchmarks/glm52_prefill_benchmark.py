@@ -69,6 +69,13 @@ def parse_lengths(value):
     return [int(v.strip()) for v in value.split(",") if v.strip()]
 
 
+def decode_context_mtp_candidate_values(args):
+    candidates = getattr(args, "decode_context_mtp_draft_token_candidates", None)
+    if candidates is None:
+        return None
+    return list(candidates)
+
+
 def parse_policy_candidates(value):
     candidates = []
     for raw in value.split(","):
@@ -1818,6 +1825,12 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             generated_tokens / request_seconds if request_seconds > 0 else None
         ),
         "decode_context_mtp_speculative": mtp_speculative,
+        "decode_context_mtp_candidate_index": getattr(
+            args, "decode_context_mtp_candidate_index", None
+        ),
+        "decode_context_mtp_draft_tokens_candidate": getattr(
+            args, "decode_context_mtp_draft_tokens_candidate", None
+        ),
         "peak_memory_gb": response.peak_memory,
         "progress_events": None,
         "finish_reason": response.finish_reason,
@@ -2586,6 +2599,8 @@ def print_table(rows, output_format):
         "request_tps",
         "decode_context_use_checkpoints",
         "decode_context_mtp_speculative",
+        "decode_context_mtp_candidate_index",
+        "decode_context_mtp_draft_tokens_candidate",
         "kv_bits",
         "kv_group_size",
         "quantized_kv_start",
@@ -3207,6 +3222,55 @@ def run_prefill_sweep(model, tokenizer, args):
         args.checkpoint_save_exact = old_checkpoint_save_exact
 
 
+def append_decode_context_mtp_candidate_rows(
+    rows,
+    runner,
+    model,
+    tokenizer,
+    text,
+    args,
+    case_name,
+):
+    candidates = decode_context_mtp_candidate_values(args)
+    if args.mode != "decode-context" or candidates is None:
+        return False
+
+    old_mtp_speculative = args.decode_context_mtp_speculative
+    old_mtp_draft_tokens = args.mtp_draft_tokens
+    old_candidate_index = getattr(args, "decode_context_mtp_candidate_index", None)
+    old_candidate_value = getattr(
+        args,
+        "decode_context_mtp_draft_tokens_candidate",
+        None,
+    )
+    try:
+        for candidate_index, draft_tokens in enumerate(candidates):
+            args.decode_context_mtp_candidate_index = candidate_index
+            args.decode_context_mtp_draft_tokens_candidate = draft_tokens
+            args.decode_context_mtp_speculative = draft_tokens > 0
+            if draft_tokens > 0:
+                args.mtp_draft_tokens = draft_tokens
+            candidate_name = (
+                "baseline" if draft_tokens == 0 else f"mtp-draft-{draft_tokens}"
+            )
+            for run in range(args.repeat_runs):
+                rows.append(
+                    runner(
+                        model,
+                        tokenizer,
+                        text,
+                        args,
+                        f"{case_name}-{candidate_name}-run-{run + 1}",
+                    )
+                )
+        return True
+    finally:
+        args.decode_context_mtp_speculative = old_mtp_speculative
+        args.mtp_draft_tokens = old_mtp_draft_tokens
+        args.decode_context_mtp_candidate_index = old_candidate_index
+        args.decode_context_mtp_draft_tokens_candidate = old_candidate_value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -3353,6 +3417,15 @@ def main():
             "Use the production stream_generate GLM DSA MTP speculative path "
             "during --mode decode-context. This requires a checkpoint with "
             "native MTP weights and disables decode-context prompt checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--decode-context-mtp-draft-token-candidates",
+        type=parse_lengths,
+        help=(
+            "Comma-separated draft-token candidates for --mode decode-context. "
+            "Use 0 for the non-MTP baseline; positive values run the production "
+            "stream_generate GLM DSA MTP speculative path."
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=1)
@@ -3756,6 +3829,32 @@ def main():
         parser.error("--prefill-stop-after-tokens must be positive when set.")
     if args.mode == "decode-context" and args.max_tokens <= 0:
         parser.error("--max-tokens must be positive in --mode decode-context.")
+    decode_context_mtp_candidates = decode_context_mtp_candidate_values(args)
+    decode_context_mtp_candidate_uses_mtp = (
+        decode_context_mtp_candidates is not None
+        and any(candidate > 0 for candidate in decode_context_mtp_candidates)
+    )
+    if decode_context_mtp_candidates is not None:
+        if args.mode != "decode-context":
+            parser.error(
+                "--decode-context-mtp-draft-token-candidates is only valid with "
+                "--mode decode-context."
+            )
+        if not decode_context_mtp_candidates:
+            parser.error(
+                "--decode-context-mtp-draft-token-candidates must include at "
+                "least one value."
+            )
+        if any(candidate < 0 for candidate in decode_context_mtp_candidates):
+            parser.error(
+                "--decode-context-mtp-draft-token-candidates values must be "
+                "non-negative."
+            )
+        if args.decode_context_use_checkpoints and decode_context_mtp_candidate_uses_mtp:
+            parser.error(
+                "--decode-context-mtp-draft-token-candidates with positive "
+                "values cannot be combined with --decode-context-use-checkpoints."
+            )
     if args.decode_context_mtp_speculative:
         if args.mode != "decode-context":
             parser.error(
@@ -3821,7 +3920,10 @@ def main():
     old_mtp_env = os.environ.get(glm_moe_dsa.GLM_DSA_MTP_ENV)
     if args.mode in ("mtp-acceptance", "mtp-speculative") or (
         args.mode == "decode-context"
-        and getattr(args, "decode_context_mtp_speculative", False)
+        and (
+            getattr(args, "decode_context_mtp_speculative", False)
+            or decode_context_mtp_candidate_uses_mtp
+        )
     ):
         os.environ[glm_moe_dsa.GLM_DSA_MTP_ENV] = "1"
 
@@ -3856,10 +3958,25 @@ def main():
             if args.prompt_file:
                 text = args.prompt_file.read_text()
                 args.target_tokens = None
-                for run in range(args.repeat_runs):
-                    rows.append(
-                        runner(model, tokenizer, text, args, f"file-run-{run + 1}")
-                    )
+                if not append_decode_context_mtp_candidate_rows(
+                    rows,
+                    runner,
+                    model,
+                    tokenizer,
+                    text,
+                    args,
+                    "file",
+                ):
+                    for run in range(args.repeat_runs):
+                        rows.append(
+                            runner(
+                                model,
+                                tokenizer,
+                                text,
+                                args,
+                                f"file-run-{run + 1}",
+                            )
+                        )
             elif args.mode == "queued":
                 for run in range(args.repeat_runs):
                     rows.append(
@@ -3869,16 +3986,25 @@ def main():
                 for length in parse_lengths(args.lengths):
                     args.target_tokens = length
                     text = build_prompt_text(tokenizer, length)
-                    for run in range(args.repeat_runs):
-                        rows.append(
-                            runner(
-                                model,
-                                tokenizer,
-                                text,
-                                args,
-                                f"synthetic-{length}",
+                    if not append_decode_context_mtp_candidate_rows(
+                        rows,
+                        runner,
+                        model,
+                        tokenizer,
+                        text,
+                        args,
+                        f"synthetic-{length}",
+                    ):
+                        for run in range(args.repeat_runs):
+                            rows.append(
+                                runner(
+                                    model,
+                                    tokenizer,
+                                    text,
+                                    args,
+                                    f"synthetic-{length}",
+                                )
                             )
-                        )
 
                 if args.mode == "single" and args.repeat_prefix_tokens > 0:
                     prefix = build_prompt_text(tokenizer, args.repeat_prefix_tokens)

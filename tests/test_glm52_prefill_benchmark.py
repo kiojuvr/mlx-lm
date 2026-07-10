@@ -376,6 +376,55 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             4.0,
         )
 
+    def test_decode_context_mtp_candidate_rows_restore_args(self):
+        args = Namespace(
+            mode="decode-context",
+            repeat_runs=1,
+            decode_context_mtp_draft_token_candidates=[0, 1, 2],
+            decode_context_mtp_speculative=False,
+            mtp_draft_tokens=9,
+        )
+        rows = []
+
+        def fake_runner(_model, _tokenizer, _text, runner_args, case_name):
+            return {
+                "case": case_name,
+                "mtp": runner_args.decode_context_mtp_speculative,
+                "draft_tokens": runner_args.mtp_draft_tokens,
+                "candidate_index": runner_args.decode_context_mtp_candidate_index,
+                "candidate": (
+                    runner_args.decode_context_mtp_draft_tokens_candidate
+                ),
+            }
+
+        handled = benchmark.append_decode_context_mtp_candidate_rows(
+            rows,
+            fake_runner,
+            object(),
+            object(),
+            "prompt",
+            args,
+            "decode",
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [row["case"] for row in rows],
+            [
+                "decode-baseline-run-1",
+                "decode-mtp-draft-1-run-1",
+                "decode-mtp-draft-2-run-1",
+            ],
+        )
+        self.assertEqual([row["mtp"] for row in rows], [False, True, True])
+        self.assertEqual([row["draft_tokens"] for row in rows], [9, 1, 2])
+        self.assertEqual([row["candidate_index"] for row in rows], [0, 1, 2])
+        self.assertEqual([row["candidate"] for row in rows], [0, 1, 2])
+        self.assertFalse(args.decode_context_mtp_speculative)
+        self.assertEqual(args.mtp_draft_tokens, 9)
+        self.assertIsNone(args.decode_context_mtp_candidate_index)
+        self.assertIsNone(args.decode_context_mtp_draft_tokens_candidate)
+
     def test_run_mtp_acceptance_reports_match_rate(self):
         class DummyCache:
             def __init__(self):
