@@ -384,6 +384,7 @@ class TestModels(unittest.TestCase):
         index_topk_pattern="FS",
         kv_lora_rank=64,
         num_hidden_layers=2,
+        num_nextn_predict_layers=0,
     ):
         from mlx_lm.models import glm_moe_dsa
 
@@ -420,6 +421,7 @@ class TestModels(unittest.TestCase):
             rope_parameters={"rope_theta": 10000.0},
             attention_bias=False,
             index_topk_pattern=index_topk_pattern,
+            num_nextn_predict_layers=num_nextn_predict_layers,
         )
         return glm_moe_dsa.Model(args)
 
@@ -1691,7 +1693,13 @@ class TestModels(unittest.TestCase):
             "model.foo.mtp_block.weight": mx.zeros((1,), dtype=mx.float32),
         }
 
-        sanitized = model.sanitize(weights)
+        env_key = glm_moe_dsa.GLM_DSA_MTP_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ.pop(env_key, None)
+            sanitized = model.sanitize(weights)
+        finally:
+            self._restore_env(saved_env)
 
         self.assertEqual(
             list(sanitized),
@@ -1701,6 +1709,64 @@ class TestModels(unittest.TestCase):
                 "model.layers.not_an_int.weight",
             ],
         )
+
+    def test_glm_moe_dsa_sanitize_remaps_mtp_weights_opt_in(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = glm_moe_dsa.Model.__new__(glm_moe_dsa.Model)
+        model.args = type("Args", (), {"num_hidden_layers": 78})()
+        base = mx.ones((1,), dtype=mx.float32)
+        weights = {
+            "model.layers.77.self_attn.q_a_proj.weight": base,
+            "model.layers.78.enorm.weight": base * 2,
+            "model.layers.78.hnorm.weight": base * 3,
+            "model.layers.78.eh_proj.weight": base * 4,
+            "model.layers.78.shared_head.norm.weight": base * 5,
+            "model.layers.78.self_attn.q_a_proj.weight": base * 6,
+            "model.layers.79.self_attn.q_a_proj.weight": base * 7,
+            "mtp.layer.mlp.gate.weight": base * 8,
+            "mtp.fc.weight": base * 9,
+        }
+
+        env_key = glm_moe_dsa.GLM_DSA_MTP_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "1"
+            sanitized = model.sanitize(weights)
+        finally:
+            self._restore_env(saved_env)
+
+        self.assertEqual(
+            list(sanitized),
+            [
+                "model.layers.77.self_attn.q_a_proj.weight",
+                "mtp.enorm.weight",
+                "mtp.hnorm.weight",
+                "mtp.eh_proj.weight",
+                "mtp.shared_head.norm.weight",
+                "mtp.layer.self_attn.q_a_proj.weight",
+                "mtp.layer.mlp.gate.weight",
+            ],
+        )
+        self.assertTrue(mx.array_equal(sanitized["mtp.enorm.weight"], base * 2))
+        self.assertTrue(
+            mx.array_equal(sanitized["mtp.layer.self_attn.q_a_proj.weight"], base * 6)
+        )
+
+    def test_glm_moe_dsa_mtp_scaffold_instantiates_opt_in(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_key = glm_moe_dsa.GLM_DSA_MTP_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "1"
+            model = self._make_glm_moe_dsa_model(num_nextn_predict_layers=1)
+        finally:
+            self._restore_env(saved_env)
+
+        self.assertIsNotNone(model.mtp)
+        self.assertEqual(len(model.layers), 2)
+        self.assertFalse(model.mtp.layer.self_attn.skip_topk)
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4

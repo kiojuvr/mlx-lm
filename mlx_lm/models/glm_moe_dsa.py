@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import (
@@ -59,6 +60,7 @@ GLM_DSA_PREFILL_PROFILE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE"
 GLM_DSA_PREFILL_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_PREFILL_PROFILE_ISOLATE"
 GLM_DSA_DECODE_PROFILE_ENV = "MLX_LM_GLM_DSA_DECODE_PROFILE"
 GLM_DSA_DECODE_PROFILE_ISOLATE_ENV = "MLX_LM_GLM_DSA_DECODE_PROFILE_ISOLATE"
+GLM_DSA_MTP_ENV = "MLX_LM_GLM_DSA_MTP"
 
 _PROFILE_STAGES = (
     "input_layernorm",
@@ -187,6 +189,10 @@ def _decode_profile_enabled() -> bool:
 
 def _decode_profile_isolate_enabled() -> bool:
     return _env_flag(GLM_DSA_DECODE_PROFILE_ISOLATE_ENV, False)
+
+
+def _mtp_enabled() -> bool:
+    return _env_flag(GLM_DSA_MTP_ENV, False)
 
 
 def _fast_prefill_debug_enabled() -> bool:
@@ -971,6 +977,13 @@ def get_glm_dsa_native_q4_qa_status():
     }
 
 
+def get_glm_dsa_mtp_status():
+    return {
+        "enabled": _mtp_enabled(),
+        "env": GLM_DSA_MTP_ENV,
+    }
+
+
 def _warn_fast_prefill_large_topk(topk: int):
     global _WARNED_FAST_PREFILL_LARGE_TOPK
     if _WARNED_FAST_PREFILL_LARGE_TOPK or topk < _FAST_PREFILL_LARGE_TOPK_WARNING:
@@ -1171,6 +1184,8 @@ class ModelArgs(BaseModelArgs):
     index_topk_pattern: Optional[Any] = None
     index_topk_freq: int = 1
     index_skip_topk_offset: int = 2
+    num_nextn_predict_layers: int = 0
+    index_share_for_mtp_iteration: bool = False
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
@@ -1198,7 +1213,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__(config)
         object.__setattr__(self, "_q_a_dense_cache", None)
-        self.skip_topk = config.indexer_types[layer_idx] == "shared"
+        indexer_types = config.indexer_types or []
+        indexer_type = (
+            indexer_types[layer_idx] if layer_idx < len(indexer_types) else "full"
+        )
+        self.skip_topk = indexer_type == "shared"
         if self.skip_topk:
             self.indexer = None
 
@@ -2453,36 +2472,132 @@ class GlmMoeDsaModel(DeepseekV32Model):
         return h
 
 
+class GlmMoeDsaMTPSharedHead(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def __call__(self, x: mx.array):
+        return self.norm(x)
+
+
+class GlmMoeDsaMTPPredictor(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.enorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layer = GlmMoeDsaDecoderLayer(config, config.num_hidden_layers)
+        self.shared_head = GlmMoeDsaMTPSharedHead(config)
+
+    def __call__(
+        self,
+        inputs_embeds: mx.array,
+        previous_hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
+        inputs_embeds = self.enorm(inputs_embeds)
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        hidden = self.eh_proj(
+            mx.concatenate([inputs_embeds, previous_hidden_states], axis=-1)
+        )
+        hidden, topk_indices = self.layer(hidden, mask, cache, prev_topk_indices)
+        return hidden, self.shared_head(hidden), topk_indices
+
+
 class Model(DSV32Model):
     def __init__(self, config: ModelArgs):
         super().__init__(config)
         self.model = GlmMoeDsaModel(config)
+        self.mtp = None
+        if _mtp_enabled() and config.num_nextn_predict_layers > 0:
+            self.mtp = GlmMoeDsaMTPPredictor(config)
 
     def sanitize(self, weights):
-        # Native MTP layers need a separate generation path. Keep baseline GLM
-        # loading compatible with updated checkpoints that include MTP weights.
         mtp_layer_start = self.args.num_hidden_layers
+        mtp_enabled = _mtp_enabled()
 
-        def is_mtp_weight(key):
+        def is_supported_internal_mtp_key(key):
+            return (
+                key in ("mtp.enorm.weight", "mtp.hnorm.weight", "mtp.eh_proj.weight")
+                or key.startswith("mtp.shared_head.")
+                or key.startswith("mtp.layer.")
+            )
+
+        def remap_key(key):
+            if key.startswith("mtp."):
+                if mtp_enabled and is_supported_internal_mtp_key(key):
+                    return key
+                return None
             if (
-                key.startswith(("mtp.", "mtp_", "model.mtp"))
+                key.startswith(("mtp_", "model.mtp"))
                 or ".mtp." in key
                 or ".mtp_" in key
             ):
-                return True
+                return None
             parts = key.split(".")
             if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
                 try:
-                    return int(parts[2]) >= mtp_layer_start
+                    layer_idx = int(parts[2])
                 except ValueError:
-                    return False
-            return False
+                    return key
+                if layer_idx < mtp_layer_start:
+                    return key
+                if not mtp_enabled or layer_idx != mtp_layer_start:
+                    return None
+                suffix = ".".join(parts[3:])
+                if suffix in ("enorm.weight", "hnorm.weight", "eh_proj.weight"):
+                    return f"mtp.{suffix}"
+                if suffix.startswith("shared_head."):
+                    return f"mtp.{suffix}"
+                if suffix:
+                    return f"mtp.layer.{suffix}"
+                return None
+            return key
 
-        return {
-            k: v
-            for k, v in weights.items()
-            if not is_mtp_weight(k)
-        }
+        sanitized = {}
+        for k, v in weights.items():
+            mapped_key = remap_key(k)
+            if mapped_key is not None:
+                sanitized[mapped_key] = v
+        return sanitized
+
+    def make_mtp_cache(self):
+        if self.mtp is None:
+            return []
+        if getattr(self.mtp.layer.self_attn, "skip_topk", False):
+            return CacheList(GlmMlaKVCache())
+        return CacheList(GlmMlaKVCache(), KVCache())
+
+    def mtp_logits(
+        self,
+        inputs: mx.array,
+        previous_hidden_states: mx.array,
+        cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
+        if self.mtp is None:
+            raise RuntimeError(f"GLM DSA MTP is disabled; set {GLM_DSA_MTP_ENV}=1")
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(inputs)
+        if mask is None:
+            mask = create_attention_mask(
+                inputs_embeds,
+                cache[0] if cache is not None else None,
+                return_array=True,
+            )
+        hidden, logits_hidden, topk_indices = self.mtp(
+            inputs_embeds,
+            previous_hidden_states,
+            mask,
+            cache,
+            prev_topk_indices,
+        )
+        return self.lm_head(logits_hidden), hidden, topk_indices
 
     def make_cache(self):
         # Shared layers run no indexer, so they get no indexer KVCache.
