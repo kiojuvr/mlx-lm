@@ -1918,6 +1918,19 @@ def mtp_speculative_generate_step(
                 )
             stats["target_prefill_tokens"] += n_to_process
             _quantize_runtime_cache(target_cache)
+            prefill_start = cached_prompt_tokens + processed
+            prefill_stop = prefill_start + n_to_process
+            _prompt_checkpoint_debug(
+                "mtp target prefill eval start "
+                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
+                f"chunk_tokens={n_to_process}"
+            )
+            _eval_target(target_logits, target_hidden)
+            _prompt_checkpoint_debug(
+                "mtp target prefill eval complete "
+                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
+                f"chunk_tokens={n_to_process}"
+            )
             final_prefill_chunk = processed + n_to_process == prompt.size
             if fused_mtp_prefill:
                 shifted_prompt = prompt[
@@ -1975,19 +1988,6 @@ def mtp_speculative_generate_step(
                 )
             stats["mtp_prefill_tokens"] += n_to_process
             _quantize_runtime_cache(mtp_cache_holder)
-            prefill_start = cached_prompt_tokens + processed
-            prefill_stop = prefill_start + n_to_process
-            _prompt_checkpoint_debug(
-                "mtp target prefill eval start "
-                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
-                f"chunk_tokens={n_to_process}"
-            )
-            _eval_target(target_logits, target_hidden)
-            _prompt_checkpoint_debug(
-                "mtp target prefill eval complete "
-                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
-                f"chunk_tokens={n_to_process}"
-            )
             _prompt_checkpoint_debug(
                 "mtp layer prefill eval start "
                 f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
