@@ -2932,7 +2932,7 @@ def remove_partial_json_output(path):
         pass
 
 
-def write_partial_prefill_sweep_output(args, rows):
+def write_partial_benchmark_output(args, rows):
     json_output = getattr(args, "json_output", None)
     if json_output:
         write_json_output(partial_json_output_path(json_output), rows, partial=True)
@@ -3292,7 +3292,7 @@ def run_prefill_sweep(model, tokenizer, args):
                         }
                     )
                     rows.append(row)
-                    write_partial_prefill_sweep_output(args, rows)
+                    write_partial_benchmark_output(args, rows)
         return rows
     finally:
         args.target_tokens = old_target_tokens
@@ -3349,6 +3349,7 @@ def append_decode_context_mtp_candidate_rows(
                         f"{case_name}-{candidate_name}-run-{run + 1}",
                     )
                 )
+                write_partial_benchmark_output(args, rows)
         return True
     finally:
         args.decode_context_mtp_speculative = old_mtp_speculative
@@ -4137,7 +4138,10 @@ def main():
         print_table(summaries, args.output_format)
         if args.json_output:
             write_json_output(args.json_output, rows)
-            if args.mode == "prefill-sweep":
+            if args.mode == "prefill-sweep" or (
+                args.mode == "decode-context"
+                and decode_context_mtp_candidates is not None
+            ):
                 remove_partial_json_output(args.json_output)
     finally:
         restore_checkpoint_cache_dir(old_checkpoint_cache_dir)

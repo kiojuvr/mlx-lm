@@ -449,15 +449,23 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                 ),
             }
 
-        handled = benchmark.append_decode_context_mtp_candidate_rows(
-            rows,
-            fake_runner,
-            object(),
-            object(),
-            "prompt",
-            args,
-            "decode",
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args.json_output = Path(tmpdir) / "decode-mtp.json"
+            handled = benchmark.append_decode_context_mtp_candidate_rows(
+                rows,
+                fake_runner,
+                object(),
+                object(),
+                "prompt",
+                args,
+                "decode",
+            )
+            with open(
+                benchmark.partial_json_output_path(args.json_output),
+                "r",
+                encoding="utf-8",
+            ) as f:
+                partial_payload = json.load(f)
 
         self.assertTrue(handled)
         self.assertEqual(
@@ -472,6 +480,9 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual([row["draft_tokens"] for row in rows], [9, 1, 2])
         self.assertEqual([row["candidate_index"] for row in rows], [0, 1, 2])
         self.assertEqual([row["candidate"] for row in rows], [0, 1, 2])
+        self.assertTrue(partial_payload["partial"])
+        self.assertEqual(partial_payload["completed_runs"], 3)
+        self.assertEqual(partial_payload["runs"], rows)
         self.assertFalse(args.decode_context_mtp_speculative)
         self.assertEqual(args.mtp_draft_tokens, 9)
         self.assertIsNone(args.decode_context_mtp_candidate_index)
