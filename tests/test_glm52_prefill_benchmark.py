@@ -364,6 +364,122 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["mtp_acceptance_examples"][1]["proposal"], 99)
         self.assertFalse(row["mtp_acceptance_examples"][1]["match"])
 
+    def test_run_mtp_speculative_reports_verified_greedy_tokens(self):
+        class DummyCache:
+            def __init__(self):
+                self.state = benchmark.mx.array([0])
+                self.offset = 0
+                self.trimmed = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trimmed.append(n)
+                return n
+
+        class DummyModel:
+            def __init__(self):
+                self.mtp = object()
+                self.layers = [object()]
+                self.target_next = {
+                    3: 5,
+                    5: 7,
+                    7: 11,
+                    99: 101,
+                    11: 13,
+                    13: 17,
+                }
+                self.mtp_next = {
+                    5: 7,
+                    7: 99,
+                    11: 13,
+                    13: 17,
+                }
+                self.mtp_cache = DummyCache()
+
+            def make_mtp_cache(self):
+                return self.mtp_cache
+
+            def _logits(self, token, length):
+                logits = benchmark.mx.where(
+                    benchmark.mx.arange(128) == token,
+                    benchmark.mx.array(1.0),
+                    benchmark.mx.array(0.0),
+                )
+                return benchmark.mx.broadcast_to(
+                    logits.reshape(1, 1, 128),
+                    (1, length, 128),
+                )
+
+            def forward_with_hidden(self, inputs, cache=None):
+                flat = [int(v) for v in inputs.reshape(-1).tolist()]
+                outputs = [self.target_next.get(token, 0) for token in flat]
+                logits = benchmark.mx.concatenate(
+                    [self._logits(token, 1) for token in outputs],
+                    axis=1,
+                )
+                hidden_values = benchmark.mx.array(flat, dtype=benchmark.mx.float32)
+                hidden = benchmark.mx.broadcast_to(
+                    hidden_values.reshape(1, len(flat), 1),
+                    (1, len(flat), 4),
+                )
+                return logits, hidden
+
+            def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+                last = int(inputs.reshape(-1)[-1].item())
+                token = self.mtp_next.get(last, 0)
+                logits = self._logits(token, inputs.shape[1])
+                hidden = benchmark.mx.ones((1, inputs.shape[1], 4)) * token
+                return logits, hidden, None
+
+        target_cache = [DummyCache()]
+        old_make_cache = benchmark.prompt_cache.make_prompt_cache
+        old_collect_profile = benchmark.collect_glm_dsa_profile
+        old_collect_decode_profile = benchmark.collect_glm_dsa_decode_profile
+        old_reset_profile = benchmark.reset_glm_dsa_profile
+        benchmark.prompt_cache.make_prompt_cache = lambda _model: target_cache
+        benchmark.collect_glm_dsa_profile = lambda _args: {}
+        benchmark.collect_glm_dsa_decode_profile = lambda _args: {}
+        benchmark.reset_glm_dsa_profile = lambda: None
+        args = Namespace(
+            target_tokens=None,
+            max_tokens=5,
+            mtp_draft_tokens=3,
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+            prefill_step_size=4,
+            prefill_max_qk_tokens=0,
+            glm_dsa_adaptive_prefill_step_size=0,
+            glm_dsa_adaptive_prefill_after_tokens=0,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=0,
+        )
+        model = DummyModel()
+        try:
+            row = benchmark.run_mtp_speculative_once(
+                model,
+                object(),
+                [1, 2, 3],
+                args,
+                "mtp-spec-test",
+            )
+        finally:
+            benchmark.prompt_cache.make_prompt_cache = old_make_cache
+            benchmark.collect_glm_dsa_profile = old_collect_profile
+            benchmark.collect_glm_dsa_decode_profile = old_collect_decode_profile
+            benchmark.reset_glm_dsa_profile = old_reset_profile
+
+        self.assertEqual(row["mode"], "mtp-speculative")
+        self.assertEqual(row["generated_tokens"], 5)
+        self.assertEqual(row["mtp_speculative_generated_tokens"], [5, 7, 11, 13, 17])
+        self.assertEqual(row["mtp_speculative_drafted_tokens"], 4)
+        self.assertEqual(row["mtp_speculative_accepted_tokens"], 2)
+        self.assertAlmostEqual(row["mtp_speculative_acceptance_rate"], 0.5)
+        self.assertGreaterEqual(row["mtp_speculative_target_forwards"], 2)
+        self.assertIn(2, target_cache[0].trimmed)
+        self.assertIn(1, model.mtp_cache.trimmed)
+
     def test_main_rejects_empty_model_argument(self):
         old_argv = sys.argv
         sys.argv = [

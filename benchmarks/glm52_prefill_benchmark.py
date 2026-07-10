@@ -1952,6 +1952,225 @@ def run_mtp_acceptance_once(model, tokenizer, prompt, args, case_name):
     }
 
 
+def _quantize_cache_for_args(cache_obj, args):
+    maybe_quantize_kv_cache(
+        cache_obj,
+        getattr(args, "quantized_kv_start", 0),
+        getattr(args, "kv_group_size", 64),
+        getattr(args, "kv_bits", None),
+    )
+
+
+def run_mtp_speculative_once(model, tokenizer, prompt, args, case_name):
+    if getattr(model, "mtp", None) is None:
+        raise RuntimeError(
+            "MTP speculative decode requires MLX_LM_GLM_DSA_MTP=1 at model load time"
+        )
+    if not hasattr(model, "forward_with_hidden"):
+        raise RuntimeError("MTP speculative decode requires model.forward_with_hidden")
+
+    tokenize_t0 = time.perf_counter()
+    tokens = prompt_to_tokens(tokenizer, prompt)
+    if args.target_tokens is not None:
+        tokens = tokens[: args.target_tokens]
+    tokenize_seconds = time.perf_counter() - tokenize_t0
+    if len(tokens) == 0:
+        raise RuntimeError(f"{case_name}: MTP speculative decode needs a prompt")
+
+    max_tokens = int(args.max_tokens)
+    if max_tokens <= 0:
+        raise RuntimeError("--max-tokens must be positive in --mode mtp-speculative")
+    num_draft_tokens = int(getattr(args, "mtp_draft_tokens", 1) or 1)
+    if num_draft_tokens <= 0:
+        raise RuntimeError("--mtp-draft-tokens must be positive")
+
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    mx.clear_cache()
+    mx.synchronize()
+    reset_glm_dsa_profile()
+    prefill_config = prefill_config_summary(args)
+
+    token_array = mx.array(tokens, dtype=mx.uint32).reshape(1, -1)
+    target_cache = prompt_cache.make_prompt_cache(model)
+    mtp_cache_holder = [model.make_mtp_cache()]
+    mtp_cache = mtp_cache_holder[0]
+
+    prefill_t0 = time.perf_counter()
+    target_logits, target_hidden = model.forward_with_hidden(
+        token_array,
+        cache=target_cache,
+    )
+    _quantize_cache_for_args(target_cache, args)
+    mx.eval(target_logits, target_hidden, [c.state for c in target_cache])
+    target_prefill_seconds = time.perf_counter() - prefill_t0
+
+    mtp_prefill_t0 = time.perf_counter()
+    _mtp_logits, _mtp_hidden, _topk = model.mtp_logits(
+        token_array,
+        target_hidden,
+        cache=mtp_cache,
+    )
+    _quantize_cache_for_args(mtp_cache_holder, args)
+    mtp_cache = mtp_cache_holder[0]
+    mx.eval(_mtp_logits, _mtp_hidden, mtp_cache.state)
+    mtp_prefill_seconds = time.perf_counter() - mtp_prefill_t0
+
+    current = _argmax_token(target_logits[:, -1:, :])
+    previous_hidden = target_hidden[:, -1:, :]
+    emitted = [_token_item(current)]
+    target_seconds = 0.0
+    draft_seconds = 0.0
+    target_forwards = 0
+    target_input_tokens = 0
+    drafted_tokens = 0
+    accepted_tokens = 0
+    rounds = 0
+    examples = []
+
+    decode_t0 = time.perf_counter()
+    while len(emitted) < max_tokens:
+        remaining = max_tokens - len(emitted)
+        num_draft = min(num_draft_tokens, max(remaining - 1, 0))
+        if num_draft == 0:
+            target_t0 = time.perf_counter()
+            logits, hidden = model.forward_with_hidden(current, cache=target_cache)
+            _quantize_cache_for_args(target_cache, args)
+            next_token = _argmax_token(logits[:, -1:, :])
+            mx.eval(next_token, hidden, [c.state for c in target_cache])
+            target_seconds += time.perf_counter() - target_t0
+            target_forwards += 1
+            target_input_tokens += 1
+            current = next_token
+            previous_hidden = hidden[:, -1:, :]
+            emitted.append(_token_item(current))
+            break
+
+        rounds += 1
+        draft_inputs = []
+        draft_tokens = []
+        draft_input = current
+        draft_hidden = previous_hidden
+        for _ in range(num_draft):
+            draft_t0 = time.perf_counter()
+            mtp_logits, mtp_hidden, _topk = model.mtp_logits(
+                draft_input,
+                draft_hidden,
+                cache=mtp_cache,
+            )
+            _quantize_cache_for_args(mtp_cache_holder, args)
+            mtp_cache = mtp_cache_holder[0]
+            proposal = _argmax_token(mtp_logits[:, -1:, :])
+            mx.eval(proposal, mtp_hidden, mtp_cache.state)
+            draft_seconds += time.perf_counter() - draft_t0
+            draft_inputs.append(draft_input)
+            draft_tokens.append(proposal)
+            drafted_tokens += 1
+            draft_input = proposal
+            draft_hidden = mtp_hidden[:, -1:, :]
+
+        target_inputs = mx.concatenate([current] + draft_tokens, axis=1)
+        target_t0 = time.perf_counter()
+        logits, hidden = model.forward_with_hidden(target_inputs, cache=target_cache)
+        _quantize_cache_for_args(target_cache, args)
+        target_predictions = _argmax_token(logits)
+        mx.eval(target_predictions, hidden, [c.state for c in target_cache])
+        target_seconds += time.perf_counter() - target_t0
+        target_forwards += 1
+        target_input_tokens += num_draft + 1
+
+        accepted = 0
+        for draft_index, draft_token in enumerate(draft_tokens):
+            proposal_id = _token_item(draft_token)
+            target_id = _token_item(
+                target_predictions[:, draft_index : draft_index + 1]
+            )
+            matched = proposal_id == target_id
+            if len(examples) < 16:
+                examples.append(
+                    {
+                        "round": rounds,
+                        "draft_index": draft_index,
+                        "input": _token_item(draft_inputs[draft_index]),
+                        "proposal": proposal_id,
+                        "target": target_id,
+                        "match": matched,
+                    }
+                )
+            if not matched:
+                break
+            accepted += 1
+
+        accepted_tokens += accepted
+        for i in range(accepted):
+            if len(emitted) >= max_tokens:
+                break
+            emitted.append(_token_item(target_predictions[:, i : i + 1]))
+
+        cache_trim = num_draft - accepted
+        if cache_trim:
+            prompt_cache.trim_prompt_cache(target_cache, cache_trim)
+
+        mtp_trim = max(num_draft - accepted - 1, 0)
+        if mtp_trim:
+            prompt_cache.trim_prompt_cache(mtp_cache_holder, mtp_trim)
+
+        if len(emitted) >= max_tokens:
+            break
+
+        current = target_predictions[:, accepted : accepted + 1].astype(mx.uint32)
+        previous_hidden = hidden[:, accepted : accepted + 1, :]
+        emitted.append(_token_item(current))
+
+        if accepted == num_draft:
+            catch_prev_hidden = hidden[:, num_draft - 1 : num_draft, :]
+            catch_t0 = time.perf_counter()
+            _catch_logits, _catch_hidden, _topk = model.mtp_logits(
+                draft_tokens[-1],
+                catch_prev_hidden,
+                cache=mtp_cache,
+            )
+            _quantize_cache_for_args(mtp_cache_holder, args)
+            mtp_cache = mtp_cache_holder[0]
+            mx.eval(_catch_logits, _catch_hidden, mtp_cache.state)
+            draft_seconds += time.perf_counter() - catch_t0
+
+    mx.synchronize()
+    decode_seconds = time.perf_counter() - decode_t0
+    generated_tokens = min(max_tokens, len(emitted))
+    acceptance_rate = accepted_tokens / drafted_tokens if drafted_tokens else None
+    mean_accepted = accepted_tokens / rounds if rounds else None
+    return {
+        "case": case_name,
+        "mode": "mtp-speculative",
+        "batch_size": 1,
+        "requested_total_tokens": args.target_tokens,
+        "prompt_tokens": len(tokens),
+        "generated_tokens": generated_tokens,
+        "tokenize_seconds": tokenize_seconds,
+        "target_prefill_seconds": target_prefill_seconds,
+        "mtp_prefill_seconds": mtp_prefill_seconds,
+        "decode_seconds": decode_seconds,
+        "decode_tps": generated_tokens / decode_seconds if decode_seconds > 0 else None,
+        "mtp_draft_tokens": num_draft_tokens,
+        "mtp_speculative_rounds": rounds,
+        "mtp_speculative_target_forwards": target_forwards,
+        "mtp_speculative_target_input_tokens": target_input_tokens,
+        "mtp_speculative_drafted_tokens": drafted_tokens,
+        "mtp_speculative_accepted_tokens": accepted_tokens,
+        "mtp_speculative_acceptance_rate": acceptance_rate,
+        "mtp_speculative_mean_accepted": mean_accepted,
+        "mtp_speculative_target_seconds": target_seconds,
+        "mtp_speculative_draft_seconds": draft_seconds,
+        "mtp_speculative_generated_tokens": emitted[:32],
+        "mtp_speculative_examples": examples,
+        "peak_memory_gb": mx.get_peak_memory() / 1e9,
+        **prefill_config,
+        **collect_glm_dsa_profile(args),
+        **collect_glm_dsa_decode_profile(args),
+    }
+
+
 def run_batch_once(model, tokenizer, text, args, case_name):
     tokenize_t0 = time.perf_counter()
     prompts = []
@@ -2346,6 +2565,16 @@ def print_table(rows, output_format):
         "mtp_target_decode_tps",
         "mtp_proposal_seconds",
         "mtp_proposal_tps",
+        "mtp_draft_tokens",
+        "mtp_speculative_rounds",
+        "mtp_speculative_target_forwards",
+        "mtp_speculative_target_input_tokens",
+        "mtp_speculative_drafted_tokens",
+        "mtp_speculative_accepted_tokens",
+        "mtp_speculative_acceptance_rate",
+        "mtp_speculative_mean_accepted",
+        "mtp_speculative_target_seconds",
+        "mtp_speculative_draft_seconds",
         "checkpoint_resolution",
         "glm_dsa_prefill_profile",
         "glm_dsa_prefill_profile_isolate",
@@ -2947,6 +3176,7 @@ def main():
             "prefill-sweep",
             "decode-context",
             "mtp-acceptance",
+            "mtp-speculative",
             "native-smoke",
         ),
         default="single",
@@ -3074,6 +3304,15 @@ def main():
         help=(
             "Number of greedy decode positions to probe in --mode mtp-acceptance. "
             "Defaults to --max-tokens."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-draft-tokens",
+        type=int,
+        default=2,
+        help=(
+            "Number of MTP draft tokens per target verification round in "
+            "--mode mtp-speculative."
         ),
     )
     parser.add_argument("--prefill-step-size", type=int, default=2048)
@@ -3470,6 +3709,11 @@ def main():
             and args.mtp_acceptance_steps <= 0
         ):
             parser.error("--mtp-acceptance-steps must be positive when set.")
+    if args.mode == "mtp-speculative":
+        if args.max_tokens <= 0:
+            parser.error("--max-tokens must be positive in --mode mtp-speculative.")
+        if args.mtp_draft_tokens <= 0:
+            parser.error("--mtp-draft-tokens must be positive.")
     if args.mode == "native-smoke":
         if args.native_smoke_q_len <= 1:
             parser.error("--native-smoke-q-len must be greater than 1.")
@@ -3504,7 +3748,7 @@ def main():
 
     old_checkpoint_cache_dir = configure_checkpoint_cache_dir(args)
     old_mtp_env = os.environ.get(glm_moe_dsa.GLM_DSA_MTP_ENV)
-    if args.mode == "mtp-acceptance":
+    if args.mode in ("mtp-acceptance", "mtp-speculative"):
         os.environ[glm_moe_dsa.GLM_DSA_MTP_ENV] = "1"
 
     try:
@@ -3531,6 +3775,8 @@ def main():
                 runner = run_decode_context_once
             elif args.mode == "mtp-acceptance":
                 runner = run_mtp_acceptance_once
+            elif args.mode == "mtp-speculative":
+                runner = run_mtp_speculative_once
             else:
                 runner = run_once
             if args.prompt_file:
