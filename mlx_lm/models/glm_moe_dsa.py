@@ -2555,8 +2555,11 @@ class GlmMoeDsaMTPPredictor(nn.Module):
 
 class Model(DSV32Model):
     def __init__(self, config: ModelArgs):
-        super().__init__(config)
+        nn.Module.__init__(self)
+        self.args = config
+        self.model_type = config.model_type
         self.model = GlmMoeDsaModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.mtp = None
         if _mtp_enabled() and config.num_nextn_predict_layers > 0:
             self.mtp = GlmMoeDsaMTPPredictor(config)
