@@ -45,6 +45,7 @@ from mlx_lm.models.cache import (
     PROMPT_CHECKPOINT_MAX_FILES_ENV,
     PromptCacheCheckpointError,
     PromptCheckpointManager,
+    MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
     QuantizedGlmMlaKVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -68,6 +69,8 @@ from mlx_lm.models.cache import (
     make_mtp_speculative_prompt_cache,
     make_prompt_cache,
     materialize_prompt_cache,
+    mtp_speculative_prompt_checkpoint_file,
+    mtp_speculative_prompt_checkpoint_name,
     prompt_checkpoint_budget_from_env,
     prompt_checkpoint_file,
     prompt_checkpoint_lcp_block_hash_chain,
@@ -641,6 +644,102 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertEqual(
             prompt_cache_layout_signature(loaded_cache),
             expected_layout,
+        )
+
+    def test_mtp_speculative_checkpoint_file_can_coexist_with_target_checkpoint(self):
+        self._set_home_to_test_dir()
+        ensure_glm52_local_cache_dirs()
+
+        class ToyMTPModel:
+            def make_cache(self):
+                return [CacheList(GlmMlaKVCache(), KVCache())]
+
+            def make_mtp_cache(self):
+                return CacheList(GlmMlaKVCache(), KVCache())
+
+        model = ToyMTPModel()
+        prefix_tokens = [1, 2, 3, 4]
+        target_cache = self._filled_kv_cache(shape=(1, 1, len(prefix_tokens), 8))[:1]
+        mtp_cache = [
+            self._filled_glm_mla_cache_list(length=len(prefix_tokens)),
+            self._filled_glm_mla_cache_list(length=len(prefix_tokens)),
+        ]
+        target_path = prompt_checkpoint_file(prefix_tokens)
+        mtp_path = mtp_speculative_prompt_checkpoint_file(prefix_tokens)
+
+        self.assertNotEqual(os.path.basename(target_path), os.path.basename(mtp_path))
+        self.assertTrue(
+            os.path.basename(mtp_path).startswith("mtp-speculative-")
+        )
+        self.assertEqual(
+            mtp_speculative_prompt_checkpoint_name(prefix_tokens),
+            os.path.basename(mtp_path),
+        )
+
+        target_metadata = save_prompt_checkpoint(
+            target_path,
+            target_cache,
+            model_id="toy-model",
+            prefix_tokens=prefix_tokens,
+        )
+        update_prompt_checkpoint_manifest(
+            target_path,
+            prefix_length=len(prefix_tokens),
+            kind="exact",
+            metadata=target_metadata,
+        )
+        mtp_metadata = save_prompt_checkpoint(
+            mtp_path,
+            mtp_cache,
+            checkpoint_namespace=MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
+            model_id="toy-model",
+            prefix_tokens=prefix_tokens,
+            metadata={"checkpoint_label": "exact"},
+        )
+        update_prompt_checkpoint_manifest(
+            mtp_path,
+            prefix_length=len(prefix_tokens),
+            kind="exact",
+            metadata=mtp_metadata,
+        )
+
+        target_layout = expected_prompt_cache_layout_signature(
+            object(),
+            prompt_cache=target_cache,
+        )
+        mtp_layout = expected_mtp_speculative_prompt_cache_layout_signature(
+            model,
+            cache_token_length=len(prefix_tokens),
+        )
+        target_candidates = find_prompt_checkpoint_prefix(
+            prefix_tokens,
+            expected_cache_layout_by_length=lambda _length: target_layout,
+        )
+        mtp_candidates = find_prompt_checkpoint_prefix(
+            prefix_tokens,
+            expected_cache_layout_by_length=lambda _length: mtp_layout,
+        )
+
+        self.assertEqual(
+            os.path.basename(target_candidates[0][2]),
+            os.path.basename(target_path),
+        )
+        self.assertEqual(
+            os.path.basename(mtp_candidates[0][2]),
+            os.path.basename(mtp_path),
+        )
+        load_prompt_checkpoint(
+            target_path,
+            model_id="toy-model",
+            prefix_tokens=prefix_tokens,
+            expected_cache_layout=target_layout,
+        )
+        load_prompt_checkpoint(
+            mtp_path,
+            checkpoint_namespace=MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
+            model_id="toy-model",
+            prefix_tokens=prefix_tokens,
+            expected_cache_layout=mtp_layout,
         )
 
     def test_lcp_checkpoint_manager_filters_cache_layout_mismatch(self):

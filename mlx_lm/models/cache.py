@@ -20,6 +20,10 @@ from .base import create_causal_mask
 PROMPT_CACHE_CHECKPOINT_FORMAT = "mlx_lm.prompt_cache_checkpoint"
 PROMPT_CACHE_CHECKPOINT_VERSION = "1"
 DEFAULT_PROMPT_CHECKPOINT_NAMESPACE = "glm52-local"
+MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE = (
+    f"{DEFAULT_PROMPT_CHECKPOINT_NAMESPACE}-mtp-speculative"
+)
+MTP_SPECULATIVE_PROMPT_CHECKPOINT_FILE_PREFIX = "mtp-speculative"
 DEFAULT_PROMPT_CHECKPOINT_MODEL_ID = "default_model"
 DEFAULT_PROMPT_CHECKPOINT_TOKENIZER_ID = "default_tokenizer"
 GLM52_LOCAL_CACHE_ROOT = os.path.join(
@@ -530,15 +534,43 @@ def prompt_checkpoint_metadata_prefix_tokens(metadata):
     return prefix
 
 
-def prompt_checkpoint_name(prefix_tokens):
+def _prompt_checkpoint_file_prefix(file_prefix):
+    if file_prefix is None:
+        return ""
+    file_prefix = str(file_prefix)
+    if not file_prefix:
+        return ""
+    if os.path.basename(file_prefix) != file_prefix or file_prefix.endswith("-"):
+        raise ValueError("checkpoint file prefix must be a safe filename prefix")
+    return f"{file_prefix}-"
+
+
+def prompt_checkpoint_name(prefix_tokens, *, file_prefix: Optional[str] = None):
     prefix = _token_list(prefix_tokens)
-    return f"{_json_hash(prefix)}-{len(prefix)}.safetensors"
+    return (
+        f"{_prompt_checkpoint_file_prefix(file_prefix)}"
+        f"{_json_hash(prefix)}-{len(prefix)}.safetensors"
+    )
 
 
-def prompt_checkpoint_file(prefix_tokens):
+def prompt_checkpoint_file(prefix_tokens, *, file_prefix: Optional[str] = None):
     return os.path.join(
         glm52_prompt_checkpoints_dir(),
-        prompt_checkpoint_name(prefix_tokens),
+        prompt_checkpoint_name(prefix_tokens, file_prefix=file_prefix),
+    )
+
+
+def mtp_speculative_prompt_checkpoint_name(prefix_tokens):
+    return prompt_checkpoint_name(
+        prefix_tokens,
+        file_prefix=MTP_SPECULATIVE_PROMPT_CHECKPOINT_FILE_PREFIX,
+    )
+
+
+def mtp_speculative_prompt_checkpoint_file(prefix_tokens):
+    return prompt_checkpoint_file(
+        prefix_tokens,
+        file_prefix=MTP_SPECULATIVE_PROMPT_CHECKPOINT_FILE_PREFIX,
     )
 
 

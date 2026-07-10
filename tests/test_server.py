@@ -18,12 +18,14 @@ import requests
 
 from mlx_lm.models.cache import (
     KVCache,
+    MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
     PROMPT_CHECKPOINT_CACHE_DIR_ENV,
     PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_LENGTH_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_CACHE_START_TOKENS_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY,
+    PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY,
     materialize_prompt_cache,
     prompt_cache_token_length,
     prompt_prefix_hash,
@@ -554,6 +556,72 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
                 200_000,
             )
         )
+
+    def test_save_mtp_speculative_exact_prompt_checkpoint_records_namespace(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_args = self._args(
+            checkpoint_save_exact="enabled",
+            checkpoint_cold_max_tokens=10,
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+            mtp_speculative=True,
+        )
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=cli_args,
+        )
+        prompt_cache = [KVCache(), KVCache()]
+        for idx, cache in enumerate(prompt_cache):
+            start = idx * 100
+            keys = mx.array(
+                list(range(start, start + 8)),
+                dtype=mx.float32,
+            ).reshape(1, 1, 4, 2)
+            cache.update_and_fetch(keys, keys + 1000)
+        prompt_tokens = [1, 2, 3, 4]
+        captured = {}
+
+        def fake_save_prompt_checkpoint(file_name, cache, **kwargs):
+            captured["file_name"] = file_name
+            captured["cache"] = cache
+            captured["kwargs"] = kwargs
+            return dict(kwargs["metadata"])
+
+        with mock.patch(
+            "mlx_lm.server.mtp_speculative_prompt_checkpoint_file",
+            return_value="/tmp/mtp-exact.safetensors",
+        ), mock.patch(
+            "mlx_lm.server.save_prompt_checkpoint",
+            fake_save_prompt_checkpoint,
+        ), mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest, mock.patch(
+            "mlx_lm.server.prune_prompt_checkpoints"
+        ) as prune:
+            saved = generator._save_mtp_speculative_exact_prompt_checkpoint(
+                prompt_cache,
+                prompt_tokens,
+                rendered_prompt="abcd",
+            )
+
+        self.assertTrue(saved)
+        self.assertEqual(captured["file_name"], "/tmp/mtp-exact.safetensors")
+        self.assertEqual(prompt_cache_token_length(captured["cache"]), 4)
+        self.assertEqual(captured["kwargs"]["prefix_tokens"], prompt_tokens)
+        self.assertEqual(
+            captured["kwargs"]["checkpoint_namespace"],
+            MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
+        )
+        metadata = captured["kwargs"]["metadata"]
+        self.assertEqual(metadata["checkpoint_label"], "exact")
+        self.assertIn(PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY, metadata)
+        self.assertIn("checkpoint_rendered_prefix_hash", metadata)
+        update_manifest.assert_called_once()
+        self.assertEqual(update_manifest.call_args.kwargs["kind"], "exact")
+        self.assertEqual(update_manifest.call_args.kwargs["prefix_length"], 4)
+        prune.assert_called_once()
 
     def test_save_continued_prompt_checkpoint_trims_and_records_metadata(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
@@ -1350,6 +1418,53 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(result.cached_tokens, 2)
         self.assertEqual(result.prompt, [ord(ch) for ch in "abcXYZ"])
         self.assertIn("exact", find_rendered.call_args.kwargs["allowed_kinds"])
+        update_manifest.assert_called_once()
+        self.assertEqual(update_manifest.call_args.kwargs["prefix_length"], 3)
+        self.assertEqual(update_manifest.call_args.kwargs["kind"], "exact")
+
+    def test_rendered_checkpoint_uses_mtp_exact_as_full_cached_prefix(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            draft_model=None,
+            cli_args=self._args(
+                kv_bits=None,
+                kv_group_size=64,
+                quantized_kv_start=0,
+                mtp_speculative=True,
+            ),
+        )
+        tokenizer = types.SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [ord(ch) for ch in text],
+            decode=lambda tokens, **kwargs: "".join(chr(token) for token in tokens),
+        )
+
+        with mock.patch(
+            "mlx_lm.server.find_prompt_checkpoint_rendered_prefix",
+            return_value=([(3, 3, "/tmp/mtp-exact.safetensors", "exact")], {}),
+        ) as find_rendered, mock.patch(
+            "mlx_lm.server.load_prompt_checkpoint_with_metadata_prefix",
+            return_value=(
+                ["mtp-cache"],
+                [ord("a"), ord("b"), ord("c")],
+                {"checkpoint_label": "exact"},
+            ),
+        ) as load_checkpoint, mock.patch(
+            "mlx_lm.server.update_prompt_checkpoint_manifest"
+        ) as update_manifest:
+            result = generator._load_rendered_prompt_checkpoint(tokenizer, "abcXYZ")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "exact")
+        self.assertEqual(result.prefix_tokens, [ord("a"), ord("b"), ord("c")])
+        self.assertEqual(result.suffix_tokens, [ord(ch) for ch in "XYZ"])
+        self.assertEqual(result.cached_tokens, 3)
+        self.assertEqual(result.prompt, [ord(ch) for ch in "abcXYZ"])
+        self.assertEqual(find_rendered.call_args.kwargs["allowed_kinds"], ("exact",))
+        self.assertEqual(
+            load_checkpoint.call_args.kwargs["checkpoint_namespace"],
+            MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
+        )
         update_manifest.assert_called_once()
         self.assertEqual(update_manifest.call_args.kwargs["prefix_length"], 3)
         self.assertEqual(update_manifest.call_args.kwargs["kind"], "exact")

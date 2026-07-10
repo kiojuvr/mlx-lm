@@ -143,10 +143,12 @@ python benchmarks/glm52_prefill_benchmark.py \
 ```
 
 This benchmark path is intentionally checkpoint-disabled for now. Server
-`--mtp-speculative` still keeps disk checkpoints separate from target-only
-checkpoints, while repeated served prompts can reuse the dedicated MTP RAM
-prompt-cache namespace. Compare the benchmark row against a checkpoint-disabled
-baseline decode-context row before interpreting decode TPS. The MTP row reports
+`--mtp-speculative` keeps MTP exact disk checkpoints separate from target-only
+checkpoints with an `mtp-speculative-...` filename prefix and a dedicated
+checkpoint namespace when exact saves are enabled, while repeated served prompts
+can reuse the dedicated MTP RAM prompt-cache namespace. Compare the benchmark row
+against a checkpoint-disabled baseline decode-context row before interpreting
+decode TPS. The MTP row reports
 `decode_context_mtp_speculative=true` plus `mtp_speculative_*` fields including
 `accepted_tokens`, `acceptance_rate`, `mean_accepted`, and
 `emitted_per_target_forward`. If acceptance is low, the extra MTP draft work can

@@ -51,6 +51,7 @@ from .generate import (
 from .models.cache import (
     DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
     LRUPromptCache,
+    MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
     PROMPT_CHECKPOINT_CACHE_DIR_ENV,
     PROMPT_CHECKPOINT_DELTA_BASE_FILENAME_METADATA_KEY,
     PROMPT_CHECKPOINT_DELTA_BASE_PREFIX_HASH_METADATA_KEY,
@@ -65,6 +66,8 @@ from .models.cache import (
     concat_prompt_caches,
     expected_glm_mla_kv_quantization_metadata,
     expected_glm_mla_kv_settings_metadata,
+    expected_mtp_speculative_glm_mla_kv_quantization_metadata,
+    expected_mtp_speculative_prompt_cache_layout_signature,
     expected_prompt_cache_layout_signature,
     find_prompt_checkpoint_rendered_prefix,
     load_prompt_checkpoint,
@@ -73,6 +76,7 @@ from .models.cache import (
     make_prompt_cache,
     materialize_prompt_cache,
     model_has_glm_mla_kv_cache,
+    mtp_speculative_prompt_checkpoint_file,
     prompt_checkpoint_file,
     prompt_checkpoint_prefix_tokens_metadata,
     prompt_prefix_hash,
@@ -1648,9 +1652,11 @@ class ResponseGenerator:
         if (
             rendered_prompt is None
             or self.model_provider.draft_model is not None
-            or getattr(self.model_provider.cli_args, "mtp_speculative", False)
         ):
             return None
+        mtp_speculative = bool(
+            getattr(self.model_provider.cli_args, "mtp_speculative", False)
+        )
         rendered = rendered_prompt_bytes(rendered_prompt)
         if not rendered:
             return None
@@ -1659,10 +1665,22 @@ class ResponseGenerator:
             if kind == "delta":
                 return None
             cache_token_length = (
-                max(prefix_length - 1, 0)
-                if kind == "exact"
-                else prefix_length
+                prefix_length
+                if mtp_speculative
+                else (
+                    max(prefix_length - 1, 0)
+                    if kind == "exact"
+                    else prefix_length
+                )
             )
+            if mtp_speculative:
+                return expected_mtp_speculative_prompt_cache_layout_signature(
+                    self.model_provider.model,
+                    kv_bits=self.cli_args.kv_bits,
+                    kv_group_size=self.cli_args.kv_group_size,
+                    quantized_kv_start=self.cli_args.quantized_kv_start,
+                    cache_token_length=cache_token_length,
+                )
             return expected_prompt_cache_layout_signature(
                 self.model_provider.model,
                 kv_bits=self.cli_args.kv_bits,
@@ -1673,7 +1691,11 @@ class ResponseGenerator:
 
         candidates, lookup_stats = find_prompt_checkpoint_rendered_prefix(
             rendered,
-            allowed_kinds=("prefix", "frontier", "continued", "delta", "exact"),
+            allowed_kinds=(
+                ("exact",)
+                if mtp_speculative
+                else ("prefix", "frontier", "continued", "delta", "exact")
+            ),
             expected_cache_layout_by_candidate=(
                 expected_cache_layout_for_rendered_candidate
             ),
@@ -1696,6 +1718,8 @@ class ResponseGenerator:
 
             try:
                 if kind == "delta":
+                    if mtp_speculative:
+                        continue
                     (
                         prompt_cache,
                         prefix_tokens,
@@ -1706,34 +1730,52 @@ class ResponseGenerator:
                     ) = self._load_delta_prompt_checkpoint(checkpoint_path)
                 else:
                     checkpoint_cache_token_length = (
-                        max(token_prefix_length - 1, 0)
-                        if kind == "exact"
-                        else token_prefix_length
+                        token_prefix_length
+                        if mtp_speculative
+                        else (
+                            max(token_prefix_length - 1, 0)
+                            if kind == "exact"
+                            else token_prefix_length
+                        )
                     )
-                    expected_quantization = expected_glm_mla_kv_quantization_metadata(
-                        self.model_provider.model,
-                        cache_token_length=checkpoint_cache_token_length,
-                        kv_bits=self.cli_args.kv_bits,
-                        kv_group_size=self.cli_args.kv_group_size,
-                        quantized_kv_start=self.cli_args.quantized_kv_start,
-                    )
+                    if mtp_speculative:
+                        expected_quantization = (
+                            expected_mtp_speculative_glm_mla_kv_quantization_metadata(
+                                self.model_provider.model,
+                                cache_token_length=checkpoint_cache_token_length,
+                                kv_bits=self.cli_args.kv_bits,
+                                kv_group_size=self.cli_args.kv_group_size,
+                                quantized_kv_start=self.cli_args.quantized_kv_start,
+                            )
+                        )
+                    else:
+                        expected_quantization = (
+                            expected_glm_mla_kv_quantization_metadata(
+                                self.model_provider.model,
+                                cache_token_length=checkpoint_cache_token_length,
+                                kv_bits=self.cli_args.kv_bits,
+                                kv_group_size=self.cli_args.kv_group_size,
+                                quantized_kv_start=self.cli_args.quantized_kv_start,
+                            )
+                        )
                     expected_settings = expected_glm_mla_kv_settings_metadata(
                         self.model_provider.model,
                         kv_bits=self.cli_args.kv_bits,
                         kv_group_size=self.cli_args.kv_group_size,
                         quantized_kv_start=self.cli_args.quantized_kv_start,
                     )
-                    expected_cache_layout = expected_prompt_cache_layout_signature(
-                        self.model_provider.model,
-                        kv_bits=self.cli_args.kv_bits,
-                        kv_group_size=self.cli_args.kv_group_size,
-                        quantized_kv_start=self.cli_args.quantized_kv_start,
-                        cache_token_length=checkpoint_cache_token_length,
+                    expected_cache_layout = expected_cache_layout_for_rendered_candidate(
+                        token_prefix_length,
+                        kind,
                     )
                     prompt_cache, prefix_tokens, metadata = (
                         load_prompt_checkpoint_with_metadata_prefix(
                             checkpoint_path,
-                            checkpoint_namespace=DEFAULT_PROMPT_CHECKPOINT_NAMESPACE,
+                            checkpoint_namespace=(
+                                MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE
+                                if mtp_speculative
+                                else DEFAULT_PROMPT_CHECKPOINT_NAMESPACE
+                            ),
                             model=self.model_provider.model,
                             expected_glm_mla_kv_quantization=expected_quantization,
                             expected_glm_mla_kv_settings=expected_settings,
@@ -1770,14 +1812,18 @@ class ResponseGenerator:
                 continue
 
             if checkpoint_label == "exact":
-                if len(stored_prefix_tokens) <= 1:
+                if not mtp_speculative and len(stored_prefix_tokens) <= 1:
                     _prompt_checkpoint_debug(
                         "rendered candidate rejected exact too short "
                         f"file={os.path.basename(checkpoint_path)} "
                         f"prefix_tokens={len(stored_prefix_tokens)}"
                     )
                     continue
-                prefix_tokens = stored_prefix_tokens[:-1]
+                prefix_tokens = (
+                    stored_prefix_tokens
+                    if mtp_speculative
+                    else stored_prefix_tokens[:-1]
+                )
                 try:
                     decoded_prefix = self._decode_checkpoint_tokens_bytes(
                         tokenizer,
@@ -1990,6 +2036,96 @@ class ResponseGenerator:
                 "save continued failure swallowed "
                 f"file={os.path.basename(checkpoint_path)} "
                 f"prefix_length={store_length} "
+                f"error={type(exc).__name__}"
+            )
+            return False
+
+    def _save_mtp_speculative_exact_prompt_checkpoint(
+        self,
+        prompt_cache,
+        prompt_tokens,
+        *,
+        rendered_prompt=None,
+    ):
+        if not getattr(self.model_provider.cli_args, "mtp_speculative", False):
+            return False
+        if not _prompt_checkpoint_save_exact_for_prompt(
+            self.cli_args,
+            len(prompt_tokens),
+        ):
+            _prompt_checkpoint_debug(
+                "save mtp exact skipped disabled "
+                f"prefix_length={len(prompt_tokens)}"
+            )
+            return False
+
+        cache_length = prompt_cache_token_length(prompt_cache)
+        if cache_length < len(prompt_tokens):
+            _prompt_checkpoint_debug(
+                "save mtp exact skipped cache too short "
+                f"cache_length={cache_length} "
+                f"prefix_length={len(prompt_tokens)}"
+            )
+            return False
+
+        checkpoint_cache = slice_prompt_cache(
+            prompt_cache,
+            0,
+            len(prompt_tokens),
+        )
+        try:
+            checkpoint_cache = materialize_prompt_cache(checkpoint_cache)
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "save mtp exact skipped materialize failure "
+                f"prefix_length={len(prompt_tokens)} "
+                f"error={type(exc).__name__}"
+            )
+            return False
+
+        metadata = {"checkpoint_label": "exact"}
+        rendered_bytes = rendered_prompt_bytes(rendered_prompt)
+        if rendered_bytes:
+            metadata.update(prompt_checkpoint_rendered_prefix_metadata(rendered_prompt))
+            metadata[PROMPT_CHECKPOINT_PREFIX_TOKENS_METADATA_KEY] = (
+                prompt_checkpoint_prefix_tokens_metadata(prompt_tokens)
+            )
+
+        checkpoint_path = mtp_speculative_prompt_checkpoint_file(prompt_tokens)
+        try:
+            checkpoint_metadata = save_prompt_checkpoint(
+                checkpoint_path,
+                checkpoint_cache,
+                prefix_tokens=prompt_tokens,
+                checkpoint_namespace=MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
+                model=self.model_provider.model,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
+                metadata=metadata,
+            )
+            update_prompt_checkpoint_manifest(
+                checkpoint_path,
+                prefix_length=len(prompt_tokens),
+                kind="exact",
+                metadata=checkpoint_metadata,
+            )
+            prune_prompt_checkpoints(
+                protected_files=[os.path.basename(checkpoint_path)],
+                max_age_seconds=_prompt_checkpoint_max_age_seconds(self.cli_args),
+            )
+            _prompt_checkpoint_debug(
+                "save mtp exact success "
+                f"file={os.path.basename(checkpoint_path)} "
+                f"prefix_length={len(prompt_tokens)} "
+                f"rendered_metadata={int(bool(rendered_bytes))}"
+            )
+            return True
+        except Exception as exc:
+            _prompt_checkpoint_debug(
+                "save mtp exact failure swallowed "
+                f"file={os.path.basename(checkpoint_path)} "
+                f"prefix_length={len(prompt_tokens)} "
                 f"error={type(exc).__name__}"
             )
             return False
@@ -2964,12 +3100,23 @@ class ResponseGenerator:
                     prompt,
                 )
                 ram_cache_count = len(prompt) - len(ram_rest)
-                cache = ram_cache
-                rest = ram_rest
-                ctx.prompt_cache_count = ram_cache_count
-                prompt_cache_source = "mtp-speculative"
-                if ctx.prompt_cache_count > 0:
-                    prompt_cache_source = "mtp-speculative-server-cache"
+                if (
+                    rendered_checkpoint is not None
+                    and rendered_checkpoint.cached_tokens >= ram_cache_count
+                ):
+                    cache = rendered_checkpoint.prompt_cache
+                    ctx.prompt_cache_count = rendered_checkpoint.cached_tokens
+                    rest = prompt[ctx.prompt_cache_count :]
+                    prompt_cache_source = (
+                        f"disk-rendered-mtp-{rendered_checkpoint.kind}"
+                    )
+                else:
+                    cache = ram_cache
+                    rest = ram_rest
+                    ctx.prompt_cache_count = ram_cache_count
+                    prompt_cache_source = "mtp-speculative"
+                    if ctx.prompt_cache_count > 0:
+                        prompt_cache_source = "mtp-speculative-server-cache"
             else:
                 ram_cache, ram_rest = self.prompt_cache.fetch_nearest_cache(
                     self.model_provider.model_key, prompt
@@ -3223,8 +3370,10 @@ class ResponseGenerator:
                 )
 
             if mtp_speculative:
-                _prompt_checkpoint_debug(
-                    "post response disk save skipped mtp speculative"
+                self._save_mtp_speculative_exact_prompt_checkpoint(
+                    cache,
+                    prompt[:prompt_token_count],
+                    rendered_prompt=rendered_prompt,
                 )
                 cache_token_length = prompt_cache_token_length(cache)
                 insert_length = min(cache_token_length, len(cache_key))

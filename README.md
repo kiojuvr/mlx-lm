@@ -289,9 +289,13 @@ recommended OpenCode command yet. Server MTP mode disables batching and keeps
 disk prompt checkpoints separate from target-only checkpoints, but it now uses a
 dedicated `mtp-speculative` RAM prompt-cache namespace for repeated prompts. An
 exact RAM hit trims one token and prefills only that suffix token so the MTP
-layer can rebuild the hidden state it needs. Post-response disk checkpoint saves
-remain disabled for MTP; use it only for controlled decode A/B runs until the
-MTP cache can safely coexist with persistent checkpoint reuse. The server logs
+layer can rebuild the hidden state it needs. If exact checkpoint saves are
+enabled, MTP writes persistent exact checkpoints with an `mtp-speculative-...`
+filename prefix and the `glm52-local-mtp-speculative` checkpoint namespace so
+they can coexist with target-only checkpoints. Continued/delta disk saves remain
+disabled for MTP, and the recommended long-running OpenCode command still keeps
+`--checkpoint-save-exact disabled` to avoid large post-response writes. The
+server logs
 `prompt_cache_source=mtp-speculative-server-cache` on RAM hits and
 `mtp speculative complete` with `drafted_tokens`, `accepted_tokens`,
 `acceptance_rate`, `mean_accepted`, and `emitted_per_target_forward`; those
