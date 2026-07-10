@@ -301,9 +301,13 @@ server logs
 `acceptance_rate`, `mean_accepted`, and `emitted_per_target_forward`; those
 fields are the first sanity check before comparing wall-clock decode TPS.
 GLM MTP cold prefill updates the MTP hidden state and cache without projecting
-full-prompt vocabulary logits. The completion log reports
-`mtp_prefill_tokens` and `mtp_prefill_logits_skipped`; these values should match
-when the native GLM MTP prefill path is active.
+full-prompt vocabulary logits. The target path projects only the final position
+of each prefill chunk. The completion log reports `target_prefill_tokens`,
+`target_prefill_logits_skipped`, `mtp_prefill_tokens`, and
+`mtp_prefill_logits_skipped`; the skipped counts confirm that the native GLM
+prefill paths are active. Greedy requests also report
+`draft_logsumexp_skipped`, avoiding normalization work for MTP proposal logits
+that are never returned.
 
 `--checkpoint-async-save-backlog-limit 2` bounds queued post-response continued
 and delta checkpoint saves. These saves can hold large prompt-cache snapshots in

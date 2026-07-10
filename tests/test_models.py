@@ -1793,9 +1793,20 @@ class TestModels(unittest.TestCase):
 
         logits = model(inputs)
         hidden_logits, hidden = model.forward_with_hidden(inputs)
-        mx.eval(logits, hidden_logits, hidden)
+        prefill_logits, prefill_hidden = model.prefill_with_hidden(inputs)
+        mx.eval(logits, hidden_logits, hidden, prefill_logits, prefill_hidden)
 
         self.assertTrue(mx.allclose(logits, hidden_logits))
+        self.assertTrue(
+            mx.allclose(prefill_logits, hidden_logits[:, -1:, :], atol=1e-6)
+        )
+        self.assertTrue(
+            mx.array_equal(
+                mx.argmax(prefill_logits, axis=-1),
+                mx.argmax(hidden_logits[:, -1:, :], axis=-1),
+            )
+        )
+        self.assertTrue(mx.allclose(prefill_hidden, hidden))
         self.assertEqual(hidden.shape, (1, 3, 128))
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):

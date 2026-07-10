@@ -128,6 +128,7 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertIn(1, model.mtp_cache.trimmed)
         self.assertEqual(stats["rounds"], 2)
         self.assertEqual(stats["drafted_tokens"], 4)
+        self.assertEqual(stats["draft_logsumexp_skipped"], 4)
         self.assertEqual(stats["accepted_tokens"], 2)
         self.assertEqual(stats["target_forwards"], 2)
         self.assertEqual(stats["target_input_tokens"], 6)
@@ -364,6 +365,7 @@ class TestGenerateUtilities(unittest.TestCase):
             def __init__(self):
                 self.mtp = object()
                 self.layers = [object()]
+                self.target_prefill_calls = 0
                 self.mtp_prefill_calls = 0
                 self.mtp_logits_calls = 0
 
@@ -387,6 +389,11 @@ class TestGenerateUtilities(unittest.TestCase):
                 hidden = mx.ones((1, inputs.shape[1], 4))
                 return self._logits(5, inputs.shape[1]), hidden
 
+            def prefill_with_hidden(self, inputs, cache=None):
+                self.target_prefill_calls += 1
+                logits, hidden = self.forward_with_hidden(inputs, cache=cache)
+                return logits[:, -1:, :], hidden
+
             def mtp_logits(self, inputs, previous_hidden_states, cache=None):
                 self.mtp_logits_calls += 1
                 cache.offset += inputs.shape[1]
@@ -408,7 +415,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 model,
                 prompt_cache=combined_cache,
                 max_tokens=1,
-                prefill_step_size=1,
+                prefill_step_size=2,
                 kv_bits=8,
                 quantized_kv_start=0,
                 mtp_speculative_stats=stats,
@@ -420,8 +427,11 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertTrue(combined_cache[1].quantized)
         self.assertEqual(combined_cache[0].offset, 3)
         self.assertEqual(combined_cache[1].offset, 3)
-        self.assertEqual(model.mtp_prefill_calls, 3)
+        self.assertEqual(model.target_prefill_calls, 2)
+        self.assertEqual(model.mtp_prefill_calls, 2)
         self.assertEqual(model.mtp_logits_calls, 0)
+        self.assertEqual(stats["target_prefill_tokens"], 3)
+        self.assertEqual(stats["target_prefill_logits_skipped"], 1)
         self.assertEqual(stats["mtp_prefill_tokens"], 3)
         self.assertEqual(stats["mtp_prefill_logits_skipped"], 3)
 

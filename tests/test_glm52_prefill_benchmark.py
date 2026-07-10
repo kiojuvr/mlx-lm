@@ -305,6 +305,11 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "emitted_tokens": 4,
                     "emitted_per_target_forward": 4.0,
                     "catchup_forwards": 0,
+                    "target_prefill_tokens": 3,
+                    "target_prefill_logits_skipped": 2,
+                    "mtp_prefill_tokens": 3,
+                    "mtp_prefill_logits_skipped": 3,
+                    "draft_logsumexp_skipped": 2,
                 }
             )
             yield Namespace(
@@ -375,6 +380,10 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             row["mtp_speculative_emitted_per_target_forward"],
             4.0,
         )
+        self.assertEqual(row["mtp_speculative_target_prefill_tokens"], 3)
+        self.assertEqual(row["mtp_speculative_target_prefill_logits_skipped"], 2)
+        self.assertEqual(row["mtp_speculative_prefill_logits_skipped"], 3)
+        self.assertEqual(row["mtp_speculative_draft_logsumexp_skipped"], 2)
 
     def test_decode_context_mtp_candidate_rows_restore_args(self):
         args = Namespace(

@@ -1645,6 +1645,7 @@ def mtp_speculative_generate_step(
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     mtp_speculative_stats: Optional[dict] = None,
     prompt_history: Optional[mx.array] = None,
+    mtp_sampler_is_greedy: Optional[bool] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     Generate with a model's built-in GLM DSA MTP layer.
@@ -1707,7 +1708,12 @@ def mtp_speculative_generate_step(
         if not mx.array_equal(prompt_history[-prompt.size :], prompt).item():
             raise ValueError("prompt_history must end with prompt.")
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    if sampler is None:
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        if mtp_sampler_is_greedy is None:
+            mtp_sampler_is_greedy = True
+    elif mtp_sampler_is_greedy is None:
+        mtp_sampler_is_greedy = False
     use_logits_processors = bool(logits_processors)
     prompt_progress_callback = prompt_progress_callback or (lambda *_args: None)
 
@@ -1759,8 +1765,11 @@ def mtp_speculative_generate_step(
             "num_draft_tokens": int(num_draft_tokens),
             "cached_prompt_tokens": int(cached_prompt_tokens),
             "fresh_prompt_tokens": int(prompt.size),
+            "target_prefill_tokens": 0,
+            "target_prefill_logits_skipped": 0,
             "mtp_prefill_tokens": 0,
             "mtp_prefill_logits_skipped": 0,
+            "draft_logsumexp_skipped": 0,
         }
     )
 
@@ -1792,7 +1801,7 @@ def mtp_speculative_generate_step(
         tokens = tokens.astype(mx.uint32).reshape(-1)
         return mx.concatenate([base_history, tokens])
 
-    def _process_and_sample(tokens, logits):
+    def _process_and_sample(tokens, logits, *, normalize=True):
         if logits.ndim == 1:
             logits = logits[None, :]
         elif logits.ndim == 3:
@@ -1800,9 +1809,12 @@ def mtp_speculative_generate_step(
         if use_logits_processors:
             for processor in logits_processors:
                 logits = processor(tokens, logits)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        y = sampler(logprobs).astype(mx.uint32).reshape(-1)[:1]
-        return y, logprobs.squeeze(0)
+        if normalize:
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            y = sampler(logprobs).astype(mx.uint32).reshape(-1)[:1]
+            return y, logprobs.squeeze(0)
+        y = sampler(logits).astype(mx.uint32).reshape(-1)[:1]
+        return y, None
 
     def _eval_target(logits, hidden):
         mx.eval(logits, hidden, [c.state for c in target_cache])
@@ -1822,10 +1834,21 @@ def mtp_speculative_generate_step(
         while processed < prompt.size:
             n_to_process = min(step_size, prompt.size - processed)
             chunk = prompt[processed : processed + n_to_process][None]
-            target_logits, target_hidden = model.forward_with_hidden(
-                chunk,
-                cache=target_cache,
-            )
+            if callable(getattr(model, "prefill_with_hidden", None)):
+                target_logits, target_hidden = model.prefill_with_hidden(
+                    chunk,
+                    cache=target_cache,
+                )
+                stats["target_prefill_logits_skipped"] += max(
+                    n_to_process - target_logits.shape[1],
+                    0,
+                )
+            else:
+                target_logits, target_hidden = model.forward_with_hidden(
+                    chunk,
+                    cache=target_cache,
+                )
+            stats["target_prefill_tokens"] += n_to_process
             _quantize_runtime_cache(target_cache)
             if callable(getattr(model, "mtp_prefill", None)):
                 mtp_hidden, _topk = model.mtp_prefill(
@@ -1921,7 +1944,10 @@ def mtp_speculative_generate_step(
                 proposal, _proposal_logprobs = _process_and_sample(
                     draft_history,
                     mtp_logits[:, -1, :],
+                    normalize=not mtp_sampler_is_greedy,
                 )
+                if mtp_sampler_is_greedy:
+                    stats["draft_logsumexp_skipped"] += 1
                 _eval_mtp(mtp_logits, mtp_hidden)
                 mx.async_eval(proposal, mtp_hidden)
                 stats["drafted_tokens"] += 1
@@ -2266,6 +2292,7 @@ def stream_generate(
     if draft_model is None and not mtp_speculative:
         kwargs.pop("num_draft_tokens", None)
         kwargs.pop("mtp_speculative_stats", None)
+        kwargs.pop("mtp_sampler_is_greedy", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (

@@ -2537,6 +2537,14 @@ class Model(DSV32Model):
         out, hidden = self.model(inputs, cache, return_pre_norm_hidden=True)
         return self.lm_head(out), hidden
 
+    def prefill_with_hidden(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+    ):
+        out, hidden = self.model(inputs, cache, return_pre_norm_hidden=True)
+        return self.lm_head(out[:, -1:, :]), hidden
+
     def sanitize(self, weights):
         mtp_layer_start = self.args.num_hidden_layers
         mtp_enabled = _mtp_enabled()
