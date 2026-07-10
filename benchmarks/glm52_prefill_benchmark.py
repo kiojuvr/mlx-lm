@@ -1655,9 +1655,12 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
     reset_glm_dsa_profile()
     prefill_config = prefill_config_summary(args)
 
+    mtp_speculative = bool(getattr(args, "decode_context_mtp_speculative", False))
+    mtp_speculative_stats = {} if mtp_speculative else None
     checkpoint_enabled = (
         bool(getattr(args, "decode_context_use_checkpoints", False))
         and not getattr(args, "no_prompt_checkpoint", False)
+        and not mtp_speculative
     )
     request_t0 = time.perf_counter()
     first_response_seconds = None
@@ -1682,6 +1685,9 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
             quantized_kv_start=args.quantized_kv_start,
+            mtp_speculative=mtp_speculative,
+            num_draft_tokens=getattr(args, "mtp_draft_tokens", 2),
+            mtp_speculative_stats=mtp_speculative_stats,
             prompt_checkpoint=checkpoint_enabled,
             prompt_checkpoint_store_prefix_lengths=(
                 getattr(args, "checkpoint_store_prefix_lengths", None)
@@ -1742,6 +1748,42 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
         if fresh_prefill_tokens is not None and prefill_seconds
         else None
     )
+    mtp_fields = {}
+    if mtp_speculative_stats is not None:
+        mtp_fields = {
+            "mtp_draft_tokens": mtp_speculative_stats.get("num_draft_tokens"),
+            "mtp_speculative_rounds": mtp_speculative_stats.get("rounds"),
+            "mtp_speculative_target_forwards": mtp_speculative_stats.get(
+                "target_forwards"
+            ),
+            "mtp_speculative_target_input_tokens": mtp_speculative_stats.get(
+                "target_input_tokens"
+            ),
+            "mtp_speculative_drafted_tokens": mtp_speculative_stats.get(
+                "drafted_tokens"
+            ),
+            "mtp_speculative_accepted_tokens": mtp_speculative_stats.get(
+                "accepted_tokens"
+            ),
+            "mtp_speculative_acceptance_rate": mtp_speculative_stats.get(
+                "acceptance_rate"
+            ),
+            "mtp_speculative_mean_accepted": mtp_speculative_stats.get(
+                "mean_accepted"
+            ),
+            "mtp_speculative_target_tokens": mtp_speculative_stats.get(
+                "target_tokens"
+            ),
+            "mtp_speculative_emitted_tokens": mtp_speculative_stats.get(
+                "emitted_tokens"
+            ),
+            "mtp_speculative_emitted_per_target_forward": (
+                mtp_speculative_stats.get("emitted_per_target_forward")
+            ),
+            "mtp_speculative_catchup_forwards": mtp_speculative_stats.get(
+                "catchup_forwards"
+            ),
+        }
 
     return {
         "case": case_name,
@@ -1775,11 +1817,13 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
         "request_tps": (
             generated_tokens / request_seconds if request_seconds > 0 else None
         ),
+        "decode_context_mtp_speculative": mtp_speculative,
         "peak_memory_gb": response.peak_memory,
         "progress_events": None,
         "finish_reason": response.finish_reason,
         **prefill_config,
         **checkpoint,
+        **mtp_fields,
         **collect_glm_dsa_profile(args),
         **collect_glm_dsa_decode_profile(args),
     }
@@ -2541,6 +2585,7 @@ def print_table(rows, output_format):
         "request_seconds",
         "request_tps",
         "decode_context_use_checkpoints",
+        "decode_context_mtp_speculative",
         "kv_bits",
         "kv_group_size",
         "quantized_kv_start",
@@ -2573,6 +2618,10 @@ def print_table(rows, output_format):
         "mtp_speculative_accepted_tokens",
         "mtp_speculative_acceptance_rate",
         "mtp_speculative_mean_accepted",
+        "mtp_speculative_target_tokens",
+        "mtp_speculative_emitted_tokens",
+        "mtp_speculative_emitted_per_target_forward",
+        "mtp_speculative_catchup_forwards",
         "mtp_speculative_target_seconds",
         "mtp_speculative_draft_seconds",
         "checkpoint_resolution",
@@ -3297,6 +3346,15 @@ def main():
             "measurements are not mixed with disk-cache hits."
         ),
     )
+    parser.add_argument(
+        "--decode-context-mtp-speculative",
+        action="store_true",
+        help=(
+            "Use the production stream_generate GLM DSA MTP speculative path "
+            "during --mode decode-context. This requires a checkpoint with "
+            "native MTP weights and disables decode-context prompt checkpoints."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument(
         "--mtp-acceptance-steps",
@@ -3698,6 +3756,19 @@ def main():
         parser.error("--prefill-stop-after-tokens must be positive when set.")
     if args.mode == "decode-context" and args.max_tokens <= 0:
         parser.error("--max-tokens must be positive in --mode decode-context.")
+    if args.decode_context_mtp_speculative:
+        if args.mode != "decode-context":
+            parser.error(
+                "--decode-context-mtp-speculative is only valid with "
+                "--mode decode-context."
+            )
+        if args.decode_context_use_checkpoints:
+            parser.error(
+                "--decode-context-mtp-speculative cannot be combined with "
+                "--decode-context-use-checkpoints."
+            )
+        if args.mtp_draft_tokens <= 0:
+            parser.error("--mtp-draft-tokens must be positive.")
     if args.mode == "mtp-acceptance":
         if args.max_tokens <= 0 and args.mtp_acceptance_steps is None:
             parser.error(
@@ -3748,7 +3819,10 @@ def main():
 
     old_checkpoint_cache_dir = configure_checkpoint_cache_dir(args)
     old_mtp_env = os.environ.get(glm_moe_dsa.GLM_DSA_MTP_ENV)
-    if args.mode in ("mtp-acceptance", "mtp-speculative"):
+    if args.mode in ("mtp-acceptance", "mtp-speculative") or (
+        args.mode == "decode-context"
+        and getattr(args, "decode_context_mtp_speculative", False)
+    ):
         os.environ[glm_moe_dsa.GLM_DSA_MTP_ENV] = "1"
 
     try:

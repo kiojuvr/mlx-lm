@@ -240,6 +240,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             quantized_kv_start=0,
             no_prompt_checkpoint=False,
             decode_context_use_checkpoints=False,
+            decode_context_mtp_speculative=False,
+            mtp_draft_tokens=2,
             checkpoint_store_prefix_lengths=[2],
             checkpoint_save_exact="enabled",
             checkpoint_frontier_min_tokens=8192,
@@ -272,9 +274,107 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["decode_tps"], 20.0)
         self.assertAlmostEqual(row["decode_seconds"], 0.1)
         self.assertFalse(row["decode_context_use_checkpoints"])
+        self.assertFalse(row["decode_context_mtp_speculative"])
         self.assertEqual(row["checkpoint_resolution"], "disabled")
         self.assertFalse(calls[0]["prompt_checkpoint"])
+        self.assertFalse(calls[0]["mtp_speculative"])
+        self.assertIsNone(calls[0]["mtp_speculative_stats"])
         self.assertIsNone(calls[0]["prompt_checkpoint_store_prefix_lengths"])
+
+    def test_run_decode_context_can_use_stream_mtp_speculative(self):
+        old_stream_generate = benchmark.stream_generate
+        old_collect_profile = benchmark.collect_glm_dsa_profile
+        old_collect_decode_profile = benchmark.collect_glm_dsa_decode_profile
+        old_reset_profile = benchmark.reset_glm_dsa_profile
+        calls = []
+
+        def fake_stream_generate(**kwargs):
+            calls.append(kwargs)
+            stats = kwargs["mtp_speculative_stats"]
+            stats.update(
+                {
+                    "num_draft_tokens": 2,
+                    "rounds": 1,
+                    "target_forwards": 1,
+                    "target_input_tokens": 3,
+                    "drafted_tokens": 2,
+                    "accepted_tokens": 2,
+                    "acceptance_rate": 1.0,
+                    "mean_accepted": 2.0,
+                    "target_tokens": 2,
+                    "emitted_tokens": 4,
+                    "emitted_per_target_forward": 4.0,
+                    "catchup_forwards": 0,
+                }
+            )
+            yield Namespace(
+                prompt_tps=50.0,
+                generation_tokens=1,
+                generation_tps=10.0,
+                peak_memory=1.0,
+                finish_reason=None,
+            )
+            yield Namespace(
+                prompt_tps=50.0,
+                generation_tokens=4,
+                generation_tps=20.0,
+                peak_memory=1.5,
+                finish_reason="length",
+            )
+
+        args = Namespace(
+            target_tokens=3,
+            max_tokens=4,
+            prefill_step_size=4,
+            prefill_max_qk_tokens=0,
+            glm_dsa_adaptive_prefill_step_size=0,
+            glm_dsa_adaptive_prefill_after_tokens=0,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=0,
+            kv_bits=8,
+            kv_group_size=64,
+            quantized_kv_start=0,
+            no_prompt_checkpoint=False,
+            decode_context_use_checkpoints=False,
+            decode_context_mtp_speculative=True,
+            mtp_draft_tokens=2,
+            checkpoint_store_prefix_lengths=[2],
+            checkpoint_save_exact="enabled",
+            checkpoint_frontier_min_tokens=8192,
+            checkpoint_frontier_stride_tokens=16384,
+            resolved_checkpoint_cache_dir="/tmp/checkpoints",
+        )
+        benchmark.stream_generate = fake_stream_generate
+        benchmark.collect_glm_dsa_profile = lambda _args: {}
+        benchmark.collect_glm_dsa_decode_profile = lambda _args: {}
+        benchmark.reset_glm_dsa_profile = lambda: None
+        try:
+            row = benchmark.run_decode_context_once(
+                object(),
+                object(),
+                [1, 2, 3, 4],
+                args,
+                "decode-mtp-test",
+            )
+        finally:
+            benchmark.stream_generate = old_stream_generate
+            benchmark.collect_glm_dsa_profile = old_collect_profile
+            benchmark.collect_glm_dsa_decode_profile = old_collect_decode_profile
+            benchmark.reset_glm_dsa_profile = old_reset_profile
+
+        self.assertTrue(row["decode_context_mtp_speculative"])
+        self.assertFalse(row["decode_context_use_checkpoints"])
+        self.assertTrue(calls[0]["mtp_speculative"])
+        self.assertEqual(calls[0]["num_draft_tokens"], 2)
+        self.assertFalse(calls[0]["prompt_checkpoint"])
+        self.assertEqual(row["mtp_draft_tokens"], 2)
+        self.assertEqual(row["mtp_speculative_rounds"], 1)
+        self.assertEqual(row["mtp_speculative_drafted_tokens"], 2)
+        self.assertEqual(row["mtp_speculative_accepted_tokens"], 2)
+        self.assertAlmostEqual(row["mtp_speculative_acceptance_rate"], 1.0)
+        self.assertAlmostEqual(
+            row["mtp_speculative_emitted_per_target_forward"],
+            4.0,
+        )
 
     def test_run_mtp_acceptance_reports_match_rate(self):
         class DummyCache:

@@ -122,6 +122,34 @@ contributor but not the dominant cost. The next decode-side implementation
 targets are therefore a fused selected gather/dequant/attention kernel or
 MTP/speculative decode integration.
 
+Production `stream_generate` can now be measured through the decode-context
+mode with the built-in GLM DSA MTP speculative path:
+
+```bash
+python benchmarks/glm52_prefill_benchmark.py \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --mode decode-context \
+  --lengths 8192 \
+  --max-tokens 64 \
+  --prefill-step-size 8192 \
+  --prefill-max-qk-tokens 67108864 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 0 \
+  --decode-context-mtp-speculative \
+  --mtp-draft-tokens 2 \
+  --output-format csv \
+  --json-output glm52-decode-context-mtp-8k.json
+```
+
+This path is intentionally checkpoint-disabled for now, matching the server
+`--mtp-speculative` safety policy. Compare it against a checkpoint-disabled
+baseline decode-context row before interpreting decode TPS. The MTP row reports
+`decode_context_mtp_speculative=true` plus `mtp_speculative_*` fields including
+`accepted_tokens`, `acceptance_rate`, `mean_accepted`, and
+`emitted_per_target_forward`. If acceptance is low, the extra MTP draft work can
+make wall-clock decode slower even when target forwards are reduced.
+
 Two exact low-risk decode variants were tested and not adopted:
 
 - Reusing the existing selected sparse attention helper for `L == 1` decode
