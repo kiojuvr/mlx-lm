@@ -320,6 +320,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "adaptive_fallback_target_forwards": 0,
                     "adaptive_fallback_mtp_cache_forwards": 0,
                     "adaptive_fallback_mtp_logits_skipped": 0,
+                    "mtp_iteration_topk_reuses": 1,
                 }
             )
             yield Namespace(
@@ -412,6 +413,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(
             row["mtp_speculative_adaptive_fallback_mtp_cache_forwards"], 0
         )
+        self.assertEqual(row["mtp_speculative_iteration_topk_reuses"], 1)
 
     def test_decode_context_mtp_candidate_rows_restore_args(self):
         args = Namespace(

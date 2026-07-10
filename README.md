@@ -323,6 +323,11 @@ The completion log reports `adaptive_fallback`, the emitted-token position and
 acceptance rate at the transition, and subsequent target/cache forward counts.
 Set `--mtp-adaptive-fallback-min-drafted-tokens 0` to disable the guard while
 profiling raw MTP behavior.
+GLM-5.2 MTP recycles the shared-head final-norm output between draft steps and,
+when `index_share_for_mtp_iteration=true`, reuses the first draft step's DSA
+top-k indices for the rest of that verification round. This matches the GLM-DSA
+acceptance fix in [vLLM PR #45895](https://github.com/vllm-project/vllm/pull/45895);
+`mtp_iteration_topk_reuses` confirms that the indexer-saving path is active.
 
 `--checkpoint-async-save-backlog-limit 2` bounds queued post-response continued
 and delta checkpoint saves. These saves can hold large prompt-cache snapshots in

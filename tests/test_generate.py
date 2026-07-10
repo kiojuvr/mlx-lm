@@ -50,8 +50,12 @@ class TestGenerateUtilities(unittest.TestCase):
             def __init__(self):
                 self.mtp = object()
                 self.layers = [object()]
+                self.args = type(
+                    "Args", (), {"index_share_for_mtp_iteration": True}
+                )()
                 self.target_cache = [DummyCache()]
                 self.mtp_cache = DummyCache()
+                self.mtp_topk_reuses = 0
                 self.target_next = {
                     3: 5,
                     5: 7,
@@ -92,12 +96,20 @@ class TestGenerateUtilities(unittest.TestCase):
                 )
                 return logits, hidden
 
-            def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+            def mtp_logits(
+                self,
+                inputs,
+                previous_hidden_states,
+                cache=None,
+                prev_topk_indices=None,
+            ):
+                if prev_topk_indices is not None:
+                    self.mtp_topk_reuses += 1
                 last = int(inputs.reshape(-1)[-1].item())
                 token = self.mtp_next.get(last, 0)
                 logits = self._logits(token, inputs.shape[1])
                 hidden = mx.ones((1, inputs.shape[1], 4)) * token
-                return logits, hidden, None
+                return logits, hidden, mx.array([last])
 
         model = DummyModel()
         stats = {}
@@ -134,6 +146,8 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(stats["target_input_tokens"], 6)
         self.assertEqual(stats["target_greedy_verify_batches"], 2)
         self.assertEqual(stats["target_greedy_verify_tokens"], 6)
+        self.assertEqual(stats["mtp_iteration_topk_reuses"], 3)
+        self.assertEqual(model.mtp_topk_reuses, 3)
         self.assertEqual(stats["target_logsumexp_skipped"], 0)
         self.assertTrue(stats["return_logprobs"])
         self.assertEqual(stats["target_tokens"], 3)

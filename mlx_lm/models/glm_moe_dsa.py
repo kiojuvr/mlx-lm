@@ -1218,6 +1218,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             indexer_types[layer_idx] if layer_idx < len(indexer_types) else "full"
         )
         self.skip_topk = indexer_type == "shared"
+        self.share_mtp_iteration_topk = bool(
+            config.index_share_for_mtp_iteration
+            and layer_idx >= config.num_hidden_layers
+        )
         if self.skip_topk:
             self.indexer = None
 
@@ -1241,7 +1245,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         k = indexer.rope(k, offset=offset)
 
         if cache is not None:
-            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0], dtype=k.dtype))
+            k, _ = cache.update_and_fetch(
+                k, mx.zeros([b, 1, s, 0], dtype=k.dtype)
+            )
         if k.shape[2] <= indexer.index_topk:
             return None
         native_indices = self._native_indexer_topk(q, x, k, mask)
@@ -1255,6 +1261,24 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         ):
             return self._block_indexer_topk(q, x, k, mask)
         return self._dense_indexer_topk(q, x, k, mask)
+
+    def _update_indexer_k_cache(
+        self,
+        x: mx.array,
+        cache: Optional[Any] = None,
+    ):
+        indexer = self.indexer
+        b, s, _ = x.shape
+        k = indexer.wk(x)
+        k = indexer.k_norm(k)
+        k = mx.reshape(k, (b, 1, s, indexer.head_dim))
+
+        offset = cache.offset if cache is not None else 0
+        k = indexer.rope(k, offset=offset)
+
+        if cache is not None:
+            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0], dtype=k.dtype))
+        return k, offset
 
     def _dense_indexer_topk(
         self,
@@ -2219,7 +2243,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if cache is None:
             cache = [None] * 2
 
-        if self.indexer is not None:
+        if self.share_mtp_iteration_topk and prev_topk_indices is not None:
+            if cache[1] is not None:
+                _profile_stage(
+                    "dsa_indexer_cache_update",
+                    lambda: self._update_indexer_k_cache(x, cache[1]),
+                    inputs=x,
+                )
+            topk_indices = prev_topk_indices
+        elif self.indexer is not None:
             topk_indices = _profile_stage(
                 "dsa_indexer_topk",
                 lambda: self._indexer_topk(x, qr, mask, cache=cache[1]),
@@ -2534,16 +2566,16 @@ class Model(DSV32Model):
         inputs: mx.array,
         cache: Optional[Any] = None,
     ):
-        out, hidden = self.model(inputs, cache, return_pre_norm_hidden=True)
-        return self.lm_head(out), hidden
+        out = self.model(inputs, cache)
+        return self.lm_head(out), out
 
     def prefill_with_hidden(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
     ):
-        out, hidden = self.model(inputs, cache, return_pre_norm_hidden=True)
-        return self.lm_head(out[:, -1:, :]), hidden
+        out = self.model(inputs, cache)
+        return self.lm_head(out[:, -1:, :]), out
 
     def sanitize(self, weights):
         mtp_layer_start = self.args.num_hidden_layers
@@ -2620,14 +2652,14 @@ class Model(DSV32Model):
                 cache[0] if cache is not None else None,
                 return_array=True,
             )
-        hidden, logits_hidden, topk_indices = self.mtp(
+        _hidden, logits_hidden, topk_indices = self.mtp(
             inputs_embeds,
             previous_hidden_states,
             mask,
             cache,
             prev_topk_indices,
         )
-        return self.lm_head(logits_hidden), hidden, topk_indices
+        return self.lm_head(logits_hidden), logits_hidden, topk_indices
 
     def mtp_prefill(
         self,

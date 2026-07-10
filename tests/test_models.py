@@ -385,6 +385,7 @@ class TestModels(unittest.TestCase):
         kv_lora_rank=64,
         num_hidden_layers=2,
         num_nextn_predict_layers=0,
+        index_share_for_mtp_iteration=False,
     ):
         from mlx_lm.models import glm_moe_dsa
 
@@ -422,6 +423,7 @@ class TestModels(unittest.TestCase):
             attention_bias=False,
             index_topk_pattern=index_topk_pattern,
             num_nextn_predict_layers=num_nextn_predict_layers,
+            index_share_for_mtp_iteration=index_share_for_mtp_iteration,
         )
         return glm_moe_dsa.Model(args)
 
@@ -1768,7 +1770,7 @@ class TestModels(unittest.TestCase):
         self.assertEqual(len(model.layers), 2)
         self.assertFalse(model.mtp.layer.self_attn.skip_topk)
 
-    def test_glm_moe_dsa_mtp_prefill_matches_logits_hidden(self):
+    def test_glm_moe_dsa_mtp_recycles_post_norm_hidden(self):
         from mlx_lm.models import glm_moe_dsa
 
         env_key = glm_moe_dsa.GLM_DSA_MTP_ENV
@@ -1781,20 +1783,78 @@ class TestModels(unittest.TestCase):
 
         inputs = mx.array([[1, 2, 3]])
         previous_hidden = mx.ones((1, 3, 128))
-        _logits, logits_hidden, _topk = model.mtp_logits(inputs, previous_hidden)
+        _logits, recycled_hidden, _topk = model.mtp_logits(
+            inputs,
+            previous_hidden,
+        )
         prefill_hidden, _topk = model.mtp_prefill(inputs, previous_hidden)
-        mx.eval(logits_hidden, prefill_hidden)
+        post_norm_hidden = model.mtp.shared_head(prefill_hidden)
+        mx.eval(post_norm_hidden, recycled_hidden, prefill_hidden)
 
-        self.assertTrue(mx.allclose(logits_hidden, prefill_hidden))
+        self.assertTrue(mx.allclose(recycled_hidden, post_norm_hidden))
+
+    def test_glm_moe_dsa_mtp_reuses_iteration_topk(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_key = glm_moe_dsa.GLM_DSA_MTP_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "1"
+            model = self._make_glm_moe_dsa_model(
+                num_nextn_predict_layers=1,
+                index_share_for_mtp_iteration=True,
+            )
+        finally:
+            self._restore_env(saved_env)
+
+        mtp_cache = model.make_mtp_cache()
+        prompt = mx.array([[1, 2, 3, 4]])
+        model.mtp_prefill(prompt, mx.ones((1, 4, 128)), cache=mtp_cache)
+        attention = model.mtp.layer.self_attn
+        original_indexer_topk = attention._indexer_topk
+        indexer_calls = 0
+
+        def counted_indexer_topk(*args, **kwargs):
+            nonlocal indexer_calls
+            indexer_calls += 1
+            return original_indexer_topk(*args, **kwargs)
+
+        attention._indexer_topk = counted_indexer_topk
+        _logits, hidden, topk_indices = model.mtp_logits(
+            mx.array([[5]]),
+            mx.ones((1, 1, 128)),
+            cache=mtp_cache,
+        )
+        model.mtp_logits(
+            mx.array([[6]]),
+            hidden,
+            cache=mtp_cache,
+            prev_topk_indices=topk_indices,
+        )
+        mx.eval([cache.state for cache in mtp_cache])
+
+        self.assertEqual(indexer_calls, 1)
+        self.assertEqual(mtp_cache[1].offset, 6)
 
     def test_glm_moe_dsa_forward_with_hidden_matches_logits(self):
         model = self._make_glm_moe_dsa_model()
         inputs = mx.array([[1, 2, 3]])
 
         logits = model(inputs)
+        post_norm_hidden, pre_norm_hidden = model.model(
+            inputs, return_pre_norm_hidden=True
+        )
         hidden_logits, hidden = model.forward_with_hidden(inputs)
         prefill_logits, prefill_hidden = model.prefill_with_hidden(inputs)
-        mx.eval(logits, hidden_logits, hidden, prefill_logits, prefill_hidden)
+        mx.eval(
+            logits,
+            post_norm_hidden,
+            pre_norm_hidden,
+            hidden_logits,
+            hidden,
+            prefill_logits,
+            prefill_hidden,
+        )
 
         self.assertTrue(mx.allclose(logits, hidden_logits))
         self.assertTrue(
@@ -1807,6 +1867,8 @@ class TestModels(unittest.TestCase):
             )
         )
         self.assertTrue(mx.allclose(prefill_hidden, hidden))
+        self.assertTrue(mx.allclose(hidden, post_norm_hidden))
+        self.assertFalse(mx.allclose(hidden, pre_norm_hidden))
         self.assertEqual(hidden.shape, (1, 3, 128))
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):

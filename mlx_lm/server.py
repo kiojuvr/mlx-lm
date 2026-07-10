@@ -3370,7 +3370,8 @@ class ResponseGenerator:
                     "adaptive_fallback_acceptance_rate=%s "
                     "adaptive_fallback_target_forwards=%s "
                     "adaptive_fallback_mtp_cache_forwards=%s "
-                    "adaptive_fallback_mtp_logits_skipped=%s",
+                    "adaptive_fallback_mtp_logits_skipped=%s "
+                    "mtp_iteration_topk_reuses=%s",
                     mtp_speculative_stats.get("rounds", 0),
                     mtp_speculative_stats.get("drafted_tokens", 0),
                     mtp_speculative_stats.get("accepted_tokens", 0),
@@ -3416,6 +3417,7 @@ class ResponseGenerator:
                     mtp_speculative_stats.get(
                         "adaptive_fallback_mtp_logits_skipped", 0
                     ),
+                    mtp_speculative_stats.get("mtp_iteration_topk_reuses", 0),
                 )
             decode_profile_after = _glm_dsa_decode_profile_snapshot()
             decode_profile_fields = _glm_dsa_decode_profile_fields(

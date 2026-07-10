@@ -1826,6 +1826,7 @@ def mtp_speculative_generate_step(
             "adaptive_fallback_target_forwards": 0,
             "adaptive_fallback_mtp_cache_forwards": 0,
             "adaptive_fallback_mtp_logits_skipped": 0,
+            "mtp_iteration_topk_reuses": 0,
         }
     )
 
@@ -2062,14 +2063,33 @@ def mtp_speculative_generate_step(
         draft_input = current
         draft_hidden = previous_hidden
         draft_history = history
+        iteration_topk_indices = None
+        share_iteration_topk = bool(
+            getattr(
+                getattr(model, "args", None),
+                "index_share_for_mtp_iteration",
+                False,
+            )
+        )
         stats["rounds"] += 1
         with mx.stream(generation_stream):
-            for _ in range(num_draft):
-                mtp_logits, mtp_hidden, _topk = model.mtp_logits(
+            for draft_index in range(num_draft):
+                mtp_kwargs = {}
+                if (
+                    share_iteration_topk
+                    and draft_index > 0
+                    and iteration_topk_indices is not None
+                ):
+                    mtp_kwargs["prev_topk_indices"] = iteration_topk_indices
+                    stats["mtp_iteration_topk_reuses"] += 1
+                mtp_logits, mtp_hidden, current_topk_indices = model.mtp_logits(
                     draft_input[None],
                     draft_hidden,
                     cache=mtp_cache_holder[0],
+                    **mtp_kwargs,
                 )
+                if draft_index == 0:
+                    iteration_topk_indices = current_topk_indices
                 _quantize_runtime_cache(mtp_cache_holder)
                 proposal, _proposal_logprobs = _process_and_sample(
                     draft_history,
@@ -2182,10 +2202,15 @@ def mtp_speculative_generate_step(
         if accepted == num_draft:
             catch_prev_hidden = hidden[:, num_draft - 1 : num_draft, :]
             with mx.stream(generation_stream):
+                catchup_kwargs = {}
+                if share_iteration_topk and iteration_topk_indices is not None:
+                    catchup_kwargs["prev_topk_indices"] = iteration_topk_indices
+                    stats["mtp_iteration_topk_reuses"] += 1
                 catch_logits, catch_hidden, _topk = model.mtp_logits(
                     draft_tokens[-1][None],
                     catch_prev_hidden,
                     cache=mtp_cache_holder[0],
+                    **catchup_kwargs,
                 )
                 _quantize_runtime_cache(mtp_cache_holder)
                 _eval_mtp(catch_logits, catch_hidden)

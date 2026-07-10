@@ -174,6 +174,10 @@ Benchmark rows expose
 `mtp_speculative_adaptive_fallback*`; set
 `--mtp-adaptive-fallback-min-drafted-tokens 0` for an unguarded draft-depth
 sweep.
+The GLM-5.2 path also recycles post-final-norm hidden states between MTP draft
+steps and honors `index_share_for_mtp_iteration` by reusing the first step's DSA
+top-k indices within a round. Rows report
+`mtp_speculative_iteration_topk_reuses` for this path.
 
 To sweep baseline and multiple MTP draft depths in one run, use
 `--decode-context-mtp-draft-token-candidates`. Candidate `0` is the non-MTP
@@ -190,7 +194,7 @@ python benchmarks/glm52_prefill_benchmark.py \
   --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 0 \
-  --decode-context-mtp-draft-token-candidates 0,1,2,4 \
+  --decode-context-mtp-draft-token-candidates 0,1,2,4,5 \
   --output-format csv \
   --json-output glm52-decode-context-mtp-sweep-8k.json
 ```
