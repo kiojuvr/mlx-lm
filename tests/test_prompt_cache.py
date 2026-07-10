@@ -50,10 +50,12 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     expected_glm_mla_kv_quantization_metadata,
     expected_glm_mla_kv_settings_metadata,
+    expected_mtp_speculative_glm_mla_kv_quantization_metadata,
+    expected_mtp_speculative_prompt_cache_layout_signature,
     expected_prompt_cache_layout_signature,
+    ensure_glm52_local_cache_dirs,
     find_prompt_checkpoint_prefix,
     find_prompt_checkpoint_rendered_prefix,
-    ensure_glm52_local_cache_dirs,
     get_prompt_checkpoint_manager,
     glm52_kv_cache_dir,
     glm52_local_cache_root,
@@ -62,6 +64,8 @@ from mlx_lm.models.cache import (
     load_prompt_checkpoint_manifest,
     load_prompt_checkpoint_with_metadata_prefix,
     load_prompt_cache,
+    make_mtp_speculative_cache_pair,
+    make_mtp_speculative_prompt_cache,
     make_prompt_cache,
     materialize_prompt_cache,
     prompt_checkpoint_budget_from_env,
@@ -317,6 +321,18 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
             c.update_and_fetch(x, x)
         return cache
 
+    def _filled_glm_mla_cache(self, length=4, head_dim=32, dtype=mx.float32):
+        cache = GlmMlaKVCache()
+        x = mx.random.uniform(shape=(1, 1, length, head_dim)).astype(dtype)
+        cache.update_and_fetch(x, x)
+        return cache
+
+    def _filled_glm_mla_cache_list(self, length=4):
+        return CacheList(
+            self._filled_glm_mla_cache(length=length),
+            self._filled_kv_cache(shape=(1, 1, length, 8))[0],
+        )
+
     def test_glm52_local_cache_paths(self):
         self._set_home_to_test_dir()
         self._clear_env(PROMPT_CHECKPOINT_CACHE_DIR_ENV)
@@ -478,6 +494,154 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         self.assertEqual(int8_layout[0]["class"], "QuantizedKVCache")
         self.assertEqual(int8_layout[0]["group_size"], 32)
         self.assertEqual(int8_layout[0]["bits"], 8)
+
+    def test_mtp_speculative_cache_layout_includes_mtp_cache(self):
+        class ToyMTPModel:
+            def make_cache(self):
+                return [CacheList(GlmMlaKVCache(), KVCache())]
+
+            def make_mtp_cache(self):
+                return CacheList(GlmMlaKVCache(), KVCache())
+
+        model = ToyMTPModel()
+        target_cache, mtp_cache = make_mtp_speculative_cache_pair(model)
+        combined_cache = make_mtp_speculative_prompt_cache(model)
+        target_layout = expected_prompt_cache_layout_signature(
+            model,
+            cache_token_length=4,
+        )
+        mtp_layout = expected_mtp_speculative_prompt_cache_layout_signature(
+            model,
+            cache_token_length=4,
+        )
+
+        self.assertEqual(len(target_cache), 1)
+        self.assertEqual(len(mtp_cache), 1)
+        self.assertEqual(len(combined_cache), 2)
+        self.assertNotEqual(target_layout, mtp_layout)
+        self.assertEqual([entry["class"] for entry in mtp_layout], ["CacheList"] * 2)
+        self.assertEqual(
+            [entry["class"] for entry in mtp_layout[-1]["caches"]],
+            ["GlmMlaKVCache", "KVCache"],
+        )
+
+    def test_mtp_speculative_layout_tracks_quantized_mla_cache(self):
+        class ToyMTPModel:
+            def make_cache(self):
+                return [CacheList(GlmMlaKVCache(), KVCache())]
+
+            def make_mtp_cache(self):
+                return CacheList(GlmMlaKVCache(), KVCache())
+
+        model = ToyMTPModel()
+        fp_layout = expected_mtp_speculative_prompt_cache_layout_signature(
+            model,
+            kv_bits=8,
+            kv_group_size=32,
+            quantized_kv_start=4,
+            cache_token_length=3,
+        )
+        int8_layout = expected_mtp_speculative_prompt_cache_layout_signature(
+            model,
+            kv_bits=8,
+            kv_group_size=32,
+            quantized_kv_start=4,
+            cache_token_length=4,
+        )
+        expected_quantization = (
+            expected_mtp_speculative_glm_mla_kv_quantization_metadata(
+                model,
+                cache_token_length=4,
+                kv_bits=8,
+                kv_group_size=32,
+                quantized_kv_start=4,
+            )
+        )
+
+        self.assertEqual(fp_layout[0]["caches"][0]["class"], "GlmMlaKVCache")
+        self.assertEqual(
+            int8_layout[0]["caches"][0]["class"],
+            "QuantizedGlmMlaKVCache",
+        )
+        self.assertEqual(
+            int8_layout[-1]["caches"][0]["class"],
+            "QuantizedGlmMlaKVCache",
+        )
+        self.assertEqual(int8_layout[-1]["caches"][0]["group_size"], 32)
+        self.assertEqual(expected_quantization["glm_mla_latent_fp_layers"], 0)
+        self.assertEqual(expected_quantization["glm_mla_latent_int8_layers"], 2)
+        self.assertEqual(
+            expected_quantization["glm_mla_latent_int8_group_sizes"],
+            [32],
+        )
+
+    def test_checkpoint_rejects_target_only_when_mtp_layout_expected(self):
+        class ToyMTPModel:
+            def make_cache(self):
+                return [KVCache()]
+
+            def make_mtp_cache(self):
+                return CacheList(GlmMlaKVCache())
+
+        prefix_tokens = [1, 2, 3, 4]
+        cache = self._filled_kv_cache(shape=(1, 2, 4, 8))[:1]
+        cache_file = os.path.join(self.test_dir, "target_only_checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="toy-mtp-model",
+            prefix_tokens=prefix_tokens,
+        )
+        expected_layout = expected_mtp_speculative_prompt_cache_layout_signature(
+            ToyMTPModel(),
+            cache_token_length=len(prefix_tokens),
+        )
+
+        with self.assertRaisesRegex(PromptCacheCheckpointError, "layout"):
+            load_prompt_checkpoint(
+                cache_file,
+                model_id="toy-mtp-model",
+                prefix_tokens=prefix_tokens,
+                expected_cache_layout=expected_layout,
+            )
+
+    def test_mtp_speculative_checkpoint_round_trip_uses_combined_layout(self):
+        class ToyMTPModel:
+            def make_cache(self):
+                return [CacheList(GlmMlaKVCache(), KVCache())]
+
+            def make_mtp_cache(self):
+                return CacheList(GlmMlaKVCache(), KVCache())
+
+        prefix_tokens = [1, 2, 3, 4]
+        combined_cache = [
+            self._filled_glm_mla_cache_list(length=len(prefix_tokens)),
+            self._filled_glm_mla_cache_list(length=len(prefix_tokens)),
+        ]
+        expected_layout = expected_mtp_speculative_prompt_cache_layout_signature(
+            ToyMTPModel(),
+            cache_token_length=len(prefix_tokens),
+        )
+        cache_file = os.path.join(self.test_dir, "mtp_checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            combined_cache,
+            model_id="toy-mtp-model",
+            prefix_tokens=prefix_tokens,
+        )
+
+        loaded_cache = load_prompt_checkpoint(
+            cache_file,
+            model_id="toy-mtp-model",
+            prefix_tokens=prefix_tokens,
+            expected_cache_layout=expected_layout,
+        )
+
+        self.assertEqual(prompt_cache_token_length(loaded_cache), len(prefix_tokens))
+        self.assertEqual(
+            prompt_cache_layout_signature(loaded_cache),
+            expected_layout,
+        )
 
     def test_lcp_checkpoint_manager_filters_cache_layout_mismatch(self):
         self._set_home_to_test_dir()

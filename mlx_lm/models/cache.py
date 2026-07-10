@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -161,6 +161,45 @@ def make_prompt_cache(
         ]
     else:
         return [KVCache() for _ in range(num_layers)]
+
+
+def make_mtp_speculative_cache_pair(
+    model: nn.Module,
+    max_kv_size: Optional[int] = None,
+) -> Tuple[List[Any], List[Any]]:
+    """
+    Construct the target and MTP cache lists used by GLM DSA speculation.
+
+    The normal prompt cache contains target model layers only. Native GLM MTP
+    speculation also needs the model's MTP-layer cache, so checkpoint layout
+    checks must include both pieces to avoid reusing target-only checkpoints.
+    """
+    if max_kv_size is None:
+        prompt_cache = make_prompt_cache(model)
+    else:
+        prompt_cache = make_prompt_cache(model, max_kv_size=max_kv_size)
+    if not hasattr(model, "make_mtp_cache"):
+        raise AttributeError("model does not support MTP cache construction")
+    mtp_cache = model.make_mtp_cache()
+    if isinstance(mtp_cache, (list, tuple)):
+        if not mtp_cache:
+            raise AttributeError("model did not create an MTP cache")
+        return prompt_cache, list(mtp_cache)
+    if mtp_cache is None:
+        raise AttributeError("model did not create an MTP cache")
+    return prompt_cache, [mtp_cache]
+
+
+def make_mtp_speculative_prompt_cache(
+    model: nn.Module,
+    max_kv_size: Optional[int] = None,
+) -> List[Any]:
+    """Construct a combined target+MTP prompt cache compatibility bundle."""
+    prompt_cache, mtp_cache = make_mtp_speculative_cache_pair(
+        model,
+        max_kv_size=max_kv_size,
+    )
+    return prompt_cache + mtp_cache
 
 
 def save_prompt_cache(
@@ -1685,6 +1724,32 @@ def prompt_cache_layout_signature(cache: List[Any]):
     return [_single_cache_layout_signature(c) for c in cache]
 
 
+def _apply_expected_prompt_cache_quantization(
+    expected_cache: List[Any],
+    *,
+    kv_bits: Optional[int],
+    kv_group_size: int,
+    quantized_kv_start: int,
+    cache_token_length: Optional[int],
+):
+    if (
+        kv_bits is not None
+        and cache_token_length is not None
+        and cache_token_length >= quantized_kv_start
+    ):
+        for idx, cache_entry in enumerate(expected_cache):
+            if not hasattr(cache_entry, "to_quantized"):
+                continue
+            try:
+                expected_cache[idx] = cache_entry.to_quantized(
+                    group_size=kv_group_size,
+                    bits=kv_bits,
+                )
+            except NotImplementedError:
+                pass
+    return expected_cache
+
+
 def expected_prompt_cache_layout_signature(
     model: Optional[nn.Module],
     *,
@@ -1704,21 +1769,45 @@ def expected_prompt_cache_layout_signature(
         expected_cache = make_prompt_cache(model, max_kv_size=max_kv_size)
     except AttributeError:
         return None
-    if (
-        kv_bits is not None
-        and cache_token_length is not None
-        and cache_token_length >= quantized_kv_start
-    ):
-        for idx, cache_entry in enumerate(expected_cache):
-            if not hasattr(cache_entry, "to_quantized"):
-                continue
-            try:
-                expected_cache[idx] = cache_entry.to_quantized(
-                    group_size=kv_group_size,
-                    bits=kv_bits,
-                )
-            except NotImplementedError:
-                pass
+    _apply_expected_prompt_cache_quantization(
+        expected_cache,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+        cache_token_length=cache_token_length,
+    )
+    return prompt_cache_layout_signature(expected_cache)
+
+
+def expected_mtp_speculative_prompt_cache_layout_signature(
+    model: Optional[nn.Module],
+    *,
+    max_kv_size: Optional[int] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    cache_token_length: Optional[int] = None,
+    prompt_cache: Optional[List[Any]] = None,
+):
+    if prompt_cache is not None:
+        return prompt_cache_layout_signature(prompt_cache)
+    if model is None:
+        return None
+
+    try:
+        expected_cache = make_mtp_speculative_prompt_cache(
+            model,
+            max_kv_size=max_kv_size,
+        )
+    except AttributeError:
+        return None
+    _apply_expected_prompt_cache_quantization(
+        expected_cache,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+        cache_token_length=cache_token_length,
+    )
     return prompt_cache_layout_signature(expected_cache)
 
 
@@ -1777,6 +1866,36 @@ def expected_glm_mla_kv_quantization_metadata(
         "glm_mla_latent_int8_group_sizes": [],
         "glm_mla_latent_int8_bits": [],
     }
+
+
+def expected_mtp_speculative_glm_mla_kv_quantization_metadata(
+    model: Optional[nn.Module],
+    *,
+    cache_token_length: int,
+    kv_bits: Optional[int],
+    kv_group_size: int,
+    quantized_kv_start: int,
+):
+    if model is None:
+        return None
+    try:
+        expected_cache = make_mtp_speculative_prompt_cache(model)
+    except AttributeError:
+        return None
+    _apply_expected_prompt_cache_quantization(
+        expected_cache,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+        cache_token_length=cache_token_length,
+    )
+    metadata = glm_mla_kv_quantization_metadata(expected_cache)
+    if (
+        metadata["glm_mla_latent_fp_layers"] == 0
+        and metadata["glm_mla_latent_int8_layers"] == 0
+    ):
+        return None
+    return metadata
 
 
 def model_has_glm_mla_kv_cache(model: Optional[nn.Module]):

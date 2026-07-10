@@ -1679,8 +1679,7 @@ def mtp_speculative_generate_step(
     history = prompt if use_logits_processors else None
     prompt_progress_callback = prompt_progress_callback or (lambda *_args: None)
 
-    target_cache = cache.make_prompt_cache(model)
-    mtp_cache_holder = [model.make_mtp_cache()]
+    target_cache, mtp_cache_holder = cache.make_mtp_speculative_cache_pair(model)
     if not cache.can_trim_prompt_cache(target_cache):
         types = {type(c).__name__ for c in target_cache if not c.is_trimmable()}
         raise ValueError(
