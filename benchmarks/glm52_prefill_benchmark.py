@@ -1851,6 +1851,11 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             "mtp_speculative_adaptive_fallback_mtp_logits_skipped": (
                 mtp_speculative_stats.get("adaptive_fallback_mtp_logits_skipped")
             ),
+            "mtp_speculative_adaptive_fallback_mtp_cache_abandoned_tokens": (
+                mtp_speculative_stats.get(
+                    "adaptive_fallback_mtp_cache_abandoned_tokens"
+                )
+            ),
             "mtp_speculative_iteration_topk_reuses": mtp_speculative_stats.get(
                 "mtp_iteration_topk_reuses"
             ),
@@ -2716,6 +2721,7 @@ def print_table(rows, output_format):
         "mtp_speculative_adaptive_fallback_target_forwards",
         "mtp_speculative_adaptive_fallback_mtp_cache_forwards",
         "mtp_speculative_adaptive_fallback_mtp_logits_skipped",
+        "mtp_speculative_adaptive_fallback_mtp_cache_abandoned_tokens",
         "mtp_speculative_iteration_topk_reuses",
         "mtp_speculative_target_seconds",
         "mtp_speculative_draft_seconds",

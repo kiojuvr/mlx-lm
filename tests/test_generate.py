@@ -463,18 +463,25 @@ class TestGenerateUtilities(unittest.TestCase):
             [2, 3, 4, 5, 6],
         )
         self.assertEqual(model.mtp_calls, 2)
-        self.assertEqual(model.mtp_prefill_calls, 4)
+        self.assertEqual(model.mtp_prefill_calls, 1)
         self.assertTrue(stats["adaptive_fallback"])
         self.assertEqual(stats["adaptive_fallback_at_emitted_tokens"], 2)
         self.assertEqual(stats["adaptive_fallback_acceptance_rate"], 0.0)
         self.assertEqual(stats["adaptive_fallback_target_forwards"], 3)
-        self.assertEqual(stats["adaptive_fallback_mtp_cache_forwards"], 3)
-        self.assertEqual(stats["adaptive_fallback_mtp_logits_skipped"], 3)
+        self.assertEqual(stats["adaptive_fallback_mtp_cache_forwards"], 0)
+        self.assertEqual(stats["adaptive_fallback_mtp_logits_skipped"], 0)
+        self.assertEqual(stats["adaptive_fallback_mtp_cache_abandoned_tokens"], 3)
         self.assertEqual(stats["rounds"], 1)
         self.assertEqual(stats["drafted_tokens"], 2)
         self.assertEqual(stats["accepted_tokens"], 0)
         self.assertEqual(model.target_cache[0].offset, 5)
-        self.assertEqual(model.mtp_cache.offset, 5)
+        self.assertEqual(model.mtp_cache.offset, 2)
+        self.assertEqual(
+            generate_module.cache.prompt_cache_token_length(
+                model.target_cache + [model.mtp_cache]
+            ),
+            2,
+        )
 
     def test_mtp_speculative_generate_step_uses_combined_prompt_cache(self):
         class DummyCache:

@@ -3374,6 +3374,7 @@ class ResponseGenerator:
                     "adaptive_fallback_target_forwards=%s "
                     "adaptive_fallback_mtp_cache_forwards=%s "
                     "adaptive_fallback_mtp_logits_skipped=%s "
+                    "adaptive_fallback_mtp_cache_abandoned_tokens=%s "
                     "mtp_iteration_topk_reuses=%s",
                     mtp_speculative_stats.get("rounds", 0),
                     mtp_speculative_stats.get("drafted_tokens", 0),
@@ -3424,6 +3425,9 @@ class ResponseGenerator:
                     ),
                     mtp_speculative_stats.get(
                         "adaptive_fallback_mtp_logits_skipped", 0
+                    ),
+                    mtp_speculative_stats.get(
+                        "adaptive_fallback_mtp_cache_abandoned_tokens", 0
                     ),
                     mtp_speculative_stats.get("mtp_iteration_topk_reuses", 0),
                 )

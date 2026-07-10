@@ -1827,6 +1827,7 @@ def mtp_speculative_generate_step(
             "adaptive_fallback_target_forwards": 0,
             "adaptive_fallback_mtp_cache_forwards": 0,
             "adaptive_fallback_mtp_logits_skipped": 0,
+            "adaptive_fallback_mtp_cache_abandoned_tokens": 0,
             "mtp_iteration_topk_reuses": 0,
         }
     )
@@ -2073,27 +2074,6 @@ def mtp_speculative_generate_step(
         )
         if num_draft == 0:
             with mx.stream(generation_stream):
-                fallback_mtp_logits = None
-                fallback_mtp_hidden = None
-                if adaptive_fallback:
-                    if callable(getattr(model, "mtp_prefill", None)):
-                        fallback_mtp_hidden, _topk = model.mtp_prefill(
-                            current[None],
-                            previous_hidden,
-                            cache=mtp_cache_holder[0],
-                        )
-                        stats["adaptive_fallback_mtp_logits_skipped"] += 1
-                    else:
-                        (
-                            fallback_mtp_logits,
-                            fallback_mtp_hidden,
-                            _topk,
-                        ) = model.mtp_logits(
-                            current[None],
-                            previous_hidden,
-                            cache=mtp_cache_holder[0],
-                        )
-                    _quantize_runtime_cache(mtp_cache_holder)
                 logits, hidden = model.forward_with_hidden(
                     current[None],
                     cache=target_cache,
@@ -2108,11 +2088,6 @@ def mtp_speculative_generate_step(
                     stats["target_logsumexp_skipped"] += 1
                 next_hidden = hidden[:, -1:, :]
                 _eval_target(logits, hidden)
-                if fallback_mtp_hidden is not None:
-                    if fallback_mtp_logits is None:
-                        _eval_mtp_prefill(fallback_mtp_hidden)
-                    else:
-                        _eval_mtp(fallback_mtp_logits, fallback_mtp_hidden)
                 mx.async_eval(
                     *(
                         (next_token, next_hidden)
@@ -2124,7 +2099,7 @@ def mtp_speculative_generate_step(
             stats["target_input_tokens"] += 1
             if adaptive_fallback:
                 stats["adaptive_fallback_target_forwards"] += 1
-                stats["adaptive_fallback_mtp_cache_forwards"] += 1
+                stats["adaptive_fallback_mtp_cache_abandoned_tokens"] += 1
             mx.eval(next_token)
             current = next_token
             previous_hidden = next_hidden
