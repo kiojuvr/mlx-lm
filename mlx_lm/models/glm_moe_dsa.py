@@ -2427,6 +2427,7 @@ class GlmMoeDsaModel(DeepseekV32Model):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
+        return_pre_norm_hidden: bool = False,
     ) -> mx.array:
         profile_token = _set_profile_scope("decode" if x.shape[1] == 1 else None)
         profile_decode_total = profile_token is not None
@@ -2462,6 +2463,7 @@ class GlmMoeDsaModel(DeepseekV32Model):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
+        pre_norm_h = h
         h = self.norm(h)
         if profile_decode_total:
             _eval_profile_value(h)
@@ -2469,6 +2471,8 @@ class GlmMoeDsaModel(DeepseekV32Model):
                 "total_decode_model", time.perf_counter() - total_start
             )
             _GLM_DSA_PROFILE_SCOPE.reset(profile_token)
+        if return_pre_norm_hidden:
+            return h, pre_norm_h
         return h
 
 
@@ -2498,6 +2502,14 @@ class GlmMoeDsaMTPPredictor(nn.Module):
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
     ):
+        offset = cache[0].offset if cache is not None and cache[0] is not None else 0
+        if offset == 0 and inputs_embeds.shape[1] > 0:
+            positions = mx.arange(inputs_embeds.shape[1]).reshape(1, -1, 1)
+            inputs_embeds = mx.where(
+                positions == 0,
+                mx.zeros_like(inputs_embeds),
+                inputs_embeds,
+            )
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
         hidden = self.eh_proj(
@@ -2514,6 +2526,14 @@ class Model(DSV32Model):
         self.mtp = None
         if _mtp_enabled() and config.num_nextn_predict_layers > 0:
             self.mtp = GlmMoeDsaMTPPredictor(config)
+
+    def forward_with_hidden(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+    ):
+        out, hidden = self.model(inputs, cache, return_pre_norm_hidden=True)
+        return self.lm_head(out), hidden
 
     def sanitize(self, weights):
         mtp_layer_start = self.args.num_hidden_layers

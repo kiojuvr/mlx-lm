@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mlx_lm.generate import PROMPT_CHECKPOINT_DEBUG_ENV, BatchGenerator, BatchStats
 from mlx_lm.generate import DEFAULT_PREFILL_MAX_QK_TOKENS
+from mlx_lm.generate import maybe_quantize_kv_cache
 from mlx_lm.generate import stream_generate
 from mlx_lm.models import cache as prompt_cache
 from mlx_lm.models import glm_moe_dsa
@@ -1784,6 +1785,173 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
     }
 
 
+def _argmax_token(logits):
+    return mx.argmax(logits, axis=-1).astype(mx.uint32)
+
+
+def _token_item(token):
+    return int(token.reshape(-1)[0].item())
+
+
+def run_mtp_acceptance_once(model, tokenizer, prompt, args, case_name):
+    if getattr(model, "mtp", None) is None:
+        raise RuntimeError(
+            "MTP acceptance probe requires MLX_LM_GLM_DSA_MTP=1 at model load time"
+        )
+    if not hasattr(model, "forward_with_hidden"):
+        raise RuntimeError("MTP acceptance probe requires model.forward_with_hidden")
+
+    tokenize_t0 = time.perf_counter()
+    tokens = prompt_to_tokens(tokenizer, prompt)
+    if args.target_tokens is not None:
+        tokens = tokens[: args.target_tokens]
+    tokenize_seconds = time.perf_counter() - tokenize_t0
+    if len(tokens) == 0:
+        raise RuntimeError(f"{case_name}: MTP acceptance probe needs a prompt")
+
+    probe_steps = getattr(args, "mtp_acceptance_steps", None) or args.max_tokens
+    probe_steps = int(probe_steps)
+    if probe_steps <= 0:
+        raise RuntimeError("--mtp-acceptance-steps or --max-tokens must be positive")
+
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    mx.clear_cache()
+    mx.synchronize()
+    reset_glm_dsa_profile()
+    prefill_config = prefill_config_summary(args)
+
+    token_array = mx.array(tokens, dtype=mx.uint32).reshape(1, -1)
+    target_cache = prompt_cache.make_prompt_cache(model)
+    mtp_cache_holder = [model.make_mtp_cache()]
+    mtp_cache = mtp_cache_holder[0]
+
+    prefill_t0 = time.perf_counter()
+    target_logits, target_hidden = model.forward_with_hidden(
+        token_array,
+        cache=target_cache,
+    )
+    maybe_quantize_kv_cache(
+        target_cache,
+        getattr(args, "quantized_kv_start", 0),
+        getattr(args, "kv_group_size", 64),
+        getattr(args, "kv_bits", None),
+    )
+    maybe_quantize_kv_cache(
+        mtp_cache_holder,
+        getattr(args, "quantized_kv_start", 0),
+        getattr(args, "kv_group_size", 64),
+        getattr(args, "kv_bits", None),
+    )
+    mtp_cache = mtp_cache_holder[0]
+    mx.eval(target_logits, target_hidden, [c.state for c in target_cache])
+    target_prefill_seconds = time.perf_counter() - prefill_t0
+
+    mtp_prefill_t0 = time.perf_counter()
+    _mtp_logits, mtp_hidden, _topk = model.mtp_logits(
+        token_array,
+        target_hidden,
+        cache=mtp_cache,
+    )
+    maybe_quantize_kv_cache(
+        mtp_cache_holder,
+        getattr(args, "quantized_kv_start", 0),
+        getattr(args, "kv_group_size", 64),
+        getattr(args, "kv_bits", None),
+    )
+    mtp_cache = mtp_cache_holder[0]
+    mx.eval(_mtp_logits, mtp_hidden, mtp_cache.state)
+    mtp_prefill_seconds = time.perf_counter() - mtp_prefill_t0
+
+    current = _argmax_token(target_logits[:, -1, :]).reshape(1, 1)
+    matches = 0
+    target_decode_seconds = 0.0
+    mtp_proposal_seconds = 0.0
+    examples = []
+    previous_hidden = target_hidden[:, -1:, :]
+
+    for step in range(probe_steps):
+        proposal_t0 = time.perf_counter()
+        mtp_logits, mtp_hidden, _topk = model.mtp_logits(
+            current,
+            previous_hidden,
+            cache=mtp_cache,
+        )
+        maybe_quantize_kv_cache(
+            mtp_cache_holder,
+            getattr(args, "quantized_kv_start", 0),
+            getattr(args, "kv_group_size", 64),
+            getattr(args, "kv_bits", None),
+        )
+        mtp_cache = mtp_cache_holder[0]
+        proposal = _argmax_token(mtp_logits[:, -1, :]).reshape(1, 1)
+        mx.eval(proposal, mtp_hidden, mtp_cache.state)
+        mtp_proposal_seconds += time.perf_counter() - proposal_t0
+
+        target_t0 = time.perf_counter()
+        next_logits, next_hidden = model.forward_with_hidden(
+            current,
+            cache=target_cache,
+        )
+        maybe_quantize_kv_cache(
+            target_cache,
+            getattr(args, "quantized_kv_start", 0),
+            getattr(args, "kv_group_size", 64),
+            getattr(args, "kv_bits", None),
+        )
+        target_next = _argmax_token(next_logits[:, -1, :]).reshape(1, 1)
+        mx.eval(target_next, next_hidden, [c.state for c in target_cache])
+        target_decode_seconds += time.perf_counter() - target_t0
+
+        proposal_id = _token_item(proposal)
+        target_id = _token_item(target_next)
+        matched = proposal_id == target_id
+        matches += int(matched)
+        if len(examples) < 16:
+            examples.append(
+                {
+                    "step": step,
+                    "input": _token_item(current),
+                    "proposal": proposal_id,
+                    "target": target_id,
+                    "match": matched,
+                }
+            )
+
+        current = target_next
+        previous_hidden = next_hidden[:, -1:, :]
+
+    acceptance_rate = matches / probe_steps if probe_steps else None
+    target_decode_tps = (
+        probe_steps / target_decode_seconds if target_decode_seconds > 0 else None
+    )
+    mtp_proposal_tps = (
+        probe_steps / mtp_proposal_seconds if mtp_proposal_seconds > 0 else None
+    )
+    return {
+        "case": case_name,
+        "mode": "mtp-acceptance",
+        "batch_size": 1,
+        "requested_total_tokens": args.target_tokens,
+        "prompt_tokens": len(tokens),
+        "tokenize_seconds": tokenize_seconds,
+        "target_prefill_seconds": target_prefill_seconds,
+        "mtp_prefill_seconds": mtp_prefill_seconds,
+        "mtp_acceptance_steps": probe_steps,
+        "mtp_acceptance_matches": matches,
+        "mtp_acceptance_rate": acceptance_rate,
+        "mtp_target_decode_seconds": target_decode_seconds,
+        "mtp_target_decode_tps": target_decode_tps,
+        "mtp_proposal_seconds": mtp_proposal_seconds,
+        "mtp_proposal_tps": mtp_proposal_tps,
+        "mtp_acceptance_examples": examples,
+        "peak_memory_gb": mx.get_peak_memory() / 1e9,
+        **prefill_config,
+        **collect_glm_dsa_profile(args),
+        **collect_glm_dsa_decode_profile(args),
+    }
+
+
 def run_batch_once(model, tokenizer, text, args, case_name):
     tokenize_t0 = time.perf_counter()
     prompts = []
@@ -2142,6 +2310,8 @@ def print_table(rows, output_format):
         "prompt_tps",
         "prefill_seconds",
         "prefill_tps",
+        "target_prefill_seconds",
+        "mtp_prefill_seconds",
         "generated_tokens",
         "generation_seconds",
         "generation_tps",
@@ -2169,6 +2339,13 @@ def print_table(rows, output_format):
         "active_batch_cache_kind",
         "active_batch_size_max",
         "queued_request_count",
+        "mtp_acceptance_steps",
+        "mtp_acceptance_matches",
+        "mtp_acceptance_rate",
+        "mtp_target_decode_seconds",
+        "mtp_target_decode_tps",
+        "mtp_proposal_seconds",
+        "mtp_proposal_tps",
         "checkpoint_resolution",
         "glm_dsa_prefill_profile",
         "glm_dsa_prefill_profile_isolate",
@@ -2769,6 +2946,7 @@ def main():
             "policy-sweep",
             "prefill-sweep",
             "decode-context",
+            "mtp-acceptance",
             "native-smoke",
         ),
         default="single",
@@ -2890,6 +3068,14 @@ def main():
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument(
+        "--mtp-acceptance-steps",
+        type=int,
+        help=(
+            "Number of greedy decode positions to probe in --mode mtp-acceptance. "
+            "Defaults to --max-tokens."
+        ),
+    )
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument(
         "--prefill-max-qk-tokens",
@@ -3273,6 +3459,17 @@ def main():
         parser.error("--prefill-stop-after-tokens must be positive when set.")
     if args.mode == "decode-context" and args.max_tokens <= 0:
         parser.error("--max-tokens must be positive in --mode decode-context.")
+    if args.mode == "mtp-acceptance":
+        if args.max_tokens <= 0 and args.mtp_acceptance_steps is None:
+            parser.error(
+                "--max-tokens must be positive in --mode mtp-acceptance "
+                "unless --mtp-acceptance-steps is set."
+            )
+        if (
+            args.mtp_acceptance_steps is not None
+            and args.mtp_acceptance_steps <= 0
+        ):
+            parser.error("--mtp-acceptance-steps must be positive when set.")
     if args.mode == "native-smoke":
         if args.native_smoke_q_len <= 1:
             parser.error("--native-smoke-q-len must be greater than 1.")
@@ -3306,6 +3503,9 @@ def main():
         return
 
     old_checkpoint_cache_dir = configure_checkpoint_cache_dir(args)
+    old_mtp_env = os.environ.get(glm_moe_dsa.GLM_DSA_MTP_ENV)
+    if args.mode == "mtp-acceptance":
+        os.environ[glm_moe_dsa.GLM_DSA_MTP_ENV] = "1"
 
     try:
         tokenizer_config = {"trust_remote_code": args.trust_remote_code}
@@ -3329,6 +3529,8 @@ def main():
                 runner = run_batch_once
             elif args.mode == "decode-context":
                 runner = run_decode_context_once
+            elif args.mode == "mtp-acceptance":
+                runner = run_mtp_acceptance_once
             else:
                 runner = run_once
             if args.prompt_file:
@@ -3392,6 +3594,10 @@ def main():
                 remove_partial_json_output(args.json_output)
     finally:
         restore_checkpoint_cache_dir(old_checkpoint_cache_dir)
+        if old_mtp_env is None:
+            os.environ.pop(glm_moe_dsa.GLM_DSA_MTP_ENV, None)
+        else:
+            os.environ[glm_moe_dsa.GLM_DSA_MTP_ENV] = old_mtp_env
 
 
 if __name__ == "__main__":

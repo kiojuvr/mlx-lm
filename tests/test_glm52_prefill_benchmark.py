@@ -276,6 +276,94 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertFalse(calls[0]["prompt_checkpoint"])
         self.assertIsNone(calls[0]["prompt_checkpoint_store_prefix_lengths"])
 
+    def test_run_mtp_acceptance_reports_match_rate(self):
+        class DummyCache:
+            def __init__(self):
+                self.state = benchmark.mx.array([0])
+
+        class DummyModel:
+            def __init__(self):
+                self.mtp = object()
+                self.layers = [object()]
+                self.forward_next = {3: 5, 5: 7, 7: 11, 11: 13}
+                self.mtp_next = {5: 7, 7: 99, 11: 13}
+
+            def make_mtp_cache(self):
+                return DummyCache()
+
+            def forward_with_hidden(self, inputs, cache=None):
+                last = int(inputs.reshape(-1)[-1].item())
+                token = self.forward_next.get(last, 0)
+                logits = benchmark.mx.where(
+                    benchmark.mx.arange(128) == token,
+                    benchmark.mx.array(1.0),
+                    benchmark.mx.array(0.0),
+                )
+                logits = benchmark.mx.broadcast_to(
+                    logits.reshape(1, 1, 128),
+                    (1, inputs.shape[1], 128),
+                )
+                hidden = benchmark.mx.ones((1, inputs.shape[1], 4)) * last
+                return logits, hidden
+
+            def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+                last = int(inputs.reshape(-1)[-1].item())
+                token = self.mtp_next.get(last, 0)
+                logits = benchmark.mx.where(
+                    benchmark.mx.arange(128) == token,
+                    benchmark.mx.array(1.0),
+                    benchmark.mx.array(0.0),
+                )
+                logits = benchmark.mx.broadcast_to(
+                    logits.reshape(1, 1, 128),
+                    (1, inputs.shape[1], 128),
+                )
+                hidden = benchmark.mx.ones((1, inputs.shape[1], 4)) * token
+                return logits, hidden, None
+
+        old_make_cache = benchmark.prompt_cache.make_prompt_cache
+        old_collect_profile = benchmark.collect_glm_dsa_profile
+        old_collect_decode_profile = benchmark.collect_glm_dsa_decode_profile
+        old_reset_profile = benchmark.reset_glm_dsa_profile
+        benchmark.prompt_cache.make_prompt_cache = lambda _model: [DummyCache()]
+        benchmark.collect_glm_dsa_profile = lambda _args: {}
+        benchmark.collect_glm_dsa_decode_profile = lambda _args: {}
+        benchmark.reset_glm_dsa_profile = lambda: None
+        args = Namespace(
+            target_tokens=None,
+            max_tokens=3,
+            mtp_acceptance_steps=None,
+            kv_bits=None,
+            kv_group_size=64,
+            quantized_kv_start=0,
+            prefill_step_size=4,
+            prefill_max_qk_tokens=0,
+            glm_dsa_adaptive_prefill_step_size=0,
+            glm_dsa_adaptive_prefill_after_tokens=0,
+            glm_dsa_adaptive_prefill_min_remaining_tokens=0,
+        )
+        try:
+            row = benchmark.run_mtp_acceptance_once(
+                DummyModel(),
+                object(),
+                [1, 2, 3],
+                args,
+                "mtp-test",
+            )
+        finally:
+            benchmark.prompt_cache.make_prompt_cache = old_make_cache
+            benchmark.collect_glm_dsa_profile = old_collect_profile
+            benchmark.collect_glm_dsa_decode_profile = old_collect_decode_profile
+            benchmark.reset_glm_dsa_profile = old_reset_profile
+
+        self.assertEqual(row["mode"], "mtp-acceptance")
+        self.assertEqual(row["mtp_acceptance_steps"], 3)
+        self.assertEqual(row["mtp_acceptance_matches"], 2)
+        self.assertAlmostEqual(row["mtp_acceptance_rate"], 2 / 3)
+        self.assertIsNone(row["kv_bits"])
+        self.assertEqual(row["mtp_acceptance_examples"][1]["proposal"], 99)
+        self.assertFalse(row["mtp_acceptance_examples"][1]["match"])
+
     def test_main_rejects_empty_model_argument(self):
         old_argv = sys.argv
         sys.argv = [

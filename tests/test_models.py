@@ -1768,6 +1768,17 @@ class TestModels(unittest.TestCase):
         self.assertEqual(len(model.layers), 2)
         self.assertFalse(model.mtp.layer.self_attn.skip_topk)
 
+    def test_glm_moe_dsa_forward_with_hidden_matches_logits(self):
+        model = self._make_glm_moe_dsa_model()
+        inputs = mx.array([[1, 2, 3]])
+
+        logits = model(inputs)
+        hidden_logits, hidden = model.forward_with_hidden(inputs)
+        mx.eval(logits, hidden_logits, hidden)
+
+        self.assertTrue(mx.allclose(logits, hidden_logits))
+        self.assertEqual(hidden.shape, (1, 3, 128))
+
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4
 
