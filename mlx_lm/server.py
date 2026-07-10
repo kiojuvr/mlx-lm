@@ -69,6 +69,7 @@ from .models.cache import (
     find_prompt_checkpoint_rendered_prefix,
     load_prompt_checkpoint,
     load_prompt_checkpoint_with_metadata_prefix,
+    make_mtp_speculative_prompt_cache,
     make_prompt_cache,
     materialize_prompt_cache,
     model_has_glm_mla_kv_cache,
@@ -100,6 +101,10 @@ DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT = 2
 DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE = "disabled"
 DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS = 8192
+
+
+def _mtp_speculative_prompt_cache_key(model_key):
+    return (model_key, "mtp-speculative")
 
 
 def get_system_fingerprint():
@@ -2949,12 +2954,22 @@ class ResponseGenerator:
             # Load the KV cache
             self._log_cache_stats()
             prompt_cache_source = "none"
+            prompt_cache_model_key = self.model_provider.model_key
             if mtp_speculative:
-                cache = None
-                rest = prompt
-                ram_cache_count = 0
-                ctx.prompt_cache_count = 0
+                prompt_cache_model_key = _mtp_speculative_prompt_cache_key(
+                    self.model_provider.model_key
+                )
+                ram_cache, ram_rest = self.prompt_cache.fetch_nearest_cache(
+                    prompt_cache_model_key,
+                    prompt,
+                )
+                ram_cache_count = len(prompt) - len(ram_rest)
+                cache = ram_cache
+                rest = ram_rest
+                ctx.prompt_cache_count = ram_cache_count
                 prompt_cache_source = "mtp-speculative"
+                if ctx.prompt_cache_count > 0:
+                    prompt_cache_source = "mtp-speculative-server-cache"
             else:
                 ram_cache, ram_rest = self.prompt_cache.fetch_nearest_cache(
                     self.model_provider.model_key, prompt
@@ -2979,6 +2994,8 @@ class ResponseGenerator:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+            if cache is None and mtp_speculative:
+                cache = make_mtp_speculative_prompt_cache(self.model_provider.model)
 
             prompt_token_count = len(prompt)
             if mtp_speculative:
@@ -3206,7 +3223,28 @@ class ResponseGenerator:
                 )
 
             if mtp_speculative:
-                _prompt_checkpoint_debug("post response save skipped mtp speculative")
+                _prompt_checkpoint_debug(
+                    "post response disk save skipped mtp speculative"
+                )
+                cache_token_length = prompt_cache_token_length(cache)
+                insert_length = min(cache_token_length, len(cache_key))
+                if insert_length > 0:
+                    self.prompt_cache.insert_cache(
+                        prompt_cache_model_key,
+                        cache_key[:insert_length],
+                        cache,
+                    )
+                    _prompt_checkpoint_debug(
+                        "post response ram save mtp speculative "
+                        f"tokens={insert_length} "
+                        f"cache_tokens={cache_token_length} "
+                        f"cache_key_tokens={len(cache_key)}"
+                    )
+                else:
+                    _prompt_checkpoint_debug(
+                        "post response ram save skipped mtp speculative "
+                        f"cache_tokens={cache_token_length}"
+                    )
             else:
                 rendered_continuation = None
                 if rendered_prompt is not None and generated_text_parts:

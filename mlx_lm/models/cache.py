@@ -202,6 +202,29 @@ def make_mtp_speculative_prompt_cache(
     return prompt_cache + mtp_cache
 
 
+def split_mtp_speculative_prompt_cache(
+    model: nn.Module,
+    prompt_cache: List[Any],
+    max_kv_size: Optional[int] = None,
+) -> Tuple[List[Any], List[Any]]:
+    """Split a combined target+MTP prompt cache into its runtime pieces."""
+    target_template, mtp_template = make_mtp_speculative_cache_pair(
+        model,
+        max_kv_size=max_kv_size,
+    )
+    target_count = len(target_template)
+    mtp_count = len(mtp_template)
+    expected_count = target_count + mtp_count
+    if len(prompt_cache) != expected_count:
+        raise ValueError(
+            "MTP speculative prompt_cache layout mismatch: "
+            f"expected {expected_count} entries "
+            f"({target_count} target + {mtp_count} MTP), "
+            f"got {len(prompt_cache)}"
+        )
+    return list(prompt_cache[:target_count]), list(prompt_cache[target_count:])
+
+
 def save_prompt_cache(
     file_name: str,
     cache: List[Any],

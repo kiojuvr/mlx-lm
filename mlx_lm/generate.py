@@ -1644,6 +1644,7 @@ def mtp_speculative_generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     mtp_speculative_stats: Optional[dict] = None,
+    prompt_history: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     Generate with a model's built-in GLM DSA MTP layer.
@@ -1657,29 +1658,66 @@ def mtp_speculative_generate_step(
             "MTP speculative decoding requires a model loaded with "
             f"{GLM_DSA_MTP_ENV}=1 and native MTP weights."
         )
-    if prompt_cache is not None:
-        raise ValueError(
-            "MTP speculative decoding does not support prompt_cache yet."
-        )
     if kv_bits is not None and kv_bits != 8 and cache.model_has_glm_mla_kv_cache(
         model
     ):
         raise ValueError("GLM MLA KV quantization supports only --kv-bits 8")
 
     prompt = prompt.astype(mx.uint32).reshape(-1)
-    if prompt.size == 0:
-        raise ValueError("MTP speculative decoding requires a non-empty prompt.")
     if max_tokens == 0:
         return
+    if prompt_history is not None:
+        prompt_history = mx.array(prompt_history, dtype=mx.uint32).reshape(-1)
+
+    if prompt_cache is None:
+        target_cache, mtp_cache_holder = cache.make_mtp_speculative_cache_pair(model)
+        cached_prompt_tokens = 0
+    else:
+        target_cache, mtp_cache_holder = cache.split_mtp_speculative_prompt_cache(
+            model,
+            prompt_cache,
+        )
+        cached_prompt_tokens = cache.prompt_cache_token_length(prompt_cache)
+    if (
+        prompt.size == 0
+        and prompt_cache is not None
+        and prompt_history is not None
+        and prompt_history.size > 0
+        and cached_prompt_tokens >= prompt_history.size
+    ):
+        combined_cache = target_cache + mtp_cache_holder
+        if not cache.can_trim_prompt_cache(combined_cache):
+            raise ValueError(
+                "Fully cached MTP prompt cannot be resumed with this cache."
+            )
+        if cache.trim_prompt_cache(combined_cache, 1) != 1:
+            raise ValueError(
+                "Fully cached MTP prompt cannot be resumed with this cache."
+            )
+        prompt = prompt_history[-1:]
+        cached_prompt_tokens = max(0, cached_prompt_tokens - 1)
+    if prompt.size == 0:
+        raise ValueError("MTP speculative decoding requires a non-empty prompt.")
     if num_draft_tokens <= 0:
         raise ValueError("--num-draft-tokens must be positive.")
+    if prompt_history is not None:
+        if prompt_history.size < prompt.size:
+            raise ValueError("prompt_history cannot be shorter than prompt.")
+        if not mx.array_equal(prompt_history[-prompt.size :], prompt).item():
+            raise ValueError("prompt_history must end with prompt.")
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
     use_logits_processors = bool(logits_processors)
-    history = prompt if use_logits_processors else None
     prompt_progress_callback = prompt_progress_callback or (lambda *_args: None)
 
-    target_cache, mtp_cache_holder = cache.make_mtp_speculative_cache_pair(model)
+    total_prompt_tokens = cached_prompt_tokens + prompt.size
+    if prompt_history is not None:
+        total_prompt_tokens = max(total_prompt_tokens, int(prompt_history.size))
+    history = (
+        (prompt_history if prompt_history is not None else prompt)
+        if use_logits_processors
+        else None
+    )
     if not cache.can_trim_prompt_cache(target_cache):
         types = {type(c).__name__ for c in target_cache if not c.is_trimmable()}
         raise ValueError(
@@ -1712,6 +1750,8 @@ def mtp_speculative_generate_step(
             "emitted_tokens": 0,
             "catchup_forwards": 0,
             "num_draft_tokens": int(num_draft_tokens),
+            "cached_prompt_tokens": int(cached_prompt_tokens),
+            "fresh_prompt_tokens": int(prompt.size),
         }
     )
 
@@ -1765,7 +1805,7 @@ def mtp_speculative_generate_step(
     target_logits = None
     target_hidden = None
     processed = 0
-    prompt_progress_callback(0, prompt.size)
+    prompt_progress_callback(cached_prompt_tokens, total_prompt_tokens)
     with mx.stream(generation_stream):
         while processed < prompt.size:
             n_to_process = min(step_size, prompt.size - processed)
@@ -1784,7 +1824,10 @@ def mtp_speculative_generate_step(
             _eval_target(target_logits, target_hidden)
             _eval_mtp(mtp_logits, mtp_hidden)
             processed += n_to_process
-            prompt_progress_callback(processed, prompt.size)
+            prompt_progress_callback(
+                cached_prompt_tokens + processed,
+                total_prompt_tokens,
+            )
             mx.clear_cache()
 
         current, logprobs = _process_and_sample(history, target_logits[:, -1, :])
@@ -2208,14 +2251,14 @@ def stream_generate(
             _prompt_checkpoint_debug("skip mtp speculative path active")
         else:
             _prompt_checkpoint_debug("checkpoint disabled")
+        prompt_history = kwargs.get("prompt_checkpoint_full_prompt")
         for key in list(kwargs):
             if key == "prompt_checkpoint" or key.startswith("prompt_checkpoint_"):
                 kwargs.pop(key, None)
-        if kwargs.get("prompt_cache") is not None:
-            raise ValueError("mtp_speculative does not support prompt_cache yet.")
+        if prompt_history is not None:
+            kwargs["prompt_history"] = prompt_history
         if kwargs.get("input_embeddings") is not None:
             raise ValueError("mtp_speculative does not support input_embeddings.")
-        kwargs.pop("prompt_cache", None)
         kwargs.pop("input_embeddings", None)
         kwargs.pop("glm_dsa_adaptive_prefill_step_size", None)
         kwargs.pop("glm_dsa_adaptive_prefill_after_tokens", None)

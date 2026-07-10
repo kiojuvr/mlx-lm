@@ -285,11 +285,14 @@ Prompt checkpointing remains the dominant TTFT optimization for repeated coding-
 
 `--mtp-speculative --num-draft-tokens 2` enables the built-in GLM DSA MTP layer
 as an experimental speculative decode path. It is intentionally not in the
-recommended OpenCode command yet because this first production wiring keeps MTP
-separate from trusted prompt checkpoint reuse: server MTP mode disables batching,
-disk/RAM prompt checkpoint reuse, and post-response checkpoint saves for the
-served request. Use it only for controlled decode A/B runs until the MTP cache
-can safely coexist with checkpointed target caches. The server logs
+recommended OpenCode command yet. Server MTP mode disables batching and keeps
+disk prompt checkpoints separate from target-only checkpoints, but it now uses a
+dedicated `mtp-speculative` RAM prompt-cache namespace for repeated prompts. An
+exact RAM hit trims one token and prefills only that suffix token so the MTP
+layer can rebuild the hidden state it needs. Post-response disk checkpoint saves
+remain disabled for MTP; use it only for controlled decode A/B runs until the
+MTP cache can safely coexist with persistent checkpoint reuse. The server logs
+`prompt_cache_source=mtp-speculative-server-cache` on RAM hits and
 `mtp speculative complete` with `drafted_tokens`, `accepted_tokens`,
 `acceptance_rate`, `mean_accepted`, and `emitted_per_target_forward`; those
 fields are the first sanity check before comparing wall-clock decode TPS.
