@@ -1439,6 +1439,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.kv_group_size, 64)
         self.assertEqual(args.quantized_kv_start, 0)
         self.assertFalse(args.disable_batching)
+        self.assertFalse(args.mtp_speculative)
         self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
         self.assertEqual(args.glm_dsa_adaptive_prefill_step_size, 0)
         self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 0)
@@ -1517,6 +1518,11 @@ class TestServerCLI(unittest.TestCase):
         args = setup_arg_parser().parse_args(["--disable-batching"])
 
         self.assertTrue(args.disable_batching)
+
+    def test_setup_arg_parser_mtp_speculative(self):
+        args = setup_arg_parser().parse_args(["--mtp-speculative"])
+
+        self.assertTrue(args.mtp_speculative)
 
     def test_setup_arg_parser_prefill_max_qk_tokens(self):
         args = setup_arg_parser().parse_args(["--prefill-max-qk-tokens", "0"])

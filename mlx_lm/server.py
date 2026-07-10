@@ -39,11 +39,13 @@ from ._version import __version__
 from .generate import (
     BatchGenerator,
     DEFAULT_PREFILL_MAX_QK_TOKENS,
+    GLM_DSA_MTP_ENV,
     SequenceStateMachine,
     _format_prefill_chunk_fields,
     _glm_dsa_decode_profile_fields,
     _glm_dsa_decode_profile_snapshot,
     _prompt_checkpoint_debug,
+    model_supports_mtp_speculative,
     stream_generate,
 )
 from .models.cache import (
@@ -1004,6 +1006,9 @@ class ModelProvider:
             raise ValueError(
                 "Loading with adapters or draft models not supported in distributed mode"
             )
+        mtp_speculative = bool(getattr(self.cli_args, "mtp_speculative", False))
+        if mtp_speculative and draft_model_path is not None:
+            raise ValueError("--mtp-speculative cannot be combined with --draft-model.")
 
         # Remove the old model if it exists.
         self.model_key = None
@@ -1012,20 +1017,35 @@ class ModelProvider:
         self.draft_model = None
 
         # Load the model and tokenizer
-        if self.is_distributed:
-            model, tokenizer = sharded_load(
-                model_path,
-                pipeline_group=self.pipeline_group,
-                tensor_group=self.tensor_group,
-                tokenizer_config=self._tokenizer_config,
-                trust_remote_code=self.cli_args.trust_remote_code,
-            )
-        else:
-            model, tokenizer = load(
-                model_path,
-                adapter_path=adapter_path,
-                tokenizer_config=self._tokenizer_config,
-                trust_remote_code=self.cli_args.trust_remote_code,
+        old_mtp_env = os.environ.get(GLM_DSA_MTP_ENV)
+        if mtp_speculative:
+            os.environ[GLM_DSA_MTP_ENV] = "1"
+        try:
+            if self.is_distributed:
+                model, tokenizer = sharded_load(
+                    model_path,
+                    pipeline_group=self.pipeline_group,
+                    tensor_group=self.tensor_group,
+                    tokenizer_config=self._tokenizer_config,
+                    trust_remote_code=self.cli_args.trust_remote_code,
+                )
+            else:
+                model, tokenizer = load(
+                    model_path,
+                    adapter_path=adapter_path,
+                    tokenizer_config=self._tokenizer_config,
+                    trust_remote_code=self.cli_args.trust_remote_code,
+                )
+        finally:
+            if mtp_speculative:
+                if old_mtp_env is None:
+                    os.environ.pop(GLM_DSA_MTP_ENV, None)
+                else:
+                    os.environ[GLM_DSA_MTP_ENV] = old_mtp_env
+        if mtp_speculative and not model_supports_mtp_speculative(model):
+            raise ValueError(
+                "--mtp-speculative requires a GLM-5.2 checkpoint with native "
+                "MTP weights."
             )
 
         # Use the default chat template if needed
@@ -1044,7 +1064,7 @@ class ModelProvider:
                 )
 
         # Compute batchability
-        is_batchable = draft_model is None
+        is_batchable = draft_model is None and not mtp_speculative
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
@@ -1271,6 +1291,9 @@ class ResponseGenerator:
             return stats
         if self.model_provider.draft_model is not None:
             _prompt_checkpoint_debug("shutdown flush skipped draft model active")
+            return stats
+        if getattr(self.model_provider.cli_args, "mtp_speculative", False):
+            _prompt_checkpoint_debug("shutdown flush skipped mtp speculative active")
             return stats
         if self.model_provider.model is None or self.model_provider.tokenizer is None:
             _prompt_checkpoint_debug("shutdown flush skipped model not loaded")
@@ -1611,7 +1634,11 @@ class ResponseGenerator:
         )
 
     def _load_rendered_prompt_checkpoint(self, tokenizer, rendered_prompt):
-        if rendered_prompt is None or self.model_provider.draft_model is not None:
+        if (
+            rendered_prompt is None
+            or self.model_provider.draft_model is not None
+            or getattr(self.model_provider.cli_args, "mtp_speculative", False)
+        ):
             return None
         rendered = rendered_prompt_bytes(rendered_prompt)
         if not rendered:
@@ -1845,6 +1872,9 @@ class ResponseGenerator:
         if self.model_provider.draft_model is not None:
             _prompt_checkpoint_debug("save continued skipped draft model active")
             return False
+        if getattr(self.model_provider.cli_args, "mtp_speculative", False):
+            _prompt_checkpoint_debug("save continued skipped mtp speculative active")
+            return False
         store_length = _prompt_checkpoint_continued_store_length(
             self.cli_args,
             len(cache_key),
@@ -1960,7 +1990,11 @@ class ResponseGenerator:
         *,
         base_checkpoint,
     ):
-        if self.model_provider.draft_model is not None or base_checkpoint is None:
+        if (
+            self.model_provider.draft_model is not None
+            or getattr(self.model_provider.cli_args, "mtp_speculative", False)
+            or base_checkpoint is None
+        ):
             return None, 0.0
 
         base_tokens = (
@@ -2016,6 +2050,9 @@ class ResponseGenerator:
     ):
         if self.model_provider.draft_model is not None:
             _prompt_checkpoint_debug("save delta skipped draft model active")
+            return False
+        if getattr(self.model_provider.cli_args, "mtp_speculative", False):
+            _prompt_checkpoint_debug("save delta skipped mtp speculative active")
             return False
         if base_checkpoint is None:
             _prompt_checkpoint_debug("save delta skipped missing base checkpoint")
@@ -2574,6 +2611,8 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         if getattr(self.model_provider.cli_args, "disable_batching", False):
             return False
+        if getattr(self.model_provider.cli_args, "mtp_speculative", False):
+            return False
         kv_bits = self.model_provider.cli_args.kv_bits
         kv_batchable = kv_bits is None or (
             kv_bits == 8 and model_has_glm_mla_kv_cache(self.model_provider.model)
@@ -2843,6 +2882,9 @@ class ResponseGenerator:
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
+            mtp_speculative = bool(
+                getattr(self.model_provider.cli_args, "mtp_speculative", False)
+            )
 
             # Prepare the prompt and state machine
             rendered_prompt = self._render_prompt_text(tokenizer, request, args)
@@ -2900,46 +2942,59 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
-            ram_cache, ram_rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
-            ram_cache_count = len(prompt) - len(ram_rest)
             prompt_cache_source = "none"
-            if (
-                rendered_checkpoint is not None
-                and rendered_checkpoint.cached_tokens >= ram_cache_count
-            ):
-                cache = rendered_checkpoint.prompt_cache
-                ctx.prompt_cache_count = rendered_checkpoint.cached_tokens
-                rest = prompt[ctx.prompt_cache_count :]
-                prompt_cache_source = f"disk-rendered-{rendered_checkpoint.kind}"
+            if mtp_speculative:
+                cache = None
+                rest = prompt
+                ram_cache_count = 0
+                ctx.prompt_cache_count = 0
+                prompt_cache_source = "mtp-speculative"
             else:
-                cache = ram_cache
-                ctx.prompt_cache_count = ram_cache_count
-                rest = ram_rest
-                if ctx.prompt_cache_count > 0:
-                    prompt_cache_source = "server-cache"
+                ram_cache, ram_rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                ram_cache_count = len(prompt) - len(ram_rest)
+                if (
+                    rendered_checkpoint is not None
+                    and rendered_checkpoint.cached_tokens >= ram_cache_count
+                ):
+                    cache = rendered_checkpoint.prompt_cache
+                    ctx.prompt_cache_count = rendered_checkpoint.cached_tokens
+                    rest = prompt[ctx.prompt_cache_count :]
+                    prompt_cache_source = f"disk-rendered-{rendered_checkpoint.kind}"
+                else:
+                    cache = ram_cache
+                    ctx.prompt_cache_count = ram_cache_count
+                    rest = ram_rest
+                    if ctx.prompt_cache_count > 0:
+                        prompt_cache_source = "server-cache"
             cache_key = prompt[:]
-            if cache is None:
+            if cache is None and not mtp_speculative:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
-            checkpoint_prefix_lengths = _prompt_checkpoint_store_prefix_lengths(
-                self.cli_args,
-                prompt,
-                segments,
-                segment_types,
-                ctx.prompt_cache_count,
-            )
-            checkpoint_frontier_min_tokens, checkpoint_frontier_stride_tokens = (
-                _prompt_checkpoint_continued_frontier_args(self.cli_args)
-            )
             prompt_token_count = len(prompt)
-            prompt_checkpoint_save_exact = _prompt_checkpoint_save_exact_for_prompt(
-                self.cli_args,
-                prompt_token_count,
-            )
+            if mtp_speculative:
+                checkpoint_prefix_lengths = []
+                checkpoint_frontier_min_tokens = 0
+                checkpoint_frontier_stride_tokens = 0
+                prompt_checkpoint_save_exact = False
+            else:
+                checkpoint_prefix_lengths = _prompt_checkpoint_store_prefix_lengths(
+                    self.cli_args,
+                    prompt,
+                    segments,
+                    segment_types,
+                    ctx.prompt_cache_count,
+                )
+                checkpoint_frontier_min_tokens, checkpoint_frontier_stride_tokens = (
+                    _prompt_checkpoint_continued_frontier_args(self.cli_args)
+                )
+                prompt_checkpoint_save_exact = _prompt_checkpoint_save_exact_for_prompt(
+                    self.cli_args,
+                    prompt_token_count,
+                )
             generated_text_parts = []
             finish_reason = None
             decode_progress_interval = _prompt_checkpoint_policy_int(
@@ -2971,6 +3026,7 @@ class ResponseGenerator:
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
+                mtp_speculative=mtp_speculative,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
@@ -3114,71 +3170,77 @@ class ResponseGenerator:
                     decode_profile_suffix,
                 )
 
-            rendered_continuation = None
-            if rendered_prompt is not None and generated_text_parts:
-                rendered_continuation = rendered_prompt + "".join(generated_text_parts)
-            if (
-                _prompt_checkpoint_post_response_save_mode(self.cli_args) == "async"
-                and hasattr(self, "_checkpoint_save_queue")
-            ):
-                checkpoint_cache_key = list(cache_key)
-                self._enqueue_checkpoint_save(
-                    "continued",
-                    lambda checkpoint_cache_key=checkpoint_cache_key: (
-                        self._save_continued_prompt_checkpoint(
-                            tokenizer,
-                            cache,
-                            checkpoint_cache_key,
-                            prompt_token_count=prompt_token_count,
-                            rendered_continuation=rendered_continuation,
-                        )
-                    ),
-                )
-                delta_cache_key = list(cache_key)
-                if not self._checkpoint_save_backlog_full("delta"):
-                    delta_cache_snapshot, delta_materialize_seconds = (
-                        self._prepare_delta_prompt_checkpoint_cache(
-                            cache,
-                            delta_cache_key,
-                            base_checkpoint=rendered_checkpoint,
-                        )
+            if mtp_speculative:
+                _prompt_checkpoint_debug("post response save skipped mtp speculative")
+            else:
+                rendered_continuation = None
+                if rendered_prompt is not None and generated_text_parts:
+                    rendered_continuation = rendered_prompt + "".join(
+                        generated_text_parts
                     )
+                if (
+                    _prompt_checkpoint_post_response_save_mode(self.cli_args)
+                    == "async"
+                    and hasattr(self, "_checkpoint_save_queue")
+                ):
+                    checkpoint_cache_key = list(cache_key)
                     self._enqueue_checkpoint_save(
-                        "delta",
-                        lambda delta_cache_key=delta_cache_key,
-                        delta_cache_snapshot=delta_cache_snapshot,
-                        delta_materialize_seconds=delta_materialize_seconds: (
-                            self._save_delta_prompt_checkpoint(
+                        "continued",
+                        lambda checkpoint_cache_key=checkpoint_cache_key: (
+                            self._save_continued_prompt_checkpoint(
                                 tokenizer,
-                                None,
-                                delta_cache_key,
-                                base_checkpoint=rendered_checkpoint,
+                                cache,
+                                checkpoint_cache_key,
+                                prompt_token_count=prompt_token_count,
                                 rendered_continuation=rendered_continuation,
-                                delta_cache=delta_cache_snapshot,
-                                materialize_seconds=delta_materialize_seconds,
                             )
                         ),
                     )
-            else:
-                self._save_continued_prompt_checkpoint(
-                    tokenizer,
-                    cache,
-                    cache_key,
-                    prompt_token_count=prompt_token_count,
-                    rendered_continuation=rendered_continuation,
-                )
-                self._save_delta_prompt_checkpoint(
-                    tokenizer,
-                    cache,
-                    cache_key,
-                    base_checkpoint=rendered_checkpoint,
-                    rendered_continuation=rendered_continuation,
-                )
+                    delta_cache_key = list(cache_key)
+                    if not self._checkpoint_save_backlog_full("delta"):
+                        delta_cache_snapshot, delta_materialize_seconds = (
+                            self._prepare_delta_prompt_checkpoint_cache(
+                                cache,
+                                delta_cache_key,
+                                base_checkpoint=rendered_checkpoint,
+                            )
+                        )
+                        self._enqueue_checkpoint_save(
+                            "delta",
+                            lambda delta_cache_key=delta_cache_key,
+                            delta_cache_snapshot=delta_cache_snapshot,
+                            delta_materialize_seconds=delta_materialize_seconds: (
+                                self._save_delta_prompt_checkpoint(
+                                    tokenizer,
+                                    None,
+                                    delta_cache_key,
+                                    base_checkpoint=rendered_checkpoint,
+                                    rendered_continuation=rendered_continuation,
+                                    delta_cache=delta_cache_snapshot,
+                                    materialize_seconds=delta_materialize_seconds,
+                                )
+                            ),
+                        )
+                else:
+                    self._save_continued_prompt_checkpoint(
+                        tokenizer,
+                        cache,
+                        cache_key,
+                        prompt_token_count=prompt_token_count,
+                        rendered_continuation=rendered_continuation,
+                    )
+                    self._save_delta_prompt_checkpoint(
+                        tokenizer,
+                        cache,
+                        cache_key,
+                        base_checkpoint=rendered_checkpoint,
+                        rendered_continuation=rendered_continuation,
+                    )
 
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+                # Save the KV cache again
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
@@ -5023,6 +5085,15 @@ def setup_arg_parser():
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
+    )
+    parser.add_argument(
+        "--mtp-speculative",
+        action="store_true",
+        help=(
+            "Use the model's built-in GLM DSA MTP layer for speculative "
+            "decoding. Experimental; disables server batching and prompt "
+            "checkpoint reuse for served requests."
+        ),
     )
     parser.add_argument(
         "--num-draft-tokens",

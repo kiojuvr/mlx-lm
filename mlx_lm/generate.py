@@ -56,6 +56,7 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+GLM_DSA_MTP_ENV = "MLX_LM_GLM_DSA_MTP"
 PROMPT_CHECKPOINT_DEBUG_ENV = "MLX_LM_PROMPT_CHECKPOINT_DEBUG"
 PROMPT_CHECKPOINT_FRONTIER_MIN_TOKENS = 8192
 PROMPT_CHECKPOINT_FRONTIER_STRIDE_TOKENS = 16384
@@ -552,6 +553,15 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--mtp-speculative",
+        action="store_true",
+        help=(
+            "Use the model's built-in GLM DSA MTP layer for speculative "
+            "decoding. This is experimental and requires a GLM-5.2 checkpoint "
+            "with native MTP weights."
+        ),
+    )
+    parser.add_argument(
         "--num-draft-tokens",
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
@@ -640,6 +650,15 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+
+
+def model_supports_mtp_speculative(model: nn.Module) -> bool:
+    return (
+        getattr(model, "mtp", None) is not None
+        and hasattr(model, "forward_with_hidden")
+        and hasattr(model, "make_mtp_cache")
+        and hasattr(model, "mtp_logits")
+    )
 
 
 def generate_step(
@@ -1610,6 +1629,266 @@ def generate_step(
         n += 1
 
 
+def mtp_speculative_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: int = 2,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """
+    Generate with a model's built-in GLM DSA MTP layer.
+
+    This is an opt-in experimental path for GLM-5.2 checkpoints that include
+    native MTP weights. It keeps the target and MTP caches separate and verifies
+    every drafted token with the target model before yielding it.
+    """
+    if not model_supports_mtp_speculative(model):
+        raise ValueError(
+            "MTP speculative decoding requires a model loaded with "
+            f"{GLM_DSA_MTP_ENV}=1 and native MTP weights."
+        )
+    if prompt_cache is not None:
+        raise ValueError(
+            "MTP speculative decoding does not support prompt_cache yet."
+        )
+    if kv_bits is not None and kv_bits != 8 and cache.model_has_glm_mla_kv_cache(
+        model
+    ):
+        raise ValueError("GLM MLA KV quantization supports only --kv-bits 8")
+
+    prompt = prompt.astype(mx.uint32).reshape(-1)
+    if prompt.size == 0:
+        raise ValueError("MTP speculative decoding requires a non-empty prompt.")
+    if max_tokens == 0:
+        return
+    if num_draft_tokens <= 0:
+        raise ValueError("--num-draft-tokens must be positive.")
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    use_logits_processors = bool(logits_processors)
+    history = prompt if use_logits_processors else None
+    prompt_progress_callback = prompt_progress_callback or (lambda *_args: None)
+
+    target_cache = cache.make_prompt_cache(model)
+    mtp_cache_holder = [model.make_mtp_cache()]
+    if not cache.can_trim_prompt_cache(target_cache):
+        types = {type(c).__name__ for c in target_cache if not c.is_trimmable()}
+        raise ValueError(
+            "MTP speculative decoding requires a trimmable target cache "
+            f"(got {types})."
+        )
+    if not cache.can_trim_prompt_cache(mtp_cache_holder):
+        types = {type(c).__name__ for c in mtp_cache_holder if not c.is_trimmable()}
+        raise ValueError(
+            "MTP speculative decoding requires a trimmable MTP cache "
+            f"(got {types})."
+        )
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _append_history(tokens):
+        nonlocal history
+        if not use_logits_processors:
+            return
+        tokens = tokens.astype(mx.uint32).reshape(-1)
+        history = mx.concatenate([history, tokens])
+
+    def _history_with(base_history, tokens):
+        if not use_logits_processors:
+            return None
+        tokens = tokens.astype(mx.uint32).reshape(-1)
+        return mx.concatenate([base_history, tokens])
+
+    def _process_and_sample(tokens, logits):
+        if logits.ndim == 1:
+            logits = logits[None, :]
+        elif logits.ndim == 3:
+            logits = logits[:, -1, :]
+        if use_logits_processors:
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        y = sampler(logprobs).astype(mx.uint32).reshape(-1)[:1]
+        return y, logprobs.squeeze(0)
+
+    def _eval_target(logits, hidden):
+        mx.eval(logits, hidden, [c.state for c in target_cache])
+
+    def _eval_mtp(logits, hidden):
+        mx.eval(logits, hidden, mtp_cache_holder[0].state)
+
+    step_size = max(1, int(prefill_step_size or 1))
+    target_logits = None
+    target_hidden = None
+    processed = 0
+    prompt_progress_callback(0, prompt.size)
+    with mx.stream(generation_stream):
+        while processed < prompt.size:
+            n_to_process = min(step_size, prompt.size - processed)
+            chunk = prompt[processed : processed + n_to_process][None]
+            target_logits, target_hidden = model.forward_with_hidden(
+                chunk,
+                cache=target_cache,
+            )
+            quantize_cache_fn(target_cache)
+            mtp_logits, mtp_hidden, _topk = model.mtp_logits(
+                chunk,
+                target_hidden,
+                cache=mtp_cache_holder[0],
+            )
+            quantize_cache_fn(mtp_cache_holder)
+            _eval_target(target_logits, target_hidden)
+            _eval_mtp(mtp_logits, mtp_hidden)
+            processed += n_to_process
+            prompt_progress_callback(processed, prompt.size)
+            mx.clear_cache()
+
+        current, logprobs = _process_and_sample(history, target_logits[:, -1, :])
+        previous_hidden = target_hidden[:, -1:, :]
+        mx.async_eval(current, logprobs, previous_hidden)
+
+    emitted = 0
+    unbounded = max_tokens < 0
+
+    def _can_emit():
+        return unbounded or emitted < max_tokens
+
+    if not _can_emit():
+        return
+
+    mx.eval(current)
+    _append_history(current)
+    emitted += 1
+    yield current.item(), logprobs, False
+
+    while _can_emit():
+        remaining = num_draft_tokens + 1 if unbounded else max_tokens - emitted
+        num_draft = min(num_draft_tokens, max(remaining - 1, 0))
+        if num_draft == 0:
+            with mx.stream(generation_stream):
+                logits, hidden = model.forward_with_hidden(
+                    current[None],
+                    cache=target_cache,
+                )
+                quantize_cache_fn(target_cache)
+                next_token, next_logprobs = _process_and_sample(
+                    history, logits[:, -1, :]
+                )
+                next_hidden = hidden[:, -1:, :]
+                _eval_target(logits, hidden)
+                mx.async_eval(next_token, next_logprobs, next_hidden)
+            mx.eval(next_token)
+            current = next_token
+            previous_hidden = next_hidden
+            _append_history(current)
+            emitted += 1
+            yield current.item(), next_logprobs, False
+            continue
+
+        draft_tokens = []
+        draft_input = current
+        draft_hidden = previous_hidden
+        draft_history = history
+        with mx.stream(generation_stream):
+            for _ in range(num_draft):
+                mtp_logits, mtp_hidden, _topk = model.mtp_logits(
+                    draft_input[None],
+                    draft_hidden,
+                    cache=mtp_cache_holder[0],
+                )
+                quantize_cache_fn(mtp_cache_holder)
+                proposal, _proposal_logprobs = _process_and_sample(
+                    draft_history,
+                    mtp_logits[:, -1, :],
+                )
+                _eval_mtp(mtp_logits, mtp_hidden)
+                mx.async_eval(proposal, mtp_hidden)
+                draft_tokens.append(proposal)
+                draft_input = proposal
+                draft_hidden = mtp_hidden[:, -1:, :]
+                if use_logits_processors:
+                    draft_history = _history_with(draft_history, proposal)
+
+            target_inputs = mx.concatenate([current] + draft_tokens, axis=0)[None]
+            logits, hidden = model.forward_with_hidden(
+                target_inputs,
+                cache=target_cache,
+            )
+            quantize_cache_fn(target_cache)
+
+        accepted = 0
+        target_tokens = []
+        target_logprobs = []
+        target_history = history
+        for i in range(num_draft + 1):
+            token, token_logprobs = _process_and_sample(
+                target_history,
+                logits[:, i, :],
+            )
+            mx.eval(token)
+            target_tokens.append(token)
+            target_logprobs.append(token_logprobs)
+            if use_logits_processors:
+                target_history = _history_with(target_history, token)
+            if i == num_draft:
+                break
+            if token.item() != draft_tokens[i].item():
+                break
+            accepted += 1
+
+        _eval_target(logits, hidden)
+
+        cache_trim = num_draft - accepted
+        if cache_trim:
+            cache.trim_prompt_cache(target_cache, cache_trim)
+
+        mtp_trim = max(num_draft - accepted - 1, 0)
+        if mtp_trim:
+            cache.trim_prompt_cache(mtp_cache_holder, mtp_trim)
+
+        for i in range(accepted):
+            if not _can_emit():
+                break
+            current = target_tokens[i]
+            _append_history(current)
+            emitted += 1
+            yield current.item(), target_logprobs[i], True
+
+        if not _can_emit():
+            break
+
+        current = target_tokens[accepted]
+        previous_hidden = hidden[:, accepted : accepted + 1, :]
+        _append_history(current)
+        emitted += 1
+        yield current.item(), target_logprobs[accepted], False
+
+        if accepted == num_draft:
+            catch_prev_hidden = hidden[:, num_draft - 1 : num_draft, :]
+            with mx.stream(generation_stream):
+                catch_logits, catch_hidden, _topk = model.mtp_logits(
+                    draft_tokens[-1][None],
+                    catch_prev_hidden,
+                    cache=mtp_cache_holder[0],
+                )
+                quantize_cache_fn(mtp_cache_holder)
+                _eval_mtp(catch_logits, catch_hidden)
+
+
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -1862,13 +2141,37 @@ def stream_generate(
 
         kwargs["prompt_checkpoint_decode_prefix"] = decode_checkpoint_prefix
 
-    if draft_model is None:
+    mtp_speculative = bool(kwargs.pop("mtp_speculative", False))
+    if mtp_speculative and draft_model is not None:
+        raise ValueError("mtp_speculative cannot be combined with draft_model.")
+
+    if draft_model is None and not mtp_speculative:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
         )
+    elif mtp_speculative:
+        if kwargs.get("prompt_checkpoint", True):
+            _prompt_checkpoint_debug("skip mtp speculative path active")
+        else:
+            _prompt_checkpoint_debug("checkpoint disabled")
+        for key in list(kwargs):
+            if key == "prompt_checkpoint" or key.startswith("prompt_checkpoint_"):
+                kwargs.pop(key, None)
+        if kwargs.get("prompt_cache") is not None:
+            raise ValueError("mtp_speculative does not support prompt_cache yet.")
+        if kwargs.get("input_embeddings") is not None:
+            raise ValueError("mtp_speculative does not support input_embeddings.")
+        kwargs.pop("prompt_cache", None)
+        kwargs.pop("input_embeddings", None)
+        kwargs.pop("glm_dsa_adaptive_prefill_step_size", None)
+        kwargs.pop("glm_dsa_adaptive_prefill_after_tokens", None)
+        kwargs.pop("glm_dsa_adaptive_prefill_min_remaining_tokens", None)
+        kwargs.pop("prefill_max_qk_tokens", None)
+        kwargs.pop("max_kv_size", None)
+        token_generator = mtp_speculative_generate_step(prompt, model, **kwargs)
     else:
         if kwargs.get("prompt_checkpoint", True):
             _prompt_checkpoint_debug("skip speculative path active")
@@ -3457,6 +3760,14 @@ def main():
                 "is an error."
             )
     model_path = model_path or DEFAULT_MODEL
+    if args.mtp_speculative:
+        if args.draft_model is not None:
+            raise ValueError("--mtp-speculative cannot be combined with --draft-model.")
+        if using_cache:
+            raise ValueError(
+                "--mtp-speculative cannot be combined with --prompt-cache-file."
+            )
+        os.environ[GLM_DSA_MTP_ENV] = "1"
 
     model, tokenizer = load(
         model_path,
@@ -3537,6 +3848,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         prompt_checkpoint=not args.no_prompt_checkpoint,
         draft_model=draft_model,
+        mtp_speculative=args.mtp_speculative,
         num_draft_tokens=args.num_draft_tokens,
     )
     if not args.verbose:

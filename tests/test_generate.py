@@ -1,11 +1,13 @@
 # Copyright © 2024 Apple Inc.
 
+import importlib
 import random
 import unittest
 from typing import List
 
 import mlx.core as mx
 
+generate_module = importlib.import_module("mlx_lm.generate")
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
@@ -18,6 +20,7 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    mtp_speculative_generate_step,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -26,6 +29,102 @@ from mlx_lm.utils import load
 
 
 class TestGenerateUtilities(unittest.TestCase):
+    def test_mtp_speculative_generate_step_verifies_drafts(self):
+        class DummyCache:
+            def __init__(self):
+                self.offset = 0
+                self.trimmed = []
+
+            @property
+            def state(self):
+                return mx.array([self.offset])
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trimmed.append(n)
+                return n
+
+        class DummyModel:
+            def __init__(self):
+                self.mtp = object()
+                self.layers = [object()]
+                self.target_cache = [DummyCache()]
+                self.mtp_cache = DummyCache()
+                self.target_next = {
+                    3: 5,
+                    5: 7,
+                    7: 11,
+                    99: 101,
+                    11: 13,
+                    13: 17,
+                }
+                self.mtp_next = {
+                    5: 7,
+                    7: 99,
+                    11: 13,
+                    13: 17,
+                }
+
+            def make_mtp_cache(self):
+                return self.mtp_cache
+
+            def _logits(self, token, length):
+                logits = mx.where(
+                    mx.arange(128) == token,
+                    mx.array(1.0),
+                    mx.array(0.0),
+                )
+                return mx.broadcast_to(logits.reshape(1, 1, 128), (1, length, 128))
+
+            def forward_with_hidden(self, inputs, cache=None):
+                flat = [int(v) for v in inputs.reshape(-1).tolist()]
+                outputs = [self.target_next.get(token, 0) for token in flat]
+                logits = mx.concatenate(
+                    [self._logits(token, 1) for token in outputs],
+                    axis=1,
+                )
+                hidden_values = mx.array(flat, dtype=mx.float32)
+                hidden = mx.broadcast_to(
+                    hidden_values.reshape(1, len(flat), 1),
+                    (1, len(flat), 4),
+                )
+                return logits, hidden
+
+            def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+                last = int(inputs.reshape(-1)[-1].item())
+                token = self.mtp_next.get(last, 0)
+                logits = self._logits(token, inputs.shape[1])
+                hidden = mx.ones((1, inputs.shape[1], 4)) * token
+                return logits, hidden, None
+
+        model = DummyModel()
+        old_make_cache = generate_module.cache.make_prompt_cache
+        generate_module.cache.make_prompt_cache = lambda _model: model.target_cache
+        try:
+            rows = list(
+                mtp_speculative_generate_step(
+                    mx.array([1, 2, 3]),
+                    model,
+                    max_tokens=5,
+                    num_draft_tokens=3,
+                )
+            )
+        finally:
+            generate_module.cache.make_prompt_cache = old_make_cache
+
+        self.assertEqual(
+            [int(token) for token, _logprobs, _draft in rows],
+            [5, 7, 11, 13, 17],
+        )
+        self.assertEqual(
+            [draft for _token, _logprobs, draft in rows],
+            [False, True, False, True, False],
+        )
+        self.assertIn(2, model.target_cache[0].trimmed)
+        self.assertIn(1, model.mtp_cache.trimmed)
+
     def test_effective_prefill_step_size_caps_long_context(self):
         step = _effective_prefill_step_size(
             requested_step_size=1024,
