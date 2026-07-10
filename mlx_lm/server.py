@@ -3362,6 +3362,8 @@ class ResponseGenerator:
                     "num_draft_tokens=%s target_prefill_tokens=%s "
                     "target_prefill_logits_skipped=%s mtp_prefill_tokens=%s "
                     "mtp_prefill_logits_skipped=%s draft_logsumexp_skipped=%s "
+                    "mtp_prefill_shifted=%s "
+                    "mtp_prefill_first_draft_fused=%s "
                     "target_greedy_verify_batches=%s "
                     "target_greedy_verify_tokens=%s "
                     "target_logsumexp_skipped=%s return_logprobs=%s "
@@ -3395,6 +3397,10 @@ class ResponseGenerator:
                     mtp_speculative_stats.get("mtp_prefill_tokens", 0),
                     mtp_speculative_stats.get("mtp_prefill_logits_skipped", 0),
                     mtp_speculative_stats.get("draft_logsumexp_skipped", 0),
+                    mtp_speculative_stats.get("mtp_prefill_shifted", False),
+                    mtp_speculative_stats.get(
+                        "mtp_prefill_first_draft_fused", False
+                    ),
                     mtp_speculative_stats.get("target_greedy_verify_batches", 0),
                     mtp_speculative_stats.get("target_greedy_verify_tokens", 0),
                     mtp_speculative_stats.get("target_logsumexp_skipped", 0),

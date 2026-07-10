@@ -29,6 +29,136 @@ from mlx_lm.utils import load
 
 
 class TestGenerateUtilities(unittest.TestCase):
+    def test_mtp_speculative_shifts_prefill_and_reuses_first_draft(self):
+        class DummyCache:
+            def __init__(self):
+                self.offset = 0
+
+            @property
+            def state(self):
+                return mx.array([self.offset])
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.offset = max(0, self.offset - n)
+                return n
+
+        class DummyModel:
+            def __init__(self):
+                self.mtp = object()
+                self.layers = [object()]
+                self.args = type(
+                    "Args", (), {"index_share_for_mtp_iteration": True}
+                )()
+                self.target_cache = [DummyCache()]
+                self.mtp_cache = DummyCache()
+                self.mtp_prefill_inputs = []
+                self.mtp_last_prefill_inputs = []
+                self.mtp_logits_inputs = []
+                self.mtp_logits_prev_topk = []
+                self.target_inputs = []
+
+            def make_mtp_cache(self):
+                return self.mtp_cache
+
+            def _logits(self, tokens):
+                rows = []
+                for token in tokens:
+                    logits = mx.where(
+                        mx.arange(32) == token,
+                        mx.array(1.0),
+                        mx.array(0.0),
+                    )
+                    rows.append(logits.reshape(1, 1, 32))
+                return mx.concatenate(rows, axis=1)
+
+            def prefill_with_hidden(self, inputs, cache=None):
+                flat = [int(token) for token in inputs.reshape(-1).tolist()]
+                self.target_inputs.append(flat)
+                cache[0].offset += len(flat)
+                hidden = mx.broadcast_to(
+                    mx.array(flat, dtype=mx.float32).reshape(1, len(flat), 1),
+                    (1, len(flat), 4),
+                )
+                return self._logits([flat[-1] + 1]), hidden
+
+            def forward_with_hidden(self, inputs, cache=None):
+                flat = [int(token) for token in inputs.reshape(-1).tolist()]
+                self.target_inputs.append(flat)
+                cache[0].offset += len(flat)
+                hidden = mx.ones((1, len(flat), 4))
+                return self._logits([token + 1 for token in flat]), hidden
+
+            def mtp_prefill(self, inputs, previous_hidden_states, cache=None):
+                flat = [int(token) for token in inputs.reshape(-1).tolist()]
+                self.mtp_prefill_inputs.append(flat)
+                cache.offset += len(flat)
+                return mx.ones((1, len(flat), 4)), None
+
+            def mtp_prefill_with_last_logits(
+                self,
+                inputs,
+                previous_hidden_states,
+                cache=None,
+            ):
+                flat = [int(token) for token in inputs.reshape(-1).tolist()]
+                self.mtp_last_prefill_inputs.append(flat)
+                cache.offset += len(flat)
+                hidden = mx.ones((1, 1, 4)) * (flat[-1] + 1)
+                return self._logits([flat[-1] + 1]), hidden, mx.array([42])
+
+            def mtp_logits(
+                self,
+                inputs,
+                previous_hidden_states,
+                cache=None,
+                prev_topk_indices=None,
+            ):
+                flat = [int(token) for token in inputs.reshape(-1).tolist()]
+                self.mtp_logits_inputs.append(flat)
+                self.mtp_logits_prev_topk.append(prev_topk_indices)
+                cache.offset += len(flat)
+                hidden = mx.ones((1, len(flat), 4)) * (flat[-1] + 1)
+                return self._logits([flat[-1] + 1]), hidden, mx.array([43])
+
+        model = DummyModel()
+        stats = {}
+        old_make_cache = generate_module.cache.make_prompt_cache
+        generate_module.cache.make_prompt_cache = lambda _model: model.target_cache
+        try:
+            rows = list(
+                mtp_speculative_generate_step(
+                    mx.array([1, 2, 3]),
+                    model,
+                    max_tokens=4,
+                    num_draft_tokens=2,
+                    prefill_step_size=2,
+                    mtp_speculative_stats=stats,
+                )
+            )
+        finally:
+            generate_module.cache.make_prompt_cache = old_make_cache
+
+        self.assertEqual(
+            [int(token) for token, _logprobs, _draft in rows],
+            [4, 5, 6, 7],
+        )
+        self.assertEqual(model.mtp_prefill_inputs, [[2, 3]])
+        self.assertEqual(model.mtp_last_prefill_inputs, [[4]])
+        self.assertEqual(model.mtp_logits_inputs, [[5], [6]])
+        self.assertTrue(
+            mx.array_equal(model.mtp_logits_prev_topk[0], mx.array([42]))
+        )
+        self.assertEqual(model.target_inputs, [[1, 2], [3], [4, 5, 6]])
+        self.assertEqual(stats["mtp_prefill_tokens"], 3)
+        self.assertEqual(stats["mtp_prefill_logits_skipped"], 2)
+        self.assertTrue(stats["mtp_prefill_shifted"])
+        self.assertTrue(stats["mtp_prefill_first_draft_fused"])
+        self.assertEqual(stats["drafted_tokens"], 2)
+        self.assertEqual(stats["mtp_iteration_topk_reuses"], 2)
+
     def test_mtp_speculative_generate_step_verifies_drafts(self):
         class DummyCache:
             def __init__(self):
@@ -455,6 +585,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 self.layers = [object()]
                 self.target_cache = [DummyCache(offset=3)]
                 self.mtp_cache = DummyCache(offset=3)
+                self.mtp_last_prefill_inputs = []
 
             def make_cache(self):
                 return [DummyCache()]
@@ -493,6 +624,19 @@ class TestGenerateUtilities(unittest.TestCase):
                 hidden = mx.ones((1, inputs.shape[1], 4))
                 return logits, hidden, None
 
+            def mtp_prefill_with_last_logits(
+                self,
+                inputs,
+                previous_hidden_states,
+                cache=None,
+            ):
+                flat = [int(v) for v in inputs.reshape(-1).tolist()]
+                self.mtp_last_prefill_inputs.append(flat)
+                cache.offset += len(flat)
+                logits = self._logits(0, 1)
+                hidden = mx.ones((1, 1, 4))
+                return logits, hidden, None
+
         model = DummyModel()
         stats = {}
         progress = []
@@ -517,6 +661,9 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(stats["fresh_prompt_tokens"], 1)
         self.assertEqual(model.target_cache[0].offset, 3)
         self.assertEqual(model.mtp_cache.offset, 3)
+        self.assertEqual(model.mtp_last_prefill_inputs, [[5]])
+        self.assertTrue(stats["mtp_prefill_shifted"])
+        self.assertTrue(stats["mtp_prefill_first_draft_fused"])
 
     def test_mtp_speculative_generate_step_syncs_quantized_combined_cache(self):
         class DummyCache:

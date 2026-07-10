@@ -1885,6 +1885,16 @@ def mtp_speculative_generate_step(
     step_size = max(1, int(prefill_step_size or 1))
     target_logits = None
     target_hidden = None
+    current = None
+    logprobs = None
+    prefetched_draft_logits = None
+    prefetched_draft_hidden = None
+    prefetched_draft_topk = None
+    fused_mtp_prefill = callable(
+        getattr(model, "mtp_prefill_with_last_logits", None)
+    )
+    stats["mtp_prefill_shifted"] = fused_mtp_prefill
+    stats["mtp_prefill_first_draft_fused"] = False
     processed = 0
     prompt_progress_callback(cached_prompt_tokens, total_prompt_tokens)
     with mx.stream(generation_stream):
@@ -1907,7 +1917,48 @@ def mtp_speculative_generate_step(
                 )
             stats["target_prefill_tokens"] += n_to_process
             _quantize_runtime_cache(target_cache)
-            if callable(getattr(model, "mtp_prefill", None)):
+            final_prefill_chunk = processed + n_to_process == prompt.size
+            if fused_mtp_prefill:
+                shifted_prompt = prompt[
+                    processed + 1 : processed + n_to_process
+                ]
+                if final_prefill_chunk:
+                    current, logprobs = _process_and_sample(
+                        history,
+                        target_logits[:, -1, :],
+                        normalize=not skip_target_logprobs,
+                    )
+                    if skip_target_logprobs:
+                        stats["target_logsumexp_skipped"] += 1
+                    mtp_inputs = mx.concatenate([shifted_prompt, current])[None]
+                    (
+                        prefetched_draft_logits,
+                        prefetched_draft_hidden,
+                        prefetched_draft_topk,
+                    ) = model.mtp_prefill_with_last_logits(
+                        mtp_inputs,
+                        target_hidden,
+                        cache=mtp_cache_holder[0],
+                    )
+                    stats["mtp_prefill_first_draft_fused"] = True
+                    mtp_hidden = prefetched_draft_hidden
+                    mtp_logits = prefetched_draft_logits
+                    stats["mtp_prefill_logits_skipped"] += max(
+                        n_to_process - 1,
+                        0,
+                    )
+                else:
+                    mtp_inputs = prompt[
+                        processed + 1 : processed + n_to_process + 1
+                    ][None]
+                    mtp_hidden, _topk = model.mtp_prefill(
+                        mtp_inputs,
+                        target_hidden,
+                        cache=mtp_cache_holder[0],
+                    )
+                    mtp_logits = None
+                    stats["mtp_prefill_logits_skipped"] += n_to_process
+            elif callable(getattr(model, "mtp_prefill", None)):
                 mtp_hidden, _topk = model.mtp_prefill(
                     chunk,
                     target_hidden,
@@ -1923,11 +1974,35 @@ def mtp_speculative_generate_step(
                 )
             stats["mtp_prefill_tokens"] += n_to_process
             _quantize_runtime_cache(mtp_cache_holder)
+            prefill_start = cached_prompt_tokens + processed
+            prefill_stop = prefill_start + n_to_process
+            _prompt_checkpoint_debug(
+                "mtp target prefill eval start "
+                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
+                f"chunk_tokens={n_to_process}"
+            )
             _eval_target(target_logits, target_hidden)
+            _prompt_checkpoint_debug(
+                "mtp target prefill eval complete "
+                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
+                f"chunk_tokens={n_to_process}"
+            )
+            _prompt_checkpoint_debug(
+                "mtp layer prefill eval start "
+                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
+                f"chunk_tokens={n_to_process} shifted={fused_mtp_prefill} "
+                f"first_draft_fused={final_prefill_chunk and fused_mtp_prefill}"
+            )
             if mtp_logits is None:
                 _eval_mtp_prefill(mtp_hidden)
             else:
                 _eval_mtp(mtp_logits, mtp_hidden)
+            _prompt_checkpoint_debug(
+                "mtp layer prefill eval complete "
+                f"start_tokens={prefill_start} stop_tokens={prefill_stop} "
+                f"chunk_tokens={n_to_process} shifted={fused_mtp_prefill} "
+                f"first_draft_fused={final_prefill_chunk and fused_mtp_prefill}"
+            )
             processed += n_to_process
             prompt_progress_callback(
                 cached_prompt_tokens + processed,
@@ -1935,13 +2010,14 @@ def mtp_speculative_generate_step(
             )
             mx.clear_cache()
 
-        current, logprobs = _process_and_sample(
-            history,
-            target_logits[:, -1, :],
-            normalize=not skip_target_logprobs,
-        )
-        if skip_target_logprobs:
-            stats["target_logsumexp_skipped"] += 1
+        if current is None:
+            current, logprobs = _process_and_sample(
+                history,
+                target_logits[:, -1, :],
+                normalize=not skip_target_logprobs,
+            )
+            if skip_target_logprobs:
+                stats["target_logsumexp_skipped"] += 1
         previous_hidden = target_hidden[:, -1:, :]
         mx.async_eval(
             *(
@@ -2074,23 +2150,34 @@ def mtp_speculative_generate_step(
         stats["rounds"] += 1
         with mx.stream(generation_stream):
             for draft_index in range(num_draft):
-                mtp_kwargs = {}
-                if (
-                    share_iteration_topk
-                    and draft_index > 0
-                    and iteration_topk_indices is not None
-                ):
-                    mtp_kwargs["prev_topk_indices"] = iteration_topk_indices
-                    stats["mtp_iteration_topk_reuses"] += 1
-                mtp_logits, mtp_hidden, current_topk_indices = model.mtp_logits(
-                    draft_input[None],
-                    draft_hidden,
-                    cache=mtp_cache_holder[0],
-                    **mtp_kwargs,
+                use_prefetched_draft = (
+                    draft_index == 0 and prefetched_draft_logits is not None
                 )
+                if use_prefetched_draft:
+                    mtp_logits = prefetched_draft_logits
+                    mtp_hidden = prefetched_draft_hidden
+                    current_topk_indices = prefetched_draft_topk
+                    prefetched_draft_logits = None
+                    prefetched_draft_hidden = None
+                    prefetched_draft_topk = None
+                else:
+                    mtp_kwargs = {}
+                    if (
+                        share_iteration_topk
+                        and draft_index > 0
+                        and iteration_topk_indices is not None
+                    ):
+                        mtp_kwargs["prev_topk_indices"] = iteration_topk_indices
+                        stats["mtp_iteration_topk_reuses"] += 1
+                    mtp_logits, mtp_hidden, current_topk_indices = model.mtp_logits(
+                        draft_input[None],
+                        draft_hidden,
+                        cache=mtp_cache_holder[0],
+                        **mtp_kwargs,
+                    )
+                    _quantize_runtime_cache(mtp_cache_holder)
                 if draft_index == 0:
                     iteration_topk_indices = current_topk_indices
-                _quantize_runtime_cache(mtp_cache_holder)
                 proposal, _proposal_logprobs = _process_and_sample(
                     draft_history,
                     mtp_logits[:, -1, :],
@@ -2098,7 +2185,8 @@ def mtp_speculative_generate_step(
                 )
                 if mtp_sampler_is_greedy:
                     stats["draft_logsumexp_skipped"] += 1
-                _eval_mtp(mtp_logits, mtp_hidden)
+                if not use_prefetched_draft:
+                    _eval_mtp(mtp_logits, mtp_hidden)
                 mx.async_eval(proposal, mtp_hidden)
                 stats["drafted_tokens"] += 1
                 draft_tokens.append(proposal)

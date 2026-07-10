@@ -305,7 +305,12 @@ full-prompt vocabulary logits. The target path projects only the final position
 of each prefill chunk. The completion log reports `target_prefill_tokens`,
 `target_prefill_logits_skipped`, `mtp_prefill_tokens`, and
 `mtp_prefill_logits_skipped`; the skipped counts confirm that the native GLM
-prefill paths are active. Greedy requests also report
+prefill paths are active. MTP prefill shifts input tokens one position ahead of
+the corresponding target hidden states and fuses the first draft proposal into
+its final position, matching the DeepSeek-family proposer layout used by vLLM.
+`mtp_prefill_shifted=true` and `mtp_prefill_first_draft_fused=true` confirm that
+the aligned path is active and that one MTP forward was removed from the first
+verification round. Greedy requests also report
 `draft_logsumexp_skipped`, avoiding normalization work for MTP proposal logits
 that are never returned. Without logits processors, greedy target verification
 also batches draft-token comparison; `target_greedy_verify_batches` and

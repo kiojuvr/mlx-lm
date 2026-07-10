@@ -1788,10 +1788,23 @@ class TestModels(unittest.TestCase):
             previous_hidden,
         )
         prefill_hidden, _topk = model.mtp_prefill(inputs, previous_hidden)
+        last_logits, last_hidden, last_topk = model.mtp_prefill_with_last_logits(
+            inputs,
+            previous_hidden,
+        )
         post_norm_hidden = model.mtp.shared_head(prefill_hidden)
-        mx.eval(post_norm_hidden, recycled_hidden, prefill_hidden)
+        mx.eval(
+            post_norm_hidden,
+            recycled_hidden,
+            prefill_hidden,
+            last_logits,
+            last_hidden,
+        )
 
         self.assertTrue(mx.allclose(recycled_hidden, post_norm_hidden))
+        self.assertEqual(last_logits.shape[1], 1)
+        self.assertTrue(mx.allclose(last_hidden, post_norm_hidden[:, -1:, :]))
+        self.assertIsNone(last_topk)
 
     def test_glm_moe_dsa_mtp_reuses_iteration_topk(self):
         from mlx_lm.models import glm_moe_dsa

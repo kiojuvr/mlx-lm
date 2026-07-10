@@ -1809,6 +1809,12 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             "mtp_speculative_prefill_logits_skipped": mtp_speculative_stats.get(
                 "mtp_prefill_logits_skipped"
             ),
+            "mtp_speculative_prefill_shifted": mtp_speculative_stats.get(
+                "mtp_prefill_shifted"
+            ),
+            "mtp_speculative_prefill_first_draft_fused": (
+                mtp_speculative_stats.get("mtp_prefill_first_draft_fused")
+            ),
             "mtp_speculative_draft_logsumexp_skipped": mtp_speculative_stats.get(
                 "draft_logsumexp_skipped"
             ),

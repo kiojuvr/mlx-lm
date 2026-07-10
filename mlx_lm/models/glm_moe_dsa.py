@@ -2690,6 +2690,39 @@ class Model(DSV32Model):
         )
         return hidden, topk_indices
 
+    def mtp_prefill_with_last_logits(
+        self,
+        inputs: mx.array,
+        previous_hidden_states: mx.array,
+        cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
+        """Prefill MTP while projecting only the final draft position."""
+        if self.mtp is None:
+            raise RuntimeError(f"GLM DSA MTP is disabled; set {GLM_DSA_MTP_ENV}=1")
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(inputs)
+        if mask is None:
+            mask = create_attention_mask(
+                inputs_embeds,
+                cache[0] if cache is not None else None,
+                return_array=True,
+            )
+        hidden, _logits_hidden, topk_indices = self.mtp(
+            inputs_embeds,
+            previous_hidden_states,
+            mask,
+            cache,
+            prev_topk_indices,
+            return_logits_hidden=False,
+        )
+        logits_hidden = self.mtp.shared_head(hidden[:, -1:, :])
+        if topk_indices is not None and topk_indices.shape[2] > 1:
+            topk_indices = topk_indices[:, :, -1:, :]
+        return self.lm_head(logits_hidden), logits_hidden, topk_indices
+
     def make_cache(self):
         # Shared layers run no indexer, so they get no indexer KVCache.
         caches = []
