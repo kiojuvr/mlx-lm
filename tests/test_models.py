@@ -1768,6 +1768,25 @@ class TestModels(unittest.TestCase):
         self.assertEqual(len(model.layers), 2)
         self.assertFalse(model.mtp.layer.self_attn.skip_topk)
 
+    def test_glm_moe_dsa_mtp_prefill_matches_logits_hidden(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_key = glm_moe_dsa.GLM_DSA_MTP_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "1"
+            model = self._make_glm_moe_dsa_model(num_nextn_predict_layers=1)
+        finally:
+            self._restore_env(saved_env)
+
+        inputs = mx.array([[1, 2, 3]])
+        previous_hidden = mx.ones((1, 3, 128))
+        _logits, logits_hidden, _topk = model.mtp_logits(inputs, previous_hidden)
+        prefill_hidden, _topk = model.mtp_prefill(inputs, previous_hidden)
+        mx.eval(logits_hidden, prefill_hidden)
+
+        self.assertTrue(mx.allclose(logits_hidden, prefill_hidden))
+
     def test_glm_moe_dsa_forward_with_hidden_matches_logits(self):
         model = self._make_glm_moe_dsa_model()
         inputs = mx.array([[1, 2, 3]])

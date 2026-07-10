@@ -3333,7 +3333,8 @@ class ResponseGenerator:
                     "target_forwards=%s target_input_tokens=%s "
                     "target_tokens=%s emitted_tokens=%s "
                     "emitted_per_target_forward=%s catchup_forwards=%s "
-                    "num_draft_tokens=%s",
+                    "num_draft_tokens=%s mtp_prefill_tokens=%s "
+                    "mtp_prefill_logits_skipped=%s",
                     mtp_speculative_stats.get("rounds", 0),
                     mtp_speculative_stats.get("drafted_tokens", 0),
                     mtp_speculative_stats.get("accepted_tokens", 0),
@@ -3352,6 +3353,8 @@ class ResponseGenerator:
                     ),
                     mtp_speculative_stats.get("catchup_forwards", 0),
                     mtp_speculative_stats.get("num_draft_tokens", 0),
+                    mtp_speculative_stats.get("mtp_prefill_tokens", 0),
+                    mtp_speculative_stats.get("mtp_prefill_logits_skipped", 0),
                 )
             decode_profile_after = _glm_dsa_decode_profile_snapshot()
             decode_profile_fields = _glm_dsa_decode_profile_fields(

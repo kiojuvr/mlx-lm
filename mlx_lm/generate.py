@@ -1759,6 +1759,8 @@ def mtp_speculative_generate_step(
             "num_draft_tokens": int(num_draft_tokens),
             "cached_prompt_tokens": int(cached_prompt_tokens),
             "fresh_prompt_tokens": int(prompt.size),
+            "mtp_prefill_tokens": 0,
+            "mtp_prefill_logits_skipped": 0,
         }
     )
 
@@ -1808,6 +1810,9 @@ def mtp_speculative_generate_step(
     def _eval_mtp(logits, hidden):
         mx.eval(logits, hidden, mtp_cache_holder[0].state)
 
+    def _eval_mtp_prefill(hidden):
+        mx.eval(hidden, mtp_cache_holder[0].state)
+
     step_size = max(1, int(prefill_step_size or 1))
     target_logits = None
     target_hidden = None
@@ -1822,14 +1827,27 @@ def mtp_speculative_generate_step(
                 cache=target_cache,
             )
             _quantize_runtime_cache(target_cache)
-            mtp_logits, mtp_hidden, _topk = model.mtp_logits(
-                chunk,
-                target_hidden,
-                cache=mtp_cache_holder[0],
-            )
+            if callable(getattr(model, "mtp_prefill", None)):
+                mtp_hidden, _topk = model.mtp_prefill(
+                    chunk,
+                    target_hidden,
+                    cache=mtp_cache_holder[0],
+                )
+                mtp_logits = None
+                stats["mtp_prefill_logits_skipped"] += n_to_process
+            else:
+                mtp_logits, mtp_hidden, _topk = model.mtp_logits(
+                    chunk,
+                    target_hidden,
+                    cache=mtp_cache_holder[0],
+                )
+            stats["mtp_prefill_tokens"] += n_to_process
             _quantize_runtime_cache(mtp_cache_holder)
             _eval_target(target_logits, target_hidden)
-            _eval_mtp(mtp_logits, mtp_hidden)
+            if mtp_logits is None:
+                _eval_mtp_prefill(mtp_hidden)
+            else:
+                _eval_mtp(mtp_logits, mtp_hidden)
             processed += n_to_process
             prompt_progress_callback(
                 cached_prompt_tokens + processed,

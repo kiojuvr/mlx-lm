@@ -2501,6 +2501,7 @@ class GlmMoeDsaMTPPredictor(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
+        return_logits_hidden: bool = True,
     ):
         offset = cache[0].offset if cache is not None and cache[0] is not None else 0
         if offset == 0 and inputs_embeds.shape[1] > 0:
@@ -2516,7 +2517,8 @@ class GlmMoeDsaMTPPredictor(nn.Module):
             mx.concatenate([inputs_embeds, previous_hidden_states], axis=-1)
         )
         hidden, topk_indices = self.layer(hidden, mask, cache, prev_topk_indices)
-        return hidden, self.shared_head(hidden), topk_indices
+        logits_hidden = self.shared_head(hidden) if return_logits_hidden else None
+        return hidden, logits_hidden, topk_indices
 
 
 class Model(DSV32Model):
@@ -2618,6 +2620,35 @@ class Model(DSV32Model):
             prev_topk_indices,
         )
         return self.lm_head(logits_hidden), hidden, topk_indices
+
+    def mtp_prefill(
+        self,
+        inputs: mx.array,
+        previous_hidden_states: mx.array,
+        cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
+        if self.mtp is None:
+            raise RuntimeError(f"GLM DSA MTP is disabled; set {GLM_DSA_MTP_ENV}=1")
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(inputs)
+        if mask is None:
+            mask = create_attention_mask(
+                inputs_embeds,
+                cache[0] if cache is not None else None,
+                return_array=True,
+            )
+        hidden, _logits_hidden, topk_indices = self.mtp(
+            inputs_embeds,
+            previous_hidden_states,
+            mask,
+            cache,
+            prev_topk_indices,
+            return_logits_hidden=False,
+        )
+        return hidden, topk_indices
 
     def make_cache(self):
         # Shared layers run no indexer, so they get no indexer KVCache.

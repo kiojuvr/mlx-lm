@@ -364,6 +364,8 @@ class TestGenerateUtilities(unittest.TestCase):
             def __init__(self):
                 self.mtp = object()
                 self.layers = [object()]
+                self.mtp_prefill_calls = 0
+                self.mtp_logits_calls = 0
 
             def make_cache(self):
                 return [DummyCache()]
@@ -386,12 +388,20 @@ class TestGenerateUtilities(unittest.TestCase):
                 return self._logits(5, inputs.shape[1]), hidden
 
             def mtp_logits(self, inputs, previous_hidden_states, cache=None):
+                self.mtp_logits_calls += 1
                 cache.offset += inputs.shape[1]
                 hidden = mx.ones((1, inputs.shape[1], 4))
                 return self._logits(6, inputs.shape[1]), hidden, None
 
+            def mtp_prefill(self, inputs, previous_hidden_states, cache=None):
+                self.mtp_prefill_calls += 1
+                cache.offset += inputs.shape[1]
+                hidden = mx.ones((1, inputs.shape[1], 4))
+                return hidden, None
+
         model = DummyModel()
         combined_cache = [DummyCache(), DummyCache()]
+        stats = {}
         rows = list(
             mtp_speculative_generate_step(
                 mx.array([1, 2, 3]),
@@ -401,6 +411,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 prefill_step_size=1,
                 kv_bits=8,
                 quantized_kv_start=0,
+                mtp_speculative_stats=stats,
             )
         )
 
@@ -409,6 +420,10 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertTrue(combined_cache[1].quantized)
         self.assertEqual(combined_cache[0].offset, 3)
         self.assertEqual(combined_cache[1].offset, 3)
+        self.assertEqual(model.mtp_prefill_calls, 3)
+        self.assertEqual(model.mtp_logits_calls, 0)
+        self.assertEqual(stats["mtp_prefill_tokens"], 3)
+        self.assertEqual(stats["mtp_prefill_logits_skipped"], 3)
 
     def test_effective_prefill_step_size_caps_long_context(self):
         step = _effective_prefill_step_size(

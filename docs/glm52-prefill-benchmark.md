@@ -153,6 +153,9 @@ decode TPS. The MTP row reports
 `accepted_tokens`, `acceptance_rate`, `mean_accepted`, and
 `emitted_per_target_forward`. If acceptance is low, the extra MTP draft work can
 make wall-clock decode slower even when target forwards are reduced.
+The native GLM path also reports `mtp_speculative_prefill_tokens` and
+`mtp_speculative_prefill_logits_skipped`. Matching values confirm that MTP cache
+warmup skipped the unnecessary full-prompt vocabulary projection.
 
 To sweep baseline and multiple MTP draft depths in one run, use
 `--decode-context-mtp-draft-token-candidates`. Candidate `0` is the non-MTP
