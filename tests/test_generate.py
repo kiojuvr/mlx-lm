@@ -58,6 +58,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 self.mtp_last_prefill_inputs = []
                 self.mtp_logits_inputs = []
                 self.mtp_logits_prev_topk = []
+                self.mtp_prefill_prev_topk = []
                 self.target_inputs = []
 
             def make_mtp_cache(self):
@@ -91,9 +92,16 @@ class TestGenerateUtilities(unittest.TestCase):
                 hidden = mx.ones((1, len(flat), 4))
                 return self._logits([token + 1 for token in flat]), hidden
 
-            def mtp_prefill(self, inputs, previous_hidden_states, cache=None):
+            def mtp_prefill(
+                self,
+                inputs,
+                previous_hidden_states,
+                cache=None,
+                prev_topk_indices=None,
+            ):
                 flat = [int(token) for token in inputs.reshape(-1).tolist()]
                 self.mtp_prefill_inputs.append(flat)
+                self.mtp_prefill_prev_topk.append(prev_topk_indices)
                 cache.offset += len(flat)
                 return mx.ones((1, len(flat), 4)), None
 
@@ -145,11 +153,14 @@ class TestGenerateUtilities(unittest.TestCase):
             [int(token) for token, _logprobs, _draft in rows],
             [4, 5, 6, 7],
         )
-        self.assertEqual(model.mtp_prefill_inputs, [[2, 3]])
+        self.assertEqual(model.mtp_prefill_inputs, [[2, 3], [6]])
         self.assertEqual(model.mtp_last_prefill_inputs, [[4]])
-        self.assertEqual(model.mtp_logits_inputs, [[5], [6]])
+        self.assertEqual(model.mtp_logits_inputs, [[5]])
         self.assertTrue(
             mx.array_equal(model.mtp_logits_prev_topk[0], mx.array([42]))
+        )
+        self.assertTrue(
+            mx.array_equal(model.mtp_prefill_prev_topk[1], mx.array([42]))
         )
         self.assertEqual(model.target_inputs, [[1, 2], [3], [4, 5, 6]])
         self.assertEqual(stats["mtp_prefill_tokens"], 3)
@@ -157,6 +168,7 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertTrue(stats["mtp_prefill_shifted"])
         self.assertTrue(stats["mtp_prefill_first_draft_fused"])
         self.assertEqual(stats["drafted_tokens"], 2)
+        self.assertEqual(stats["catchup_logits_skipped"], 1)
         self.assertEqual(stats["mtp_iteration_topk_reuses"], 2)
 
     def test_mtp_speculative_generate_step_verifies_drafts(self):

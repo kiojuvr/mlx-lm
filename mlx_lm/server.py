@@ -3359,6 +3359,7 @@ class ResponseGenerator:
                     "target_forwards=%s target_input_tokens=%s "
                     "target_tokens=%s emitted_tokens=%s "
                     "emitted_per_target_forward=%s catchup_forwards=%s "
+                    "catchup_logits_skipped=%s "
                     "num_draft_tokens=%s target_prefill_tokens=%s "
                     "target_prefill_logits_skipped=%s mtp_prefill_tokens=%s "
                     "mtp_prefill_logits_skipped=%s draft_logsumexp_skipped=%s "
@@ -3391,6 +3392,7 @@ class ResponseGenerator:
                         mtp_speculative_stats.get("emitted_per_target_forward")
                     ),
                     mtp_speculative_stats.get("catchup_forwards", 0),
+                    mtp_speculative_stats.get("catchup_logits_skipped", 0),
                     mtp_speculative_stats.get("num_draft_tokens", 0),
                     mtp_speculative_stats.get("target_prefill_tokens", 0),
                     mtp_speculative_stats.get("target_prefill_logits_skipped", 0),

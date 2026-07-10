@@ -305,6 +305,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "emitted_tokens": 4,
                     "emitted_per_target_forward": 4.0,
                     "catchup_forwards": 0,
+                    "catchup_logits_skipped": 0,
                     "target_prefill_tokens": 3,
                     "target_prefill_logits_skipped": 2,
                     "mtp_prefill_tokens": 3,
@@ -400,6 +401,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
             row["mtp_speculative_emitted_per_target_forward"],
             4.0,
         )
+        self.assertEqual(row["mtp_speculative_catchup_logits_skipped"], 0)
         self.assertEqual(row["mtp_speculative_target_prefill_tokens"], 3)
         self.assertEqual(row["mtp_speculative_target_prefill_logits_skipped"], 2)
         self.assertEqual(row["mtp_speculative_prefill_logits_skipped"], 3)

@@ -310,7 +310,9 @@ the corresponding target hidden states and fuses the first draft proposal into
 its final position, matching the DeepSeek-family proposer layout used by vLLM.
 `mtp_prefill_shifted=true` and `mtp_prefill_first_draft_fused=true` confirm that
 the aligned path is active and that one MTP forward was removed from the first
-verification round. Greedy requests also report
+verification round. Fully accepted rounds also update the MTP cache through a
+hidden/cache-only catch-up pass; `catchup_logits_skipped` counts the discarded
+full-vocabulary projections avoided there. Greedy requests also report
 `draft_logsumexp_skipped`, avoiding normalization work for MTP proposal logits
 that are never returned. Without logits processors, greedy target verification
 also batches draft-token comparison; `target_greedy_verify_batches` and

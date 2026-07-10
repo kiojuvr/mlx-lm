@@ -1802,6 +1802,7 @@ def mtp_speculative_generate_step(
             "target_tokens": 0,
             "emitted_tokens": 0,
             "catchup_forwards": 0,
+            "catchup_logits_skipped": 0,
             "num_draft_tokens": int(num_draft_tokens),
             "cached_prompt_tokens": int(cached_prompt_tokens),
             "fresh_prompt_tokens": int(prompt.size),
@@ -2294,14 +2295,27 @@ def mtp_speculative_generate_step(
                 if share_iteration_topk and iteration_topk_indices is not None:
                     catchup_kwargs["prev_topk_indices"] = iteration_topk_indices
                     stats["mtp_iteration_topk_reuses"] += 1
-                catch_logits, catch_hidden, _topk = model.mtp_logits(
-                    draft_tokens[-1][None],
-                    catch_prev_hidden,
-                    cache=mtp_cache_holder[0],
-                    **catchup_kwargs,
-                )
+                if callable(getattr(model, "mtp_prefill", None)):
+                    catch_hidden, _topk = model.mtp_prefill(
+                        draft_tokens[-1][None],
+                        catch_prev_hidden,
+                        cache=mtp_cache_holder[0],
+                        **catchup_kwargs,
+                    )
+                    catch_logits = None
+                    stats["catchup_logits_skipped"] += 1
+                else:
+                    catch_logits, catch_hidden, _topk = model.mtp_logits(
+                        draft_tokens[-1][None],
+                        catch_prev_hidden,
+                        cache=mtp_cache_holder[0],
+                        **catchup_kwargs,
+                    )
                 _quantize_runtime_cache(mtp_cache_holder)
-                _eval_mtp(catch_logits, catch_hidden)
+                if catch_logits is None:
+                    _eval_mtp_prefill(catch_hidden)
+                else:
+                    _eval_mtp(catch_logits, catch_hidden)
             stats["catchup_forwards"] += 1
             _update_stats()
 
