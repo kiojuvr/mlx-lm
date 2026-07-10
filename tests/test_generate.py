@@ -60,6 +60,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 self.mtp_logits_prev_topk = []
                 self.mtp_prefill_prev_topk = []
                 self.target_inputs = []
+                self.eval_phase = None
 
             def make_mtp_cache(self):
                 return self.mtp_cache
@@ -76,6 +77,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 return mx.concatenate(rows, axis=1)
 
             def prefill_with_hidden(self, inputs, cache=None):
+                self.eval_phase = "target"
                 flat = [int(token) for token in inputs.reshape(-1).tolist()]
                 self.target_inputs.append(flat)
                 cache[0].offset += len(flat)
@@ -86,6 +88,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 return self._logits([flat[-1] + 1]), hidden
 
             def forward_with_hidden(self, inputs, cache=None):
+                self.eval_phase = "target"
                 flat = [int(token) for token in inputs.reshape(-1).tolist()]
                 self.target_inputs.append(flat)
                 cache[0].offset += len(flat)
@@ -99,6 +102,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 cache=None,
                 prev_topk_indices=None,
             ):
+                self.eval_phase = "mtp"
                 flat = [int(token) for token in inputs.reshape(-1).tolist()]
                 self.mtp_prefill_inputs.append(flat)
                 self.mtp_prefill_prev_topk.append(prev_topk_indices)
@@ -111,6 +115,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 previous_hidden_states,
                 cache=None,
             ):
+                self.eval_phase = "mtp"
                 flat = [int(token) for token in inputs.reshape(-1).tolist()]
                 self.mtp_last_prefill_inputs.append(flat)
                 cache.offset += len(flat)
@@ -124,6 +129,7 @@ class TestGenerateUtilities(unittest.TestCase):
                 cache=None,
                 prev_topk_indices=None,
             ):
+                self.eval_phase = "mtp"
                 flat = [int(token) for token in inputs.reshape(-1).tolist()]
                 self.mtp_logits_inputs.append(flat)
                 self.mtp_logits_prev_topk.append(prev_topk_indices)
@@ -133,8 +139,14 @@ class TestGenerateUtilities(unittest.TestCase):
 
         model = DummyModel()
         stats = {}
+        eval_phases = []
         old_make_cache = generate_module.cache.make_prompt_cache
+        old_eval = generate_module.mx.eval
         generate_module.cache.make_prompt_cache = lambda _model: model.target_cache
+        generate_module.mx.eval = lambda *args: (
+            eval_phases.append(model.eval_phase),
+            old_eval(*args),
+        )[1]
         try:
             rows = list(
                 mtp_speculative_generate_step(
@@ -148,6 +160,7 @@ class TestGenerateUtilities(unittest.TestCase):
             )
         finally:
             generate_module.cache.make_prompt_cache = old_make_cache
+            generate_module.mx.eval = old_eval
 
         self.assertEqual(
             [int(token) for token, _logprobs, _draft in rows],
@@ -163,6 +176,7 @@ class TestGenerateUtilities(unittest.TestCase):
             mx.array_equal(model.mtp_prefill_prev_topk[1], mx.array([42]))
         )
         self.assertEqual(model.target_inputs, [[1, 2], [3], [4, 5, 6]])
+        self.assertEqual(eval_phases[:4], ["target", "mtp", "target", "mtp"])
         self.assertEqual(stats["mtp_prefill_tokens"], 3)
         self.assertEqual(stats["mtp_prefill_logits_skipped"], 2)
         self.assertTrue(stats["mtp_prefill_shifted"])
