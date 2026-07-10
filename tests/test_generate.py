@@ -132,6 +132,8 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(stats["accepted_tokens"], 2)
         self.assertEqual(stats["target_forwards"], 2)
         self.assertEqual(stats["target_input_tokens"], 6)
+        self.assertEqual(stats["target_greedy_verify_batches"], 2)
+        self.assertEqual(stats["target_greedy_verify_tokens"], 6)
         self.assertEqual(stats["target_tokens"], 3)
         self.assertEqual(stats["emitted_tokens"], 5)
         self.assertEqual(stats["catchup_forwards"], 1)

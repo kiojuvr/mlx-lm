@@ -1770,6 +1770,8 @@ def mtp_speculative_generate_step(
             "mtp_prefill_tokens": 0,
             "mtp_prefill_logits_skipped": 0,
             "draft_logsumexp_skipped": 0,
+            "target_greedy_verify_batches": 0,
+            "target_greedy_verify_tokens": 0,
         }
     )
 
@@ -1969,22 +1971,48 @@ def mtp_speculative_generate_step(
         accepted = 0
         target_tokens = []
         target_logprobs = []
-        target_history = history
-        for i in range(num_draft + 1):
-            token, token_logprobs = _process_and_sample(
-                target_history,
-                logits[:, i, :],
+        if mtp_sampler_is_greedy and not use_logits_processors:
+            verified_tokens = mx.argmax(logits, axis=-1).astype(mx.uint32)
+            mx.eval(verified_tokens)
+            while (
+                accepted < num_draft
+                and verified_tokens[0, accepted].item()
+                == draft_tokens[accepted].item()
+            ):
+                accepted += 1
+            needed_tokens = accepted + 1
+            needed_logits = logits[:, :needed_tokens, :]
+            needed_logprobs = needed_logits - mx.logsumexp(
+                needed_logits,
+                axis=-1,
+                keepdims=True,
             )
-            mx.eval(token)
-            target_tokens.append(token)
-            target_logprobs.append(token_logprobs)
-            if use_logits_processors:
-                target_history = _history_with(target_history, token)
-            if i == num_draft:
-                break
-            if token.item() != draft_tokens[i].item():
-                break
-            accepted += 1
+            mx.eval(needed_logprobs)
+            target_tokens = [
+                verified_tokens[0, i : i + 1] for i in range(needed_tokens)
+            ]
+            target_logprobs = [
+                needed_logprobs[0, i] for i in range(needed_tokens)
+            ]
+            stats["target_greedy_verify_batches"] += 1
+            stats["target_greedy_verify_tokens"] += num_draft + 1
+        else:
+            target_history = history
+            for i in range(num_draft + 1):
+                token, token_logprobs = _process_and_sample(
+                    target_history,
+                    logits[:, i, :],
+                )
+                mx.eval(token)
+                target_tokens.append(token)
+                target_logprobs.append(token_logprobs)
+                if use_logits_processors:
+                    target_history = _history_with(target_history, token)
+                if i == num_draft:
+                    break
+                if token.item() != draft_tokens[i].item():
+                    break
+                accepted += 1
 
         _eval_target(logits, hidden)
 

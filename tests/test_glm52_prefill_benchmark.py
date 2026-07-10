@@ -310,6 +310,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
                     "mtp_prefill_tokens": 3,
                     "mtp_prefill_logits_skipped": 3,
                     "draft_logsumexp_skipped": 2,
+                    "target_greedy_verify_batches": 1,
+                    "target_greedy_verify_tokens": 3,
                 }
             )
             yield Namespace(
@@ -384,6 +386,8 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["mtp_speculative_target_prefill_logits_skipped"], 2)
         self.assertEqual(row["mtp_speculative_prefill_logits_skipped"], 3)
         self.assertEqual(row["mtp_speculative_draft_logsumexp_skipped"], 2)
+        self.assertEqual(row["mtp_speculative_target_greedy_verify_batches"], 1)
+        self.assertEqual(row["mtp_speculative_target_greedy_verify_tokens"], 3)
 
     def test_decode_context_mtp_candidate_rows_restore_args(self):
         args = Namespace(

@@ -3336,7 +3336,9 @@ class ResponseGenerator:
                     "emitted_per_target_forward=%s catchup_forwards=%s "
                     "num_draft_tokens=%s target_prefill_tokens=%s "
                     "target_prefill_logits_skipped=%s mtp_prefill_tokens=%s "
-                    "mtp_prefill_logits_skipped=%s draft_logsumexp_skipped=%s",
+                    "mtp_prefill_logits_skipped=%s draft_logsumexp_skipped=%s "
+                    "target_greedy_verify_batches=%s "
+                    "target_greedy_verify_tokens=%s",
                     mtp_speculative_stats.get("rounds", 0),
                     mtp_speculative_stats.get("drafted_tokens", 0),
                     mtp_speculative_stats.get("accepted_tokens", 0),
@@ -3360,6 +3362,8 @@ class ResponseGenerator:
                     mtp_speculative_stats.get("mtp_prefill_tokens", 0),
                     mtp_speculative_stats.get("mtp_prefill_logits_skipped", 0),
                     mtp_speculative_stats.get("draft_logsumexp_skipped", 0),
+                    mtp_speculative_stats.get("target_greedy_verify_batches", 0),
+                    mtp_speculative_stats.get("target_greedy_verify_tokens", 0),
                 )
             decode_profile_after = _glm_dsa_decode_profile_snapshot()
             decode_profile_fields = _glm_dsa_decode_profile_fields(

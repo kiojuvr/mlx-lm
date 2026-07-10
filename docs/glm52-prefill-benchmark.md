@@ -160,6 +160,8 @@ position per chunk. These fields confirm that cache warmup skipped unnecessary
 full-prompt vocabulary projections.
 For greedy runs, `mtp_speculative_draft_logsumexp_skipped` counts MTP proposals
 that skipped an unnecessary full-vocabulary normalization.
+`mtp_speculative_target_greedy_verify_*` reports batched target verification
+when no history-dependent logits processors are active.
 
 To sweep baseline and multiple MTP draft depths in one run, use
 `--decode-context-mtp-draft-token-candidates`. Candidate `0` is the non-MTP

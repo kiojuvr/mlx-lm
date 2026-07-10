@@ -1805,6 +1805,12 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             "mtp_speculative_draft_logsumexp_skipped": mtp_speculative_stats.get(
                 "draft_logsumexp_skipped"
             ),
+            "mtp_speculative_target_greedy_verify_batches": (
+                mtp_speculative_stats.get("target_greedy_verify_batches")
+            ),
+            "mtp_speculative_target_greedy_verify_tokens": (
+                mtp_speculative_stats.get("target_greedy_verify_tokens")
+            ),
         }
 
     return {

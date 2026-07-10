@@ -307,7 +307,9 @@ of each prefill chunk. The completion log reports `target_prefill_tokens`,
 `mtp_prefill_logits_skipped`; the skipped counts confirm that the native GLM
 prefill paths are active. Greedy requests also report
 `draft_logsumexp_skipped`, avoiding normalization work for MTP proposal logits
-that are never returned.
+that are never returned. Without logits processors, greedy target verification
+also batches draft-token comparison; `target_greedy_verify_batches` and
+`target_greedy_verify_tokens` report that path.
 
 `--checkpoint-async-save-backlog-limit 2` bounds queued post-response continued
 and delta checkpoint saves. These saves can hold large prompt-cache snapshots in
