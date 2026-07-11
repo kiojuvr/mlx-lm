@@ -510,6 +510,51 @@ class TestModels(unittest.TestCase):
         finally:
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_mtp_verify_uses_selected_float_kv(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model()
+        prefix = mx.array([[1, 2, 3, 4]])
+        suffix = mx.array([[5, 6]])
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "0"
+            dense_cache = make_prompt_cache(model)
+            model(prefix, cache=dense_cache)
+            dense_logits = model(suffix, cache=dense_cache)
+
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = (
+                "131072"
+            )
+            glm_moe_dsa.reset_glm_dsa_prefill_profile()
+            selected_cache = make_prompt_cache(model)
+            model(prefix, cache=selected_cache)
+            scope_token = glm_moe_dsa.set_glm_dsa_mtp_verify_scope()
+            try:
+                selected_logits = model(suffix, cache=selected_cache)
+            finally:
+                glm_moe_dsa.reset_glm_dsa_mtp_verify_scope(scope_token)
+            mx.eval(dense_logits, selected_logits)
+
+            profile = glm_moe_dsa.get_glm_dsa_prefill_profile()
+            self.assertGreater(profile["fast_prefill_hits"], 0)
+            self.assertGreater(
+                profile["native_sparse_prefill_fallback_reasons"].get(
+                    "short_verify_split_attention", 0
+                ),
+                0,
+            )
+            self.assertTrue(
+                mx.allclose(dense_logits, selected_logits, rtol=1e-4, atol=1e-4)
+            )
+        finally:
+            self._restore_env(saved_env)
+
     def test_glm_moe_dsa_decode_profile_records_decode_only(self):
         from mlx_lm.models import glm_moe_dsa
 

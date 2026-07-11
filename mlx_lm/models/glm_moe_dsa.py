@@ -106,6 +106,7 @@ _LOGGER = logging.getLogger(__name__)
 _GLM_DSA_PREFILL_PROFILE = None
 _GLM_DSA_DECODE_PROFILE = None
 _GLM_DSA_PROFILE_SCOPE = ContextVar("glm_dsa_profile_scope", default=None)
+_GLM_DSA_MTP_VERIFY_SCOPE = ContextVar("glm_dsa_mtp_verify_scope", default=False)
 _WARNED_FAST_PREFILL_LARGE_TOPK = False
 _NATIVE_SPARSE_MLA_LOOKUP_DONE = False
 _NATIVE_SPARSE_MLA_KERNEL = None
@@ -1051,6 +1052,14 @@ def _set_profile_scope(scope: Optional[str]):
     if scope is None or not _profile_scope_enabled(scope):
         return None
     return _GLM_DSA_PROFILE_SCOPE.set(scope)
+
+
+def set_glm_dsa_mtp_verify_scope():
+    return _GLM_DSA_MTP_VERIFY_SCOPE.set(True)
+
+
+def reset_glm_dsa_mtp_verify_scope(token):
+    _GLM_DSA_MTP_VERIFY_SCOPE.reset(token)
 
 
 def _scalar_int(value):
@@ -2179,11 +2188,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         output = output.reshape(B, H, L, R)
         return self._unembed_out_project(output)
 
-    def _short_quantized_verify_attention(
+    def _short_verify_attention(
         self,
         q_nope: mx.array,
         q_pe: mx.array,
-        kv_cache: QuantizedGlmMlaKVCache,
+        kv_cache: Any,
         kv_latent: Any,
         k_pe: mx.array,
         topk_indices: mx.array,
@@ -2320,7 +2329,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         fast_sparse_prefill = False
         native_sparse_prefill = False
-        short_quantized_verify = False
+        short_verify = False
         native_sparse_prefill_reason = None
         dense_sparse_mask_applied = False
         if topk_indices is not None:
@@ -2337,16 +2346,20 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     mask = _gather_attention_mask(mask, topk_indices)
             else:
-                short_quantized_verify = (
-                    isinstance(kv_cache, QuantizedGlmMlaKVCache)
+                short_verify = (
+                    _fast_prefill_enabled()
+                    and _GLM_DSA_MTP_VERIFY_SCOPE.get()
+                    and isinstance(
+                        kv_cache, (GlmMlaKVCache, QuantizedGlmMlaKVCache)
+                    )
                     and L <= _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS
                 )
-                if short_quantized_verify:
+                if short_verify:
                     _record_native_sparse_prefill_decision(
-                        False, "short_quantized_verify_split_attention"
+                        False, "short_verify_split_attention"
                     )
                     _record_fast_prefill_decision(
-                        True, "short_quantized_verify_split_attention"
+                        True, "short_verify_split_attention"
                     )
                 else:
                     native_sparse_prefill, native_sparse_prefill_reason = (
@@ -2359,7 +2372,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                             topk_indices=topk_indices,
                         )
                     )
-                if not short_quantized_verify and not native_sparse_prefill:
+                if not short_verify and not native_sparse_prefill:
                     _record_native_sparse_prefill_decision(
                         False, native_sparse_prefill_reason
                     )
@@ -2372,7 +2385,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     )
                     _record_fast_prefill_decision(fast_sparse_prefill, reason)
                 if (
-                    not short_quantized_verify
+                    not short_verify
                     and not native_sparse_prefill
                     and not fast_sparse_prefill
                 ):
@@ -2396,10 +2409,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 )
 
         output = None
-        if short_quantized_verify:
+        if short_verify:
             output = _profile_stage(
                 "attention",
-                lambda: self._short_quantized_verify_attention(
+                lambda: self._short_verify_attention(
                     q_nope,
                     q_pe,
                     kv_cache,

@@ -79,6 +79,19 @@ def _mtp_sequential_quantized_verify_enabled() -> bool:
     return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
+@contextlib.contextmanager
+def _glm_dsa_mtp_verify_scope():
+    module = sys.modules.get("mlx_lm.models.glm_moe_dsa")
+    setter = getattr(module, "set_glm_dsa_mtp_verify_scope", None)
+    resetter = getattr(module, "reset_glm_dsa_mtp_verify_scope", None)
+    token = setter() if callable(setter) else None
+    try:
+        yield
+    finally:
+        if token is not None and callable(resetter):
+            resetter(token)
+
+
 def _prompt_checkpoint_debug(message):
     if os.environ.get(PROMPT_CHECKPOINT_DEBUG_ENV) != "1":
         return
@@ -2198,36 +2211,37 @@ def mtp_speculative_generate_step(
             quantized_glm_mla = cache.glm_mla_kv_quantization_metadata(
                 target_cache
             )["glm_mla_latent_int8_layers"] > 0
-            if (
-                num_draft == 1
-                and quantized_glm_mla
-                and _mtp_sequential_quantized_verify_enabled()
-            ):
-                verify_logits = []
-                verify_hidden = []
-                for target_input in (current, draft_tokens[0]):
-                    step_logits, step_hidden = model.forward_with_hidden(
-                        target_input[None],
+            with _glm_dsa_mtp_verify_scope():
+                if (
+                    num_draft == 1
+                    and quantized_glm_mla
+                    and _mtp_sequential_quantized_verify_enabled()
+                ):
+                    verify_logits = []
+                    verify_hidden = []
+                    for target_input in (current, draft_tokens[0]):
+                        step_logits, step_hidden = model.forward_with_hidden(
+                            target_input[None],
+                            cache=target_cache,
+                        )
+                        _quantize_runtime_cache(target_cache)
+                        _eval_target(step_logits, step_hidden)
+                        verify_logits.append(step_logits)
+                        verify_hidden.append(step_hidden)
+                    logits = mx.concatenate(verify_logits, axis=1)
+                    hidden = mx.concatenate(verify_hidden, axis=1)
+                    stats["target_sequential_verify_batches"] += 1
+                    stats["target_model_forwards"] += 2
+                else:
+                    target_inputs = mx.concatenate(
+                        [current] + draft_tokens, axis=0
+                    )[None]
+                    logits, hidden = model.forward_with_hidden(
+                        target_inputs,
                         cache=target_cache,
                     )
                     _quantize_runtime_cache(target_cache)
-                    _eval_target(step_logits, step_hidden)
-                    verify_logits.append(step_logits)
-                    verify_hidden.append(step_hidden)
-                logits = mx.concatenate(verify_logits, axis=1)
-                hidden = mx.concatenate(verify_hidden, axis=1)
-                stats["target_sequential_verify_batches"] += 1
-                stats["target_model_forwards"] += 2
-            else:
-                target_inputs = mx.concatenate(
-                    [current] + draft_tokens, axis=0
-                )[None]
-                logits, hidden = model.forward_with_hidden(
-                    target_inputs,
-                    cache=target_cache,
-                )
-                _quantize_runtime_cache(target_cache)
-                stats["target_model_forwards"] += 1
+                    stats["target_model_forwards"] += 1
         stats["target_forwards"] += 1
         stats["target_input_tokens"] += num_draft + 1
 

@@ -327,8 +327,8 @@ ask for `logprobs` or `top_logprobs`, greedy MTP generation also skips target
 full-vocabulary normalization. `target_logsumexp_skipped` counts those emitted
 positions and `return_logprobs=false` confirms the practical server path.
 Short target verification batches of up to eight tokens use selected-KV sparse
-attention when the MLA cache is int8, even below the normal 131K Python sparse
-prefill handoff. The selected rows are gathered and dequantized once, then each
+attention with both float and int8 MLA caches, even below the normal 131K Python
+sparse prefill handoff. Quantized selected rows are dequantized once, then each
 query uses the optimized one-token MLX attention path. This keeps one batched
 target-model forward per speculative round while avoiding the much slower
 short-query native sparse kernel and full-context float KV materialization.
