@@ -324,7 +324,10 @@ Short target verification batches of up to eight tokens use selected-KV sparse
 attention when the MLA cache is int8, even below the normal 131K Python sparse
 prefill handoff. This prevents a missing native quantized-KV opt-in from
 dequantizing and projecting the full context during MTP verification. The
-recommended native quantized-KV route still takes priority when enabled.
+recommended native quantized-KV route still takes priority when enabled. That
+native route now compacts each verification query's causal top-k rows before
+dequantization and passes the compact float KV to the fused sparse MLA kernel;
+it no longer materializes the full float KV cache for every MTP target forward.
 After 16 drafted tokens, the default adaptive guard falls back to regular
 one-token target decode when observed MTP acceptance remains below `0.20`. This
 fallback reuses the already-verified target cache and requires no re-prefill.

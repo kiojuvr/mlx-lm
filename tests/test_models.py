@@ -1258,6 +1258,77 @@ class TestModels(unittest.TestCase):
         finally:
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_native_quantized_sparse_attention_compacts_selected_kv(
+        self,
+    ):
+        from mlx_lm.models import glm_moe_dsa
+
+        class FakeAttention:
+            scale = 0.25
+            embed_q = staticmethod(lambda x: x)
+            _gather_cached_latent = (
+                glm_moe_dsa.GlmMoeDsaAttention._gather_cached_latent
+            )
+            _unembed_out_project = staticmethod(lambda x: x)
+
+        cache = QuantizedGlmMlaKVCache(group_size=64, bits=8)
+        latent = mx.arange(6 * 64, dtype=mx.float32).reshape(1, 1, 6, 64)
+        latent = (latent / 64).astype(mx.float16)
+        k_pe = mx.arange(6 * 4, dtype=mx.float32).reshape(1, 1, 6, 4)
+        k_pe = (k_pe / 16).astype(mx.float16)
+        cache.update_and_fetch(latent, k_pe)
+        mx.eval(cache.state)
+
+        topk = mx.array([[[[0, 2, 4], [1, 3, 5]]]], dtype=mx.uint32)
+        q_nope = mx.ones((1, 1, 2, 64), dtype=mx.float16)
+        q_pe = mx.ones((1, 1, 2, 4), dtype=mx.float16)
+        captured = {}
+
+        def fake_kernel(
+            q_latent, q_pe_arg, kv_latent, k_pe_arg, indices, scale, causal
+        ):
+            captured.update(
+                kv_latent=kv_latent,
+                k_pe=k_pe_arg,
+                indices=indices,
+                scale=scale,
+                causal=causal,
+            )
+            return q_latent
+
+        original_kernel = glm_moe_dsa._native_sparse_mla_kernel
+        try:
+            glm_moe_dsa._native_sparse_mla_kernel = lambda: fake_kernel
+            output, reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_attention(
+                    FakeAttention(),
+                    q_nope,
+                    q_pe,
+                    cache,
+                    cache.state[0],
+                    cache.state[1],
+                    topk,
+                )
+            )
+            mx.eval(output, captured["kv_latent"], captured["k_pe"])
+
+            self.assertEqual(reason, "native_sparse_mla_quantized_kv_compact")
+            self.assertFalse(captured["causal"])
+            self.assertEqual(captured["kv_latent"].shape, (1, 1, 6, 64))
+            self.assertEqual(captured["k_pe"].shape, (1, 1, 6, 4))
+            self.assertTrue(
+                mx.array_equal(
+                    captured["indices"],
+                    mx.arange(6, dtype=mx.uint32).reshape(1, 1, 2, 3),
+                ).item()
+            )
+            expected = mx.take(latent.reshape(6, 64), topk.reshape(-1), axis=0)
+            self.assertTrue(
+                mx.allclose(captured["kv_latent"].reshape(6, 64), expected, atol=0.05)
+            )
+        finally:
+            glm_moe_dsa._native_sparse_mla_kernel = original_kernel
+
     def test_glm_moe_dsa_quantized_fast_prefill_dequantizes_selected_kv(self):
         from mlx_lm.models import glm_moe_dsa
 

@@ -127,7 +127,7 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
       int causal_prefix_rows,
       bool do_causal,
       Stream s) {
-    if (s.device == Device::cpu || !do_causal) {
+    if (s.device == Device::cpu) {
       return true;
     }
     if (q_latent.dtype() != q_pe.dtype() ||

@@ -2020,11 +2020,24 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 inputs=q_nope,
             )
             if isinstance(kv_cache, QuantizedGlmMlaKVCache):
-                kv_latent = _profile_stage(
-                    "native_sparse_kv_dequantization",
-                    lambda: kv_cache.dequantize_keys(kv_latent),
-                    inputs=kv_latent,
+                # Verification batches are tiny but may have a very long cache.
+                # Compact their already-causal top-k rows before dequantizing so
+                # native attention never materializes the full float KV cache.
+                selected_latent = self._gather_cached_latent(
+                    kv_cache, kv_latent, topk
                 )
+                selected_k_pe = _gather_sequence_by_flat_index(k_pe, topk)
+                B, _H, L, K, D = selected_latent.shape
+                kv_latent = selected_latent.reshape(B, 1, L * K, D)
+                k_pe = selected_k_pe.reshape(B, 1, L * K, k_pe.shape[-1])
+                topk = mx.arange(L * K, dtype=mx.uint32).reshape(1, 1, L, K)
+                if B != 1:
+                    topk = mx.broadcast_to(topk, (B, 1, L, K))
+                causal = False
+                quantized_reason = "native_sparse_mla_quantized_kv_compact"
+            else:
+                causal = True
+                quantized_reason = "native_sparse_mla"
             output = _profile_stage(
                 "native_sparse_attention",
                 lambda: kernel(
@@ -2034,17 +2047,13 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     k_pe,
                     topk,
                     self.scale,
-                    causal=True,
+                    causal=causal,
                 ),
                 inputs=(q_latent, q_pe, kv_latent, k_pe, topk),
             )
             return (
                 self._unembed_out_project(output),
-                (
-                    "native_sparse_mla_quantized_kv"
-                    if isinstance(kv_cache, QuantizedGlmMlaKVCache)
-                    else "native_sparse_mla"
-                ),
+                quantized_reason,
             )
         except Exception as exc:
             return None, f"runtime_error:{type(exc).__name__}"
