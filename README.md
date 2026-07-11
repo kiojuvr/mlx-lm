@@ -335,7 +335,7 @@ short-query native sparse kernel and full-context float KV materialization.
 Set `MLX_LM_MTP_SEQUENTIAL_QUANTIZED_VERIFY=1` only for diagnosis; it rebuilds
 the same verification with separate one-token target forwards and is slower on
 the tested checkpoint.
-After 16 drafted tokens, the default adaptive guard falls back to regular
+After four drafted tokens, the default adaptive guard falls back to regular
 one-token target decode when observed MTP acceptance remains below `0.20`. This
 fallback reuses the already-verified target cache and requires no re-prefill.
 It stops MTP-layer execution completely so fallback decode returns to the

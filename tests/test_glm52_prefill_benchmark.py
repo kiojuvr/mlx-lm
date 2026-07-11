@@ -387,7 +387,7 @@ class TestGlm52PrefillBenchmark(unittest.TestCase):
         self.assertEqual(calls[0]["num_draft_tokens"], 2)
         self.assertFalse(calls[0]["mtp_return_logprobs"])
         self.assertEqual(
-            calls[0]["mtp_adaptive_fallback_min_drafted_tokens"], 16
+            calls[0]["mtp_adaptive_fallback_min_drafted_tokens"], 4
         )
         self.assertEqual(
             calls[0]["mtp_adaptive_fallback_min_acceptance_rate"], 0.20

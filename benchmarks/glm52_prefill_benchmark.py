@@ -19,7 +19,10 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mlx_lm.generate import PROMPT_CHECKPOINT_DEBUG_ENV, BatchGenerator, BatchStats
-from mlx_lm.generate import DEFAULT_PREFILL_MAX_QK_TOKENS
+from mlx_lm.generate import (
+    DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
+    DEFAULT_PREFILL_MAX_QK_TOKENS,
+)
 from mlx_lm.generate import maybe_quantize_kv_cache
 from mlx_lm.generate import stream_generate
 from mlx_lm.models import cache as prompt_cache
@@ -1721,7 +1724,9 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             mtp_speculative_stats=mtp_speculative_stats,
             mtp_return_logprobs=False,
             mtp_adaptive_fallback_min_drafted_tokens=getattr(
-                args, "mtp_adaptive_fallback_min_drafted_tokens", 16
+                args,
+                "mtp_adaptive_fallback_min_drafted_tokens",
+                DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
             ),
             mtp_adaptive_fallback_min_acceptance_rate=getattr(
                 args, "mtp_adaptive_fallback_min_acceptance_rate", 0.20
@@ -3590,7 +3595,7 @@ def main():
     parser.add_argument(
         "--mtp-adaptive-fallback-min-drafted-tokens",
         type=int,
-        default=16,
+        default=DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
         help=(
             "Fall back to target-only decode after this many low-acceptance "
             "MTP draft tokens. Use 0 to disable."
