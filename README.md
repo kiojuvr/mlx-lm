@@ -320,6 +320,11 @@ also batches draft-token comparison; `target_greedy_verify_batches` and
 ask for `logprobs` or `top_logprobs`, greedy MTP generation also skips target
 full-vocabulary normalization. `target_logsumexp_skipped` counts those emitted
 positions and `return_logprobs=false` confirms the practical server path.
+Short target verification batches of up to eight tokens use selected-KV sparse
+attention when the MLA cache is int8, even below the normal 131K Python sparse
+prefill handoff. This prevents a missing native quantized-KV opt-in from
+dequantizing and projecting the full context during MTP verification. The
+recommended native quantized-KV route still takes priority when enabled.
 After 16 drafted tokens, the default adaptive guard falls back to regular
 one-token target decode when observed MTP acceptance remains below `0.20`. This
 fallback reuses the already-verified target cache and requires no re-prefill.

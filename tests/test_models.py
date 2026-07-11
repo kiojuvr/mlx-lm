@@ -644,6 +644,46 @@ class TestModels(unittest.TestCase):
             ) = native_state
             self._restore_env(saved_env)
 
+    def test_glm_moe_dsa_short_quantized_verify_uses_selected_kv(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        env_key = glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+        saved = os.environ.get(env_key)
+        try:
+            os.environ[env_key] = "131072"
+            fake_attention = type("FakeAttention", (), {"num_heads": 64})()
+            cache = [QuantizedGlmMlaKVCache()]
+            k_pe = mx.zeros((1, 1, 8192, 64), dtype=mx.float16)
+
+            ready, reason = glm_moe_dsa.GlmMoeDsaAttention._fast_prefill_decision(
+                fake_attention,
+                B=1,
+                L=2,
+                cache=cache,
+                topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+                k_pe=k_pe,
+            )
+            too_wide, too_wide_reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._fast_prefill_decision(
+                    fake_attention,
+                    B=1,
+                    L=9,
+                    cache=cache,
+                    topk_indices=mx.zeros((1, 1, 9, 2048), dtype=mx.uint32),
+                    k_pe=k_pe,
+                )
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(reason, "short_quantized_verify")
+            self.assertFalse(too_wide)
+            self.assertEqual(too_wide_reason, "below_sparse_min_context")
+        finally:
+            if saved is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = saved
+
     def test_glm_moe_dsa_native_sparse_prefill_quantized_kv_opt_in(self):
         from mlx_lm.models import glm_moe_dsa
 

@@ -100,6 +100,7 @@ _DEFAULT_FAST_PREFILL_QUERY_CHUNK = 16
 _DEFAULT_FAST_PREFILL_KEY_BLOCK = 8192
 _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT = 131072
 _DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT = 6144
+_MAX_QUANTIZED_SPARSE_VERIFY_TOKENS = 8
 _FAST_PREFILL_LARGE_TOPK_WARNING = 1024
 _LOGGER = logging.getLogger(__name__)
 _GLM_DSA_PREFILL_PROFILE = None
@@ -1516,7 +1517,14 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "empty_topk"
         if K > k_pe.shape[2]:
             return False, "topk_exceeds_context"
-        if not _sparse_prefill_context_ready(k_pe.shape[2]):
+        short_quantized_verify = (
+            isinstance(kv_cache, QuantizedGlmMlaKVCache)
+            and L <= _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS
+        )
+        if (
+            not short_quantized_verify
+            and not _sparse_prefill_context_ready(k_pe.shape[2])
+        ):
             return False, "below_sparse_min_context"
         if not _has_full_topk_causal_prefix(k_pe.shape[2], L, K):
             return False, "causal_prefix_shorter_than_topk"
@@ -1526,7 +1534,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if offset is None:
             return False, "non_scalar_offset"
         _warn_fast_prefill_large_topk(K)
-        return True, "fast"
+        return True, (
+            "short_quantized_verify" if short_quantized_verify else "fast"
+        )
 
     def _native_sparse_prefill_decision(
         self,
