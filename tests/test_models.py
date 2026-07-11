@@ -495,7 +495,9 @@ class TestModels(unittest.TestCase):
 
             os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = "1"
             os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
-            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
+            os.environ[
+                glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV
+            ] = "131072"
             glm_moe_dsa.reset_glm_dsa_prefill_profile()
             fast_cache = quantized_prompt_cache()
             model(prefix, cache=fast_cache)
