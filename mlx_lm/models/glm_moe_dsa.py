@@ -2179,6 +2179,45 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         output = output.reshape(B, H, L, R)
         return self._unembed_out_project(output)
 
+    def _short_quantized_verify_attention(
+        self,
+        q_nope: mx.array,
+        q_pe: mx.array,
+        kv_cache: QuantizedGlmMlaKVCache,
+        kv_latent: Any,
+        k_pe: mx.array,
+        topk_indices: mx.array,
+        mask: Optional[mx.array],
+    ):
+        latent_selected = self._gather_cached_latent(
+            kv_cache, kv_latent, topk_indices
+        )
+        k_pe_selected = _gather_sequence_by_flat_index(k_pe, topk_indices)
+        mask_selected = _gather_attention_mask(mask, topk_indices)
+        outputs = []
+        for index in range(q_nope.shape[2]):
+            q_nope_step = self.embed_q(q_nope[:, :, index : index + 1, :])
+            q_pe_step = q_pe[:, :, index : index + 1, :]
+            latent_step = latent_selected[:, :, index, :, :]
+            k_pe_step = k_pe_selected[:, :, index, :, :]
+            pe_scores = (q_pe_step * self.scale) @ k_pe_step.swapaxes(-1, -2)
+            if mask_selected is not None:
+                pe_scores = mx.where(
+                    mask_selected[:, :, index : index + 1, :],
+                    pe_scores,
+                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+                )
+            output = scaled_dot_product_attention(
+                q_nope_step,
+                latent_step,
+                latent_step,
+                cache=None,
+                scale=self.scale,
+                mask=pe_scores,
+            )
+            outputs.append(self._unembed_out_project(output))
+        return mx.concatenate(outputs, axis=2)
+
     def __call__(
         self,
         x: mx.array,
@@ -2281,6 +2320,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
 
         fast_sparse_prefill = False
         native_sparse_prefill = False
+        short_quantized_verify = False
         native_sparse_prefill_reason = None
         dense_sparse_mask_applied = False
         if topk_indices is not None:
@@ -2297,17 +2337,29 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     mask = _gather_attention_mask(mask, topk_indices)
             else:
-                native_sparse_prefill, native_sparse_prefill_reason = (
-                    self._native_sparse_prefill_decision(
-                        B=B,
-                        L=L,
-                        kv_cache=kv_cache,
-                        kv_latent=kv_latent,
-                        k_pe=k_pe,
-                        topk_indices=topk_indices,
-                    )
+                short_quantized_verify = (
+                    isinstance(kv_cache, QuantizedGlmMlaKVCache)
+                    and L <= _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS
                 )
-                if not native_sparse_prefill:
+                if short_quantized_verify:
+                    _record_native_sparse_prefill_decision(
+                        False, "short_quantized_verify_split_attention"
+                    )
+                    _record_fast_prefill_decision(
+                        True, "short_quantized_verify_split_attention"
+                    )
+                else:
+                    native_sparse_prefill, native_sparse_prefill_reason = (
+                        self._native_sparse_prefill_decision(
+                            B=B,
+                            L=L,
+                            kv_cache=kv_cache,
+                            kv_latent=kv_latent,
+                            k_pe=k_pe,
+                            topk_indices=topk_indices,
+                        )
+                    )
+                if not short_quantized_verify and not native_sparse_prefill:
                     _record_native_sparse_prefill_decision(
                         False, native_sparse_prefill_reason
                     )
@@ -2319,7 +2371,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         k_pe=k_pe,
                     )
                     _record_fast_prefill_decision(fast_sparse_prefill, reason)
-                if not native_sparse_prefill and not fast_sparse_prefill:
+                if (
+                    not short_quantized_verify
+                    and not native_sparse_prefill
+                    and not fast_sparse_prefill
+                ):
                     ensure_kv_latent_dequantized()
                     mask = self._dense_sparse_mask(mask, topk_indices, k_pe.shape[2])
                     dense_sparse_mask_applied = True
@@ -2340,7 +2396,21 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 )
 
         output = None
-        if native_sparse_prefill:
+        if short_quantized_verify:
+            output = _profile_stage(
+                "attention",
+                lambda: self._short_quantized_verify_attention(
+                    q_nope,
+                    q_pe,
+                    kv_cache,
+                    kv_latent,
+                    k_pe,
+                    topk_indices,
+                    mask,
+                ),
+                inputs=(q_nope, q_pe, kv_latent, k_pe, topk_indices, mask),
+            )
+        elif native_sparse_prefill:
             output, native_sparse_prefill_reason = (
                 self._native_sparse_prefill_attention(
                     q_nope,
@@ -2480,7 +2550,18 @@ class GlmMoeDsaModel(DeepseekV32Model):
         cache: Optional[Any] = None,
         return_pre_norm_hidden: bool = False,
     ) -> mx.array:
-        profile_token = _set_profile_scope("decode" if x.shape[1] == 1 else None)
+        cache_offset = 0
+        if cache is not None and cache[0] is not None:
+            cache_offset = _scalar_int(cache[0][0].offset) or 0
+        short_cached_decode = (
+            x.shape[1] <= _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS
+            and cache_offset > 0
+        )
+        profile_token = _set_profile_scope(
+            "decode"
+            if x.shape[1] == 1 or short_cached_decode
+            else None
+        )
         profile_decode_total = profile_token is not None
         total_start = time.perf_counter() if profile_decode_total else None
         h = self.embed_tokens(x)

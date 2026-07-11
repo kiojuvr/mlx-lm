@@ -1365,6 +1365,9 @@ def run_native_kernel_smoke(args):
         "native_smoke_mean_abs_diff": None,
         "native_smoke_passed": False,
         "native_smoke_error": None,
+        "native_smoke_benchmark_seconds_mean": None,
+        "native_smoke_benchmark_seconds_min": None,
+        "native_smoke_benchmark_seconds_p50": None,
         "native_indexer_smoke_available": indexer_status["available"],
         "native_indexer_smoke_source": indexer_status["source"],
         "native_indexer_smoke_import_error": indexer_status["import_error"],
@@ -1470,6 +1473,27 @@ def run_native_kernel_smoke(args):
                     "native_smoke_passed": max_abs_diff <= args.native_smoke_max_diff,
                 }
             )
+            if args.native_smoke_benchmark_runs > 0:
+                timings = benchmark_mx_callable(
+                    lambda: kernel(
+                        q_latent,
+                        q_pe,
+                        kv_latent,
+                        k_pe,
+                        topk_indices,
+                        scale,
+                        causal=True,
+                    ),
+                    args.native_smoke_benchmark_runs,
+                    args.native_smoke_benchmark_warmup_runs,
+                )
+                row.update(
+                    {
+                        "native_smoke_benchmark_seconds_mean": timings["mean"],
+                        "native_smoke_benchmark_seconds_min": timings["min"],
+                        "native_smoke_benchmark_seconds_p50": timings["p50"],
+                    }
+                )
         except Exception as exc:
             row["native_smoke_error"] = repr(exc)
     _run_native_indexer_smoke(row, args, indexer_status)
@@ -1770,6 +1794,9 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             "mtp_speculative_target_forwards": mtp_speculative_stats.get(
                 "target_forwards"
             ),
+            "mtp_speculative_target_model_forwards": mtp_speculative_stats.get(
+                "target_model_forwards"
+            ),
             "mtp_speculative_target_input_tokens": mtp_speculative_stats.get(
                 "target_input_tokens"
             ),
@@ -1827,6 +1854,9 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             "mtp_speculative_target_greedy_verify_tokens": (
                 mtp_speculative_stats.get("target_greedy_verify_tokens")
             ),
+            "mtp_speculative_target_sequential_verify_batches": (
+                mtp_speculative_stats.get("target_sequential_verify_batches")
+            ),
             "mtp_speculative_target_logsumexp_skipped": (
                 mtp_speculative_stats.get("target_logsumexp_skipped")
             ),
@@ -1858,6 +1888,22 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
             ),
             "mtp_speculative_iteration_topk_reuses": mtp_speculative_stats.get(
                 "mtp_iteration_topk_reuses"
+            ),
+            "mtp_speculative_target_seconds": (
+                mtp_speculative_stats.get("target_decode_seconds", 0.0)
+                + mtp_speculative_stats.get("target_verify_seconds", 0.0)
+            ),
+            "mtp_speculative_target_decode_seconds": mtp_speculative_stats.get(
+                "target_decode_seconds"
+            ),
+            "mtp_speculative_target_verify_seconds": mtp_speculative_stats.get(
+                "target_verify_seconds"
+            ),
+            "mtp_speculative_draft_seconds": mtp_speculative_stats.get(
+                "draft_seconds"
+            ),
+            "mtp_speculative_catchup_seconds": mtp_speculative_stats.get(
+                "catchup_seconds"
             ),
         }
 
@@ -2697,6 +2743,7 @@ def print_table(rows, output_format):
         "mtp_draft_tokens",
         "mtp_speculative_rounds",
         "mtp_speculative_target_forwards",
+        "mtp_speculative_target_model_forwards",
         "mtp_speculative_target_input_tokens",
         "mtp_speculative_drafted_tokens",
         "mtp_speculative_accepted_tokens",
@@ -2713,6 +2760,7 @@ def print_table(rows, output_format):
         "mtp_speculative_draft_logsumexp_skipped",
         "mtp_speculative_target_greedy_verify_batches",
         "mtp_speculative_target_greedy_verify_tokens",
+        "mtp_speculative_target_sequential_verify_batches",
         "mtp_speculative_target_logsumexp_skipped",
         "mtp_speculative_return_logprobs",
         "mtp_speculative_adaptive_fallback",
@@ -2724,7 +2772,10 @@ def print_table(rows, output_format):
         "mtp_speculative_adaptive_fallback_mtp_cache_abandoned_tokens",
         "mtp_speculative_iteration_topk_reuses",
         "mtp_speculative_target_seconds",
+        "mtp_speculative_target_decode_seconds",
+        "mtp_speculative_target_verify_seconds",
         "mtp_speculative_draft_seconds",
+        "mtp_speculative_catchup_seconds",
         "checkpoint_resolution",
         "glm_dsa_prefill_profile",
         "glm_dsa_prefill_profile_isolate",
@@ -2819,6 +2870,9 @@ def print_table(rows, output_format):
         "native_smoke_mean_abs_diff",
         "native_smoke_passed",
         "native_smoke_error",
+        "native_smoke_benchmark_seconds_mean",
+        "native_smoke_benchmark_seconds_min",
+        "native_smoke_benchmark_seconds_p50",
         "native_indexer_smoke_available",
         "native_indexer_smoke_source",
         "native_indexer_smoke_import_error",

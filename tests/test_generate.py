@@ -270,7 +270,17 @@ class TestGenerateUtilities(unittest.TestCase):
         model = DummyModel()
         stats = {}
         old_make_cache = generate_module.cache.make_prompt_cache
+        old_quantization_metadata = (
+            generate_module.cache.glm_mla_kv_quantization_metadata
+        )
+        old_sequential_verify = (
+            generate_module._mtp_sequential_quantized_verify_enabled
+        )
         generate_module.cache.make_prompt_cache = lambda _model: model.target_cache
+        generate_module.cache.glm_mla_kv_quantization_metadata = lambda _cache: {
+            "glm_mla_latent_int8_layers": 1
+        }
+        generate_module._mtp_sequential_quantized_verify_enabled = lambda: True
         try:
             rows = list(
                 mtp_speculative_generate_step(
@@ -283,6 +293,12 @@ class TestGenerateUtilities(unittest.TestCase):
             )
         finally:
             generate_module.cache.make_prompt_cache = old_make_cache
+            generate_module.cache.glm_mla_kv_quantization_metadata = (
+                old_quantization_metadata
+            )
+            generate_module._mtp_sequential_quantized_verify_enabled = (
+                old_sequential_verify
+            )
 
         self.assertEqual(
             [int(token) for token, _logprobs, _draft in rows],
@@ -299,9 +315,11 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(stats["draft_logsumexp_skipped"], 4)
         self.assertEqual(stats["accepted_tokens"], 2)
         self.assertEqual(stats["target_forwards"], 2)
+        self.assertEqual(stats["target_model_forwards"], 3)
         self.assertEqual(stats["target_input_tokens"], 6)
         self.assertEqual(stats["target_greedy_verify_batches"], 2)
         self.assertEqual(stats["target_greedy_verify_tokens"], 6)
+        self.assertEqual(stats["target_sequential_verify_batches"], 1)
         self.assertEqual(stats["mtp_iteration_topk_reuses"], 3)
         self.assertEqual(model.mtp_topk_reuses, 3)
         self.assertEqual(stats["target_logsumexp_skipped"], 0)
@@ -309,6 +327,9 @@ class TestGenerateUtilities(unittest.TestCase):
         self.assertEqual(stats["target_tokens"], 3)
         self.assertEqual(stats["emitted_tokens"], 5)
         self.assertEqual(stats["catchup_forwards"], 1)
+        self.assertGreaterEqual(stats["target_verify_seconds"], 0.0)
+        self.assertGreaterEqual(stats["draft_seconds"], 0.0)
+        self.assertGreaterEqual(stats["catchup_seconds"], 0.0)
         self.assertAlmostEqual(stats["acceptance_rate"], 0.5)
         self.assertAlmostEqual(stats["mean_accepted"], 1.0)
         self.assertAlmostEqual(stats["emitted_per_target_forward"], 2.5)

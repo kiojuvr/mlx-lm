@@ -141,10 +141,10 @@ Current local measurements use a single-device M3 Ultra 512GB Mac Studio, the
 KV cache, native sparse MLA over quantized KV, and the serving command below.
 
 The updated checkpoint includes native MTP-layer weights. This fork can load
-those weights and exposes an opt-in GLM DSA MTP speculative decode path through
-`--mtp-speculative`, but the recommended long-context OpenCode server command
-below intentionally keeps it disabled. The decode numbers below are therefore
-single-stream baseline decode numbers, not MTP-accelerated decode.
+those weights and exposes GLM DSA MTP speculative decode through
+`--mtp-speculative`; the recommended long-context OpenCode server command below
+now enables one draft token. The historical decode numbers below remain
+single-stream target-only baseline measurements unless explicitly labeled MTP.
 
 Recent OpenCode task log, July 9, 2026. This run primarily measured
 server-cache-covered suffix prefill; disk checkpoint candidates were found, but
@@ -211,6 +211,8 @@ python -m mlx_lm server \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
+  --mtp-speculative \
+  --num-draft-tokens 1 \
   --loop-guard-ngram-size 64 \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256 \
@@ -283,9 +285,13 @@ pool loops such as the same action signature repeating via
 
 Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that reuses disk prompt checkpoints and saves post-response continued/delta checkpoints asynchronously. Keep `--checkpoint-prefill-frontier-save disabled` for interactive OpenCode sessions: synchronous frontier saves during prefill can write multi-GB checkpoint files before the first decoded token, blocking the active response long enough to trip operation timeouts. Existing prefix/frontier/delta checkpoints are still eligible for lookup and reuse when this is disabled. Enable prefill frontier saves only for controlled cache-building runs where a long foreground save is acceptable. `--checkpoint-delta-chunk-tokens 8192` stores long post-response deltas as a chain of smaller delta checkpoint files; this avoids repeatedly rewriting one huge suffix and lets later saves extend the deepest reusable checkpoint. Use `--checkpoint-delta-chunk-tokens 0` only when you need the legacy single-file delta behavior for comparison. Disable final exact checkpoints for this long-running server profile: 190K-token exact checkpoints are around 11GB each on the tested setup and can spend tens of seconds writing only to be pruned immediately. The measured cold-prefill sweep now favors `--prefill-step-size 8192`, `--prefill-max-qk-tokens 67108864`, and adaptive GLM DSA prefill disabled (`--glm-dsa-adaptive-prefill-step-size 0`). The QK cap shrinks only the chunks whose query-by-context product would get too large; the 8192-token first chunk crosses the native sparse handoff immediately, then later chunks shrink automatically as the cap requires. Keep `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` at its default/effective 131072 handoff for the Python selected-KV sparse path; lowering that handoff increased runtime and memory in the tested 128K runs. The vendored native DSA indexer route is enabled by default through `MLX_LM_GLM_DSA_NATIVE_INDEXER` and can replace the Python/MLX indexer score plus top-k path for supported GLM-5.2 M3 prefill chunks at context 4096 and above. Its single-query decode score probe is separate and remains disabled unless `MLX_LM_GLM_DSA_NATIVE_DECODE_INDEXER=1`; the 8K exact-hit 64-token A/B measured it slightly slower than the existing decode path. The vendored native sparse MLA route has its own lower handoff, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 6144). `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1` lets it consume int8 GLM MLA KV cache by temporarily dequantizing the full latent KV cache for the native kernel; the recommended `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144` has been profiled through 204800 tokens with all chunks on the native sparse route and no dense fallback. Keep larger values bounded until your target context length is profiled. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery or memory pressure appears on your real prompt distribution, retry with `--prefill-step-size 4096` first, then 2048 and 1024.
 
-`--mtp-speculative --num-draft-tokens 2` enables the built-in GLM DSA MTP layer
-as an experimental speculative decode path. It is intentionally not in the
-recommended OpenCode command yet. Server MTP mode disables batching and keeps
+`--mtp-speculative --num-draft-tokens 1` enables the built-in GLM DSA MTP layer
+for the recommended single-request OpenCode path. On the tested 8K-context,
+64-token synthetic decode, the optimized MTP path reached 17.45 tok/s versus
+16.64 tok/s for target-only decode (about 4.8% faster). The gain is modest and
+depends on acceptance rate; one draft token is recommended because recursive
+two-token drafting reduced acceptance on this checkpoint. Server MTP mode
+disables batching and keeps
 disk prompt checkpoints separate from target-only checkpoints, but it now uses a
 dedicated `mtp-speculative` RAM prompt-cache namespace for repeated prompts. An
 exact RAM hit trims one token and prefills only that suffix token so the MTP
@@ -322,12 +328,13 @@ full-vocabulary normalization. `target_logsumexp_skipped` counts those emitted
 positions and `return_logprobs=false` confirms the practical server path.
 Short target verification batches of up to eight tokens use selected-KV sparse
 attention when the MLA cache is int8, even below the normal 131K Python sparse
-prefill handoff. This prevents a missing native quantized-KV opt-in from
-dequantizing and projecting the full context during MTP verification. The
-recommended native quantized-KV route still takes priority when enabled. That
-native route now compacts each verification query's causal top-k rows before
-dequantization and passes the compact float KV to the fused sparse MLA kernel;
-it no longer materializes the full float KV cache for every MTP target forward.
+prefill handoff. The selected rows are gathered and dequantized once, then each
+query uses the optimized one-token MLX attention path. This keeps one batched
+target-model forward per speculative round while avoiding the much slower
+short-query native sparse kernel and full-context float KV materialization.
+Set `MLX_LM_MTP_SEQUENTIAL_QUANTIZED_VERIFY=1` only for diagnosis; it rebuilds
+the same verification with separate one-token target forwards and is slower on
+the tested checkpoint.
 After 16 drafted tokens, the default adaptive guard falls back to regular
 one-token target decode when observed MTP acceptance remains below `0.20`. This
 fallback reuses the already-verified target cache and requires no re-prefill.

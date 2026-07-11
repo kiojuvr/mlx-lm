@@ -57,6 +57,9 @@ DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 GLM_DSA_MTP_ENV = "MLX_LM_GLM_DSA_MTP"
+MTP_SEQUENTIAL_QUANTIZED_VERIFY_ENV = (
+    "MLX_LM_MTP_SEQUENTIAL_QUANTIZED_VERIFY"
+)
 PROMPT_CHECKPOINT_DEBUG_ENV = "MLX_LM_PROMPT_CHECKPOINT_DEBUG"
 PROMPT_CHECKPOINT_FRONTIER_MIN_TOKENS = 8192
 PROMPT_CHECKPOINT_FRONTIER_STRIDE_TOKENS = 16384
@@ -67,6 +70,13 @@ PROMPT_CHECKPOINT_MAX_FRONTIERS_PER_RUN = 16
 DEFAULT_PREFILL_MAX_QK_TOKENS = 67_108_864
 DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS = 16
 DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE = 0.20
+
+
+def _mtp_sequential_quantized_verify_enabled() -> bool:
+    value = os.environ.get(MTP_SEQUENTIAL_QUANTIZED_VERIFY_ENV)
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _prompt_checkpoint_debug(message):
@@ -1796,6 +1806,7 @@ def mtp_speculative_generate_step(
         {
             "rounds": 0,
             "target_forwards": 0,
+            "target_model_forwards": 0,
             "target_input_tokens": 0,
             "drafted_tokens": 0,
             "accepted_tokens": 0,
@@ -1803,6 +1814,10 @@ def mtp_speculative_generate_step(
             "emitted_tokens": 0,
             "catchup_forwards": 0,
             "catchup_logits_skipped": 0,
+            "target_decode_seconds": 0.0,
+            "target_verify_seconds": 0.0,
+            "draft_seconds": 0.0,
+            "catchup_seconds": 0.0,
             "num_draft_tokens": int(num_draft_tokens),
             "cached_prompt_tokens": int(cached_prompt_tokens),
             "fresh_prompt_tokens": int(prompt.size),
@@ -1813,6 +1828,7 @@ def mtp_speculative_generate_step(
             "draft_logsumexp_skipped": 0,
             "target_greedy_verify_batches": 0,
             "target_greedy_verify_tokens": 0,
+            "target_sequential_verify_batches": 0,
             "target_logsumexp_skipped": 0,
             "return_logprobs": not skip_target_logprobs,
             "adaptive_fallback_min_drafted_tokens": int(
@@ -2073,6 +2089,7 @@ def mtp_speculative_generate_step(
             else min(num_draft_tokens, max(remaining - 1, 0))
         )
         if num_draft == 0:
+            target_decode_t0 = time.perf_counter()
             with mx.stream(generation_stream):
                 logits, hidden = model.forward_with_hidden(
                     current[None],
@@ -2096,11 +2113,15 @@ def mtp_speculative_generate_step(
                     )
                 )
             stats["target_forwards"] += 1
+            stats["target_model_forwards"] += 1
             stats["target_input_tokens"] += 1
             if adaptive_fallback:
                 stats["adaptive_fallback_target_forwards"] += 1
                 stats["adaptive_fallback_mtp_cache_abandoned_tokens"] += 1
             mx.eval(next_token)
+            stats["target_decode_seconds"] += (
+                time.perf_counter() - target_decode_t0
+            )
             current = next_token
             previous_hidden = next_hidden
             _append_history(current)
@@ -2137,6 +2158,7 @@ def mtp_speculative_generate_step(
                     prefetched_draft_hidden = None
                     prefetched_draft_topk = None
                 else:
+                    draft_t0 = time.perf_counter()
                     mtp_kwargs = {}
                     if (
                         share_iteration_topk
@@ -2163,6 +2185,7 @@ def mtp_speculative_generate_step(
                     stats["draft_logsumexp_skipped"] += 1
                 if not use_prefetched_draft:
                     _eval_mtp(mtp_logits, mtp_hidden)
+                    stats["draft_seconds"] += time.perf_counter() - draft_t0
                 mx.async_eval(proposal, mtp_hidden)
                 stats["drafted_tokens"] += 1
                 draft_tokens.append(proposal)
@@ -2171,12 +2194,40 @@ def mtp_speculative_generate_step(
                 if use_logits_processors:
                     draft_history = _history_with(draft_history, proposal)
 
-            target_inputs = mx.concatenate([current] + draft_tokens, axis=0)[None]
-            logits, hidden = model.forward_with_hidden(
-                target_inputs,
-                cache=target_cache,
-            )
-            _quantize_runtime_cache(target_cache)
+            target_verify_t0 = time.perf_counter()
+            quantized_glm_mla = cache.glm_mla_kv_quantization_metadata(
+                target_cache
+            )["glm_mla_latent_int8_layers"] > 0
+            if (
+                num_draft == 1
+                and quantized_glm_mla
+                and _mtp_sequential_quantized_verify_enabled()
+            ):
+                verify_logits = []
+                verify_hidden = []
+                for target_input in (current, draft_tokens[0]):
+                    step_logits, step_hidden = model.forward_with_hidden(
+                        target_input[None],
+                        cache=target_cache,
+                    )
+                    _quantize_runtime_cache(target_cache)
+                    _eval_target(step_logits, step_hidden)
+                    verify_logits.append(step_logits)
+                    verify_hidden.append(step_hidden)
+                logits = mx.concatenate(verify_logits, axis=1)
+                hidden = mx.concatenate(verify_hidden, axis=1)
+                stats["target_sequential_verify_batches"] += 1
+                stats["target_model_forwards"] += 2
+            else:
+                target_inputs = mx.concatenate(
+                    [current] + draft_tokens, axis=0
+                )[None]
+                logits, hidden = model.forward_with_hidden(
+                    target_inputs,
+                    cache=target_cache,
+                )
+                _quantize_runtime_cache(target_cache)
+                stats["target_model_forwards"] += 1
         stats["target_forwards"] += 1
         stats["target_input_tokens"] += num_draft + 1
 
@@ -2231,6 +2282,7 @@ def mtp_speculative_generate_step(
                 accepted += 1
 
         _eval_target(logits, hidden)
+        stats["target_verify_seconds"] += time.perf_counter() - target_verify_t0
 
         cache_trim = num_draft - accepted
         if cache_trim:
@@ -2265,6 +2317,7 @@ def mtp_speculative_generate_step(
 
         if accepted == num_draft:
             catch_prev_hidden = hidden[:, num_draft - 1 : num_draft, :]
+            catchup_t0 = time.perf_counter()
             with mx.stream(generation_stream):
                 catchup_kwargs = {}
                 if share_iteration_topk and iteration_topk_indices is not None:
@@ -2291,6 +2344,7 @@ def mtp_speculative_generate_step(
                     _eval_mtp_prefill(catch_hidden)
                 else:
                     _eval_mtp(catch_logits, catch_hidden)
+            stats["catchup_seconds"] += time.perf_counter() - catchup_t0
             stats["catchup_forwards"] += 1
             _update_stats()
 
