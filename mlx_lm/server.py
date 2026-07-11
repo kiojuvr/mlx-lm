@@ -853,6 +853,39 @@ class GlobalSessionLoopGuard:
             count += 1
         return count
 
+    def _repeated_tool_turn_pattern(self, limit, max_period=4):
+        if limit <= 1:
+            return None
+        events = list(self._events)
+        max_period = min(max_period, len(events) // limit)
+        for period in range(1, max_period + 1):
+            pattern = events[-period:]
+            if not all(event.kind == "tool_call" for event in pattern):
+                continue
+            pattern_keys = [
+                (event.finish_reason, event.generated_tokens) for event in pattern
+            ]
+            if not all(tokens > 0 for _finish_reason, tokens in pattern_keys):
+                continue
+            repeats = 1
+            cursor = len(events) - 2 * period
+            while cursor >= 0:
+                candidate = events[cursor : cursor + period]
+                candidate_keys = [
+                    (event.finish_reason, event.generated_tokens)
+                    for event in candidate
+                ]
+                if (
+                    not all(event.kind == "tool_call" for event in candidate)
+                    or candidate_keys != pattern_keys
+                ):
+                    break
+                repeats += 1
+                cursor -= period
+            if repeats >= limit:
+                return period, repeats
+        return None
+
     def decision(self, args):
         history_size = _prompt_checkpoint_policy_int(
             args, "session_loop_history_size", 256
@@ -905,6 +938,18 @@ class GlobalSessionLoopGuard:
                     return SessionLoopGuardDecision(
                         "global_repeated_action_signature",
                         repeated,
+                        repeated_action_limit,
+                    )
+
+            if repeated_action_limit > 0:
+                pattern = self._repeated_tool_turn_pattern(
+                    repeated_action_limit
+                )
+                if pattern is not None:
+                    period, repeats = pattern
+                    return SessionLoopGuardDecision(
+                        f"global_repeated_tool_turn_pattern_p{period}",
+                        repeats,
                         repeated_action_limit,
                     )
 

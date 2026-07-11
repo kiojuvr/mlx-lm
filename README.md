@@ -246,10 +246,14 @@ shows a non-tool loop: too many turns without visible assistant progress, or
 repeated visible output/action signatures inside the bounded pool. It
 intentionally does not count total tool-call turns at request-history or
 process-global scope because legitimate tasks may issue many tools over a long
-run. On detection it returns a short assistant message asking the client to stop
-the same action loop, summarize state, and ask the user before continuing. This
-is intentionally suited to personal OpenCode serving; do not use it as-is for
-multi-user serving where independent conversations need separate loop histories.
+run. It does detect a consecutive period-1 through period-4 tool-turn pattern
+when the same generated-token shape repeats for
+`--session-loop-repeated-action-limit` cycles, even if changing arguments keep
+the exact action JSON signatures different. On detection it returns a short
+assistant message asking the client to stop the same action loop, summarize
+state, and ask the user before continuing. This is intentionally suited to
+personal OpenCode serving; do not use it as-is for multi-user serving where
+independent conversations need separate loop histories.
 
 The recommended server command intentionally leaves `--temp` and `--top-p` unset so request-side clients can control sampling. OpenCode requests in the tested setup omitted repetition controls, so the server supplies a mild `--repetition-penalty 1.05` over the most recent 1024 tokens. Request-level `repetition_penalty` and `repetition_context_size` still take precedence. Set the penalty to `0` to disable it for an A/B run.
 

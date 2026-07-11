@@ -404,6 +404,46 @@ class TestGlobalSessionLoopGuard(unittest.TestCase):
         self.assertEqual(decision.reason, "global_repeated_action_signature")
         self.assertEqual(decision.count, 3)
 
+    def test_detects_periodic_tool_turn_pattern_with_varying_actions(self):
+        guard = GlobalSessionLoopGuard()
+        args = self._args(session_loop_repeated_action_limit=8)
+
+        for cycle in range(8):
+            for generated_tokens in (220, 41):
+                guard.observe(
+                    request_id=f"r-{cycle}-{generated_tokens}",
+                    finish_reason="tool_calls",
+                    made_tool_call=True,
+                    action_text=(
+                        '{"name":"edit","arguments":{"offset":'
+                        f"{cycle * 1000 + generated_tokens}}}"
+                    ),
+                    generated_tokens=generated_tokens,
+                )
+
+        decision = guard.decision(args)
+        self.assertIsNotNone(decision)
+        self.assertEqual(
+            decision.reason,
+            "global_repeated_tool_turn_pattern_p2",
+        )
+        self.assertEqual(decision.count, 8)
+
+    def test_periodic_tool_turn_pattern_requires_consecutive_cycles(self):
+        guard = GlobalSessionLoopGuard()
+        args = self._args(session_loop_repeated_action_limit=3)
+
+        for index, generated_tokens in enumerate((220, 41, 220, 42, 220, 41)):
+            guard.observe(
+                request_id=f"r-{index}",
+                finish_reason="tool_calls",
+                made_tool_call=True,
+                action_text=f'{{"arguments":{{"n":{index}}}}}',
+                generated_tokens=generated_tokens,
+            )
+
+        self.assertIsNone(guard.decision(args))
+
 
 class TestPromptCheckpointPolicy(unittest.TestCase):
     @staticmethod
