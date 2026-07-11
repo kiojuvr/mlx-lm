@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mlx_lm.generate import PROMPT_CHECKPOINT_DEBUG_ENV, BatchGenerator, BatchStats
 from mlx_lm.generate import (
+    DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE,
     DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
     DEFAULT_PREFILL_MAX_QK_TOKENS,
 )
@@ -1729,7 +1730,9 @@ def run_decode_context_once(model, tokenizer, prompt, args, case_name):
                 DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_DRAFTED_TOKENS,
             ),
             mtp_adaptive_fallback_min_acceptance_rate=getattr(
-                args, "mtp_adaptive_fallback_min_acceptance_rate", 0.20
+                args,
+                "mtp_adaptive_fallback_min_acceptance_rate",
+                DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE,
             ),
             prompt_checkpoint=checkpoint_enabled,
             prompt_checkpoint_store_prefix_lengths=(
@@ -3604,7 +3607,7 @@ def main():
     parser.add_argument(
         "--mtp-adaptive-fallback-min-acceptance-rate",
         type=float,
-        default=0.20,
+        default=DEFAULT_MTP_ADAPTIVE_FALLBACK_MIN_ACCEPTANCE_RATE,
         help="Minimum observed MTP acceptance rate before adaptive fallback.",
     )
     parser.add_argument("--prefill-step-size", type=int, default=2048)

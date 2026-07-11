@@ -1637,8 +1637,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.quantized_kv_start, 0)
         self.assertFalse(args.disable_batching)
         self.assertFalse(args.mtp_speculative)
-        self.assertEqual(args.mtp_adaptive_fallback_min_drafted_tokens, 4)
-        self.assertEqual(args.mtp_adaptive_fallback_min_acceptance_rate, 0.20)
+        self.assertEqual(args.mtp_adaptive_fallback_min_drafted_tokens, 8)
+        self.assertEqual(args.mtp_adaptive_fallback_min_acceptance_rate, 0.50)
         self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
         self.assertEqual(args.glm_dsa_adaptive_prefill_step_size, 0)
         self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 0)
@@ -2256,10 +2256,10 @@ class TestServerCLI(unittest.TestCase):
         self.assertTrue(captured["mtp_speculative"])
         self.assertFalse(captured["mtp_return_logprobs"])
         self.assertEqual(
-            captured["mtp_adaptive_fallback_min_drafted_tokens"], 4
+            captured["mtp_adaptive_fallback_min_drafted_tokens"], 8
         )
         self.assertEqual(
-            captured["mtp_adaptive_fallback_min_acceptance_rate"], 0.20
+            captured["mtp_adaptive_fallback_min_acceptance_rate"], 0.50
         )
         self.assertEqual(captured["prompt_checkpoint_full_prompt"], prompt)
         self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 3)
