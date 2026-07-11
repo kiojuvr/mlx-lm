@@ -212,6 +212,8 @@ python -m mlx_lm server \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
+  --repetition-penalty 1.05 \
+  --repetition-context-size 1024 \
   --loop-guard-ngram-size 64 \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256 \
@@ -249,9 +251,9 @@ the same action loop, summarize state, and ask the user before continuing. This
 is intentionally suited to personal OpenCode serving; do not use it as-is for
 multi-user serving where independent conversations need separate loop histories.
 
-The recommended server command intentionally leaves `--temp` and `--top-p` unset so request-side clients can control sampling. In local use, lower-temperature request settings helped reduce repetitive reasoning loops and “thought-loop” style failure modes while still preserving enough diversity for useful responses.
+The recommended server command intentionally leaves `--temp` and `--top-p` unset so request-side clients can control sampling. OpenCode requests in the tested setup omitted repetition controls, so the server supplies a mild `--repetition-penalty 1.05` over the most recent 1024 tokens. Request-level `repetition_penalty` and `repetition_context_size` still take precedence. Set the penalty to `0` to disable it for an A/B run.
 
-`--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it. If the model still enters near-duplicate but non-exact loops, lower request sampling first (`temperature`, `top_p`) and add a small request-side `repetition_penalty` such as `1.05` to `1.10` when your client supports it.
+`--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it only for controlled diagnosis. Keep the guard enabled in normal use: the repetition penalty reduces the chance of entering a loop, while the guard bounds damage if prevention fails.
 
 `--reasoning-loop-guard-*` is a text-span guard for reasoning doom loops that
 do not line up with exact token n-grams. The recommended settings follow the

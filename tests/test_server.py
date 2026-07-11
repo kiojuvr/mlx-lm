@@ -1639,6 +1639,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertFalse(args.mtp_speculative)
         self.assertEqual(args.mtp_adaptive_fallback_min_drafted_tokens, 8)
         self.assertEqual(args.mtp_adaptive_fallback_min_acceptance_rate, 0.50)
+        self.assertEqual(args.repetition_penalty, 0.0)
+        self.assertEqual(args.repetition_context_size, 20)
         self.assertEqual(args.prefill_max_qk_tokens, 67_108_864)
         self.assertEqual(args.glm_dsa_adaptive_prefill_step_size, 0)
         self.assertEqual(args.glm_dsa_adaptive_prefill_after_tokens, 0)
@@ -1647,6 +1649,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(
             args.checkpoint_min_tokens, DEFAULT_PROMPT_CHECKPOINT_MIN_TOKENS
         )
+
         self.assertEqual(
             args.checkpoint_cold_max_tokens,
             DEFAULT_PROMPT_CHECKPOINT_COLD_MAX_TOKENS,
@@ -1712,6 +1715,19 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.prefill_progress_interval_tokens, 0)
         self.assertEqual(args.request_max_tokens_floor, 0)
         self.assertEqual(args.checkpoint_save_exact, "enabled")
+
+    def test_setup_arg_parser_accepts_repetition_defaults(self):
+        args = setup_arg_parser().parse_args(
+            [
+                "--repetition-penalty",
+                "1.05",
+                "--repetition-context-size",
+                "1024",
+            ]
+        )
+
+        self.assertEqual(args.repetition_penalty, 1.05)
+        self.assertEqual(args.repetition_context_size, 1024)
 
     def test_setup_arg_parser_disable_batching(self):
         args = setup_arg_parser().parse_args(["--disable-batching"])

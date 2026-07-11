@@ -3738,8 +3738,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
         self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
         self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
-        self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.repetition_penalty = self.body.get(
+            "repetition_penalty",
+            getattr(self.response_generator.cli_args, "repetition_penalty", 0.0),
+        )
+        self.repetition_context_size = self.body.get(
+            "repetition_context_size",
+            getattr(
+                self.response_generator.cli_args,
+                "repetition_context_size",
+                20,
+            ),
+        )
         self.presence_penalty = self.body.get("presence_penalty", 0.0)
         self.presence_context_size = self.body.get("presence_context_size", 20)
         self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
@@ -3755,7 +3765,8 @@ class APIHandler(BaseHTTPRequestHandler):
         logging.info(
             "request parameters: path=%s stream=%s model=%s "
             "max_tokens=%s requested_max_tokens=%s max_tokens_source=%s "
-            "max_tokens_floor_applied=%s temperature=%s top_p=%s",
+            "max_tokens_floor_applied=%s temperature=%s top_p=%s "
+            "repetition_penalty=%s repetition_context_size=%s",
             self.path,
             self.stream,
             self.requested_model,
@@ -3765,6 +3776,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.max_tokens_floor_applied,
             self.temperature,
             self.top_p,
+            self.repetition_penalty,
+            self.repetition_context_size,
         )
 
         # Get stop sequences
@@ -5465,6 +5478,24 @@ def setup_arg_parser():
         type=float,
         default=0.0,
         help="Default min-p sampling (default: 0.0, disables min-p)",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "Default repetition penalty when the request omits it "
+            "(default: 0.0, disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--repetition-context-size",
+        type=int,
+        default=20,
+        help=(
+            "Default recent-token window for repetition penalty "
+            "(default: 20)."
+        ),
     )
     parser.add_argument(
         "--max-tokens",
