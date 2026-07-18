@@ -31,11 +31,23 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 xcodebuild -downloadComponent MetalToolchain
 ```
 
+Xcode 26.6 may leave the installed Metal Toolchain unselected and invoke the
+stub in `XcodeDefault.xctoolchain` instead. For the current known-good Xcode
+26.6 toolchain, set `TOOLCHAINS=com.apple.dt.toolchain.Metal.32023.883` when
+building. Confirm the selected compiler with:
+
+```sh
+TOOLCHAINS=com.apple.dt.toolchain.Metal.32023.883 \
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcrun metal --version
+```
+
 The build requires MLX 0.31.2, CMake 3.27+, nanobind 2.12.0, and wheel/setuptools
 inside the isolated build environment. The `pyproject.toml` build-system section
 pins those build dependencies. With `uv`, rebuild the editable install with:
 
 ```sh
+TOOLCHAINS=com.apple.dt.toolchain.Metal.32023.883 \
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 MLX_LM_WITH_CUSTOM_KERNEL=1 \
 uv pip install --python /Users/kioju/.venvs/mlx-glm52/bin/python --no-deps -e .
@@ -122,6 +134,7 @@ Install this checkout as the active editable `mlx-lm` package. Add
 built into the editable install:
 
 ```sh
+TOOLCHAINS=com.apple.dt.toolchain.Metal.32023.883 \
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 MLX_LM_WITH_CUSTOM_KERNEL=1 \
 uv pip install --python /Users/kioju/.venvs/mlx-glm52/bin/python --no-deps -e .
