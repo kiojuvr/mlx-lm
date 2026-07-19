@@ -237,7 +237,7 @@ python -m mlx_lm server \
   --reasoning-loop-guard-max-span-chars 2048 \
   --session-loop-history-size 256 \
   --session-loop-max-no-progress-turns 64 \
-  --session-loop-repeated-output-limit 4 \
+  --session-loop-repeated-output-limit 64 \
   --session-loop-repeated-action-limit 8
 ```
 
