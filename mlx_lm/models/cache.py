@@ -1676,7 +1676,7 @@ def _glm_dsa_metadata(model):
             1 if getattr(self_attn, "skip_topk", False) else 2
         )
 
-    return {
+    metadata = {
         "model_type": model_type,
         "indexer_types": config.get("indexer_types"),
         "index_topk": config.get("index_topk"),
@@ -1687,6 +1687,10 @@ def _glm_dsa_metadata(model):
         "index_skip_topk_offset": config.get("index_skip_topk_offset"),
         "layer_cache_widths": layer_cache_widths,
     }
+    semantics_version = getattr(model, "prompt_cache_semantics_version", None)
+    if semantics_version is not None:
+        metadata["prompt_cache_semantics_version"] = semantics_version
+    return metadata
 
 
 def _state_signature(value):

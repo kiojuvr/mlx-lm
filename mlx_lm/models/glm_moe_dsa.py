@@ -1155,6 +1155,50 @@ def _has_full_topk_causal_prefix(total_context: int, query_length: int, topk: in
     return total_context - query_length + 1 >= topk
 
 
+def _causal_topk_prefix_rows(
+    total_context: int, query_length: int, topk: int
+) -> int:
+    """Number of leading query rows whose exact top-k is the causal prefix."""
+    query_offset = total_context - query_length
+    return min(query_length, max(0, topk - query_offset))
+
+
+def _index_share_pipeline_boundaries(
+    indexer_types: List[str], pipeline_size: int
+) -> List[int]:
+    """Split layers without starting a pipeline stage on a shared indexer."""
+    num_layers = len(indexer_types)
+    if pipeline_size < 1:
+        raise ValueError("pipeline_size must be positive")
+    if pipeline_size > num_layers:
+        raise ValueError("pipeline_size cannot exceed the number of layers")
+    if not indexer_types or indexer_types[0] != "full":
+        raise ValueError("the first GLM DSA layer must own a full indexer")
+    if pipeline_size == 1:
+        return [0, num_layers]
+
+    candidates = [
+        idx
+        for idx, indexer_type in enumerate(indexer_types[1:], start=1)
+        if indexer_type == "full"
+    ]
+    if len(candidates) < pipeline_size - 1:
+        raise ValueError(
+            "pipeline parallelism requires every stage to start on a full "
+            "GLM DSA indexer layer"
+        )
+
+    boundaries = [0]
+    for split in range(1, pipeline_size):
+        available = [idx for idx in candidates if idx > boundaries[-1]]
+        remaining = pipeline_size - split - 1
+        eligible = available[: len(available) - remaining]
+        target = round(split * num_layers / pipeline_size)
+        boundaries.append(min(eligible, key=lambda idx: (abs(idx - target), idx)))
+    boundaries.append(num_layers)
+    return boundaries
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -1196,6 +1240,8 @@ class ModelArgs(BaseModelArgs):
     index_skip_topk_offset: int = 2
     num_nextn_predict_layers: int = 0
     index_share_for_mtp_iteration: bool = False
+    indexer_norm_eps: float = 1e-6
+    indexer_rope_interleave: bool = True
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
@@ -1217,6 +1263,17 @@ class ModelArgs(BaseModelArgs):
                     "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
                     for i in range(self.num_hidden_layers)
                 ]
+        if len(self.indexer_types) != self.num_hidden_layers:
+            raise ValueError(
+                "indexer_types must contain exactly one entry per decoder layer"
+            )
+        invalid_indexer_types = set(self.indexer_types) - {"full", "shared"}
+        if invalid_indexer_types:
+            raise ValueError(
+                f"unsupported GLM DSA indexer types: {sorted(invalid_indexer_types)}"
+            )
+        if not self.indexer_types or self.indexer_types[0] != "full":
+            raise ValueError("the first GLM DSA layer must own a full indexer")
 
 
 class GlmMoeDsaAttention(DeepseekV32Attention):
@@ -1234,6 +1291,20 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         )
         if self.skip_topk:
             self.indexer = None
+
+    def _indexer_head_weights(self, x: mx.array) -> mx.array:
+        """Project Indexer head weights in FP32, matching the reference model."""
+        indexer = self.indexer
+        projection = indexer.weights_proj
+        if isinstance(projection, nn.Linear):
+            weights = projection(x.astype(projection.weight.dtype)).astype(
+                mx.float32
+            )
+        else:
+            # Quantized third-party checkpoints cannot retain an FP32 linear
+            # weight. Their projection remains the best available fallback.
+            weights = projection(x).astype(mx.float32)
+        return weights * (indexer.n_heads**-0.5)
 
     def _indexer_topk(
         self,
@@ -1263,12 +1334,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         native_indices = self._native_indexer_topk(q, x, k, mask)
         if native_indices is not None:
             return native_indices
-        if (
-            _fast_prefill_enabled()
-            and b == 1
-            and s > 1
-            and _sparse_prefill_context_ready(k.shape[2])
-        ):
+        if _fast_prefill_enabled() and b == 1 and s > 1:
+            # Once the FP32 reference projection disables the 16-bit native
+            # Indexer, a dense [B, H, L, S] score tensor is prohibitively large
+            # even well below the sparse-attention activation threshold.
             return self._block_indexer_topk(q, x, k, mask)
         return self._dense_indexer_topk(q, x, k, mask)
 
@@ -1298,11 +1367,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         mask: Optional[mx.array],
     ):
         indexer = self.indexer
-        scores = q @ k.swapaxes(-1, -2)
+        scores = (
+            q.astype(mx.float32)
+            @ k.astype(mx.float32).swapaxes(-1, -2)
+        ) * indexer.softmax_scale
         scores = mx.maximum(scores, 0)
-        weights = indexer.weights_proj(x) * (
-            indexer.n_heads**-0.5 * indexer.softmax_scale
-        )
+        weights = self._indexer_head_weights(x)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
         scores = scores.sum(axis=1, keepdims=True)
@@ -1349,6 +1419,16 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "mixed_index_head_dim"
         if indexer.index_topk != 2048:
             return False, f"unsupported_topk:{indexer.index_topk}"
+        projection = getattr(indexer, "weights_proj", None)
+        projection_weight = getattr(projection, "weight", None)
+        if (
+            projection_weight is not None
+            and projection_weight.dtype == mx.float32
+        ):
+            # The native Indexer currently accepts and stores only 16-bit
+            # scores. Keep FP32 reference semantics until that kernel supports
+            # FP32 head weights and score output end-to-end.
+            return False, "fp32_indexer_weights"
         if k.shape[2] < 4096:
             return False, "below_native_indexer_min_context"
         if q.dtype not in (mx.float16, mx.bfloat16):
@@ -1370,9 +1450,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return None
 
         indexer = self.indexer
-        weights = indexer.weights_proj(x) * (
-            indexer.n_heads**-0.5 * indexer.softmax_scale
-        )
+        weights = self._indexer_head_weights(x).astype(q.dtype)
+        weights = weights * indexer.softmax_scale
         if weights.dtype != q.dtype:
             _record_native_indexer_decision(False, "mixed_weight_dtype")
             return None
@@ -1421,15 +1500,14 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         topk = indexer.index_topk
         query_chunk = _fast_prefill_query_chunk_size(L)
         key_block = _fast_prefill_key_block_size(total_length, topk)
-        weights = indexer.weights_proj(x) * (
-            indexer.n_heads**-0.5 * indexer.softmax_scale
-        )
+        weights = self._indexer_head_weights(x)
         weights = weights.swapaxes(-1, -2)[..., None]
 
         all_indices = []
         for q_start in range(0, L, query_chunk):
             q_stop = min(q_start + query_chunk, L)
             q_chunk = q[:, :, q_start:q_stop, :]
+            q_chunk_fp32 = q_chunk.astype(mx.float32)
             weight_chunk = weights[:, :, q_start:q_stop, :]
             best_scores = None
             best_indices = None
@@ -1437,7 +1515,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             for k_start in range(0, total_length, key_block):
                 k_stop = min(k_start + key_block, total_length)
                 k_block = k[:, :, k_start:k_stop, :]
-                block_scores = q_chunk @ k_block.swapaxes(-1, -2)
+                block_scores = q_chunk_fp32 @ k_block.astype(
+                    mx.float32
+                ).swapaxes(-1, -2)
+                block_scores = block_scores * indexer.softmax_scale
                 block_scores = mx.maximum(block_scores, 0)
                 block_scores = block_scores * weight_chunk
                 block_scores = block_scores.sum(axis=1, keepdims=True)
@@ -1610,8 +1691,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 return False, f"unsupported_kv_dtype:{kv_latent.dtype}"
             if k_pe.dtype != kv_latent.dtype:
                 return False, "mixed_kv_dtype"
-        if topk_indices.shape[-1] != 2048:
-            return False, f"unsupported_topk:{topk_indices.shape[-1]}"
+        topk = topk_indices.shape[-1]
+        if topk != 2048:
+            return False, f"unsupported_topk:{topk}"
+        if topk > k_pe.shape[2]:
+            return False, "topk_exceeds_context"
         if k_pe.shape[2] < _native_sparse_prefill_min_context_length():
             return False, "below_native_sparse_min_context"
         return (
@@ -2023,6 +2107,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             else topk_indices.astype(mx.uint32)
         )
         try:
+            B, _H, L, K = topk.shape
+            total_context = k_pe.shape[2]
+            query_offset = total_context - L
+            prefix_rows = _causal_topk_prefix_rows(total_context, L, K)
+            topk_length = None
+            kernel_kwargs = {"causal": True}
             q_latent = _profile_stage(
                 "latent_kv_projection",
                 lambda: self.embed_q(q_nope),
@@ -2032,6 +2122,28 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 # Verification batches are tiny but may have a very long cache.
                 # Compact their already-causal top-k rows before dequantizing so
                 # native attention never materializes the full float KV cache.
+                # An early causal row has fewer than K valid keys, so replace
+                # padded indexer output with its exact 0..q_abs prefix.  The
+                # kernel length vector prevents the unused compact slots from
+                # receiving attention mass.
+                if prefix_rows:
+                    causal_prefix = mx.arange(K, dtype=mx.uint32).reshape(
+                        1, 1, 1, K
+                    )
+                    causal_prefix = mx.broadcast_to(
+                        causal_prefix, (B, 1, prefix_rows, K)
+                    )
+                    topk = mx.concatenate(
+                        [causal_prefix, topk[:, :, prefix_rows:, :]], axis=2
+                    )
+                    valid_lengths = mx.minimum(
+                        mx.arange(L, dtype=mx.uint32)
+                        + mx.array(query_offset + 1, dtype=mx.uint32),
+                        mx.array(K, dtype=mx.uint32),
+                    )
+                    topk_length = mx.broadcast_to(
+                        valid_lengths.reshape(1, L), (B, L)
+                    )
                 selected_latent = self._gather_cached_latent(
                     kv_cache, kv_latent, topk
                 )
@@ -2042,11 +2154,24 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 topk = mx.arange(L * K, dtype=mx.uint32).reshape(1, 1, L, K)
                 if B != 1:
                     topk = mx.broadcast_to(topk, (B, 1, L, K))
-                causal = False
+                kernel_kwargs["causal"] = False
+                if topk_length is not None:
+                    kernel_kwargs["topk_length"] = topk_length
                 quantized_reason = "native_sparse_mla_quantized_kv_compact"
             else:
-                causal = True
+                if prefix_rows:
+                    # The native kernel can synthesize exact early causal rows.
+                    # Drop their padded indexer rows, then resume the real top-k
+                    # once each query has at least K causal keys.
+                    if prefix_rows < L:
+                        topk = topk[:, :, prefix_rows:, :]
+                        kernel_kwargs["causal_prefix_rows"] = prefix_rows
+                    kernel_kwargs["topk_valid_prefix"] = True
+                    kernel_kwargs["causal_prefix_indices"] = True
                 quantized_reason = "native_sparse_mla"
+            profile_inputs = (q_latent, q_pe, kv_latent, k_pe, topk)
+            if topk_length is not None:
+                profile_inputs = (*profile_inputs, topk_length)
             output = _profile_stage(
                 "native_sparse_attention",
                 lambda: kernel(
@@ -2056,9 +2181,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     k_pe,
                     topk,
                     self.scale,
-                    causal=causal,
+                    **kernel_kwargs,
                 ),
-                inputs=(q_latent, q_pe, kv_latent, k_pe, topk),
+                inputs=profile_inputs,
             )
             return (
                 self._unembed_out_project(output),
@@ -2325,6 +2450,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 inputs=(x, qr, mask),
             )
         else:
+            if prev_topk_indices is None and k_pe.shape[2] > self.config.index_topk:
+                raise ValueError(
+                    "shared GLM DSA layer requires top-k indices from the "
+                    "preceding full indexer layer"
+                )
             topk_indices = prev_topk_indices
 
         fast_sparse_prefill = False
@@ -2346,6 +2476,9 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 if mask is not None:
                     mask = _gather_attention_mask(mask, topk_indices)
             else:
+                full_topk_causal_prefix = _has_full_topk_causal_prefix(
+                    k_pe.shape[2], L, topk_indices.shape[-1]
+                )
                 short_verify = (
                     _fast_prefill_enabled()
                     and _GLM_DSA_MTP_VERIFY_SCOPE.get()
@@ -2353,6 +2486,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                         kv_cache, (GlmMlaKVCache, QuantizedGlmMlaKVCache)
                     )
                     and L <= _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS
+                    and full_topk_causal_prefix
                 )
                 if short_verify:
                     _record_native_sparse_prefill_decision(
@@ -2556,6 +2690,22 @@ class GlmMoeDsaModel(DeepseekV32Model):
             GlmMoeDsaDecoderLayer(config, idx)
             for idx in range(config.num_hidden_layers)
         ]
+        self.indexer_types = list(config.indexer_types or [])
+
+    def pipeline(self, group):
+        # IndexShare state is local to a stage. Keep every stage boundary on a
+        # full layer so no shared layer loses the preceding layer's top-k.
+        self.pipeline_rank = group.rank()
+        self.pipeline_size = group.size()
+        boundaries = _index_share_pipeline_boundaries(
+            self.indexer_types, self.pipeline_size
+        )
+        stage = self.pipeline_size - self.pipeline_rank - 1
+        self.start_idx = boundaries[stage]
+        self.end_idx = boundaries[stage + 1]
+        self.layers = self.layers[: self.end_idx]
+        self.layers[: self.start_idx] = [None] * self.start_idx
+        self.num_layers = self.end_idx - self.start_idx
 
     def __call__(
         self,
@@ -2667,6 +2817,11 @@ class GlmMoeDsaMTPPredictor(nn.Module):
 
 
 class Model(DSV32Model):
+    # Prompt checkpoints contain hidden/KV states produced by the attention
+    # implementation. Bump this whenever their numerical semantics change so
+    # checkpoints made by a known-bad implementation are rejected on load.
+    prompt_cache_semantics_version = 2
+
     def __init__(self, config: ModelArgs):
         nn.Module.__init__(self)
         self.args = config
@@ -2740,6 +2895,75 @@ class Model(DSV32Model):
             mapped_key = remap_key(k)
             if mapped_key is not None:
                 sanitized[mapped_key] = v
+        sanitized = super().sanitize(sanitized)
+
+        if mtp_enabled:
+            # The parent sanitizer handles ordinary decoder layers. Raw HF MTP
+            # weights have already been remapped to ``mtp.layer`` above, so
+            # apply the same expert stacking and MLA kv_b decomposition here.
+            prefix = "mtp.layer"
+            for projection in ("gate_proj", "down_proj", "up_proj"):
+                for suffix in ("weight", "scales", "biases"):
+                    first = f"{prefix}.mlp.experts.0.{projection}.{suffix}"
+                    if first in sanitized:
+                        to_join = [
+                            sanitized.pop(
+                                f"{prefix}.mlp.experts.{expert}.{projection}.{suffix}"
+                            )
+                            for expert in range(self.args.n_routed_experts)
+                        ]
+                        sanitized[
+                            f"{prefix}.mlp.switch_mlp.{projection}.{suffix}"
+                        ] = mx.stack(to_join)
+
+            attention_prefix = f"{prefix}.self_attn"
+            raw_kv_b = f"{attention_prefix}.kv_b_proj.weight"
+            if raw_kv_b in sanitized:
+                quantized = f"{attention_prefix}.kv_b_proj.scales" in sanitized
+                value = sanitized.pop(raw_kv_b)
+                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = sanitized.pop(
+                        f"{attention_prefix}.kv_b_proj.scales"
+                    )
+                    biases = sanitized.pop(
+                        f"{attention_prefix}.kv_b_proj.biases"
+                    )
+                    bits = (value.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    value = mx.dequantize(
+                        value,
+                        scales,
+                        biases,
+                        bits=bits,
+                        group_size=group_size,
+                    )
+                value = value.reshape(
+                    self.args.num_attention_heads, head_dim, -1
+                )
+                wk = mx.contiguous(
+                    value[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(value[:, self.args.qk_nope_head_dim :, :])
+                if quantized:
+                    wk, wk_scales, wk_biases = mx.quantize(
+                        wk, bits=bits, group_size=group_size
+                    )
+                    wv, wv_scales, wv_biases = mx.quantize(
+                        wv, bits=bits, group_size=group_size
+                    )
+                    sanitized[f"{attention_prefix}.embed_q.scales"] = wk_scales
+                    sanitized[
+                        f"{attention_prefix}.unembed_out.scales"
+                    ] = wv_scales
+                    sanitized[f"{attention_prefix}.embed_q.biases"] = wk_biases
+                    sanitized[
+                        f"{attention_prefix}.unembed_out.biases"
+                    ] = wv_biases
+                sanitized[f"{attention_prefix}.embed_q.weight"] = wk
+                sanitized[f"{attention_prefix}.unembed_out.weight"] = wv
+
         return sanitized
 
     def make_mtp_cache(self):

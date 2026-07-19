@@ -50,6 +50,8 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    indexer_norm_eps: float = 1e-5
+    indexer_rope_interleave: bool = False
 
 
 class Indexer(nn.Module):
@@ -65,13 +67,13 @@ class Indexer(nn.Module):
             self.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
         self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=args.indexer_norm_eps)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=True,
+            traditional=args.indexer_rope_interleave,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
@@ -100,9 +102,18 @@ class Indexer(nn.Module):
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0], dtype=k.dtype))
         if k.shape[2] <= self.index_topk:
             return None
-        scores = q @ k.swapaxes(-1, -2)
+        scores = (
+            q.astype(mx.float32)
+            @ k.astype(mx.float32).swapaxes(-1, -2)
+        ) * self.softmax_scale
         scores = mx.maximum(scores, 0)
-        weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
+        if isinstance(self.weights_proj, nn.Linear):
+            weights = self.weights_proj(
+                x.astype(self.weights_proj.weight.dtype)
+            ).astype(mx.float32)
+        else:
+            weights = self.weights_proj(x).astype(mx.float32)
+        weights = weights * (self.n_heads**-0.5)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
         scores = scores.sum(axis=1, keepdims=True)
@@ -497,8 +508,12 @@ class Model(nn.Module):
         new_weights = {}
         for k, v in weights.items():
             parts = k.split(".")
-            if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
-                continue
+            if len(parts) >= 3 and parts[1] == "layers":
+                try:
+                    if int(parts[2]) >= mpt_layer:
+                        continue
+                except ValueError:
+                    pass
             new_weights[k] = v
         weights = new_weights
 
@@ -579,6 +594,13 @@ class Model(nn.Module):
                 weights[f"{prefix}.embed_q.weight"] = wk
                 weights[f"{prefix}.unembed_out.weight"] = wv
 
+        for key, value in list(weights.items()):
+            if (
+                key.endswith(".indexer.weights_proj.weight")
+                and mx.issubdtype(value.dtype, mx.floating)
+            ):
+                weights[key] = value.astype(mx.float32)
+
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
@@ -646,7 +668,20 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k):
-            return "e_score_correction_bias" not in k
+            return (
+                "e_score_correction_bias" not in k
+                and ".indexer.weights_proj." not in k
+            )
+
+        return predicate
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            # The reference Indexer keeps this projection in FP32. Quantizing
+            # it changes the selected token set and also re-enables the
+            # lower-precision native Indexer path.
+            return not path.endswith("indexer.weights_proj")
 
         return predicate
 

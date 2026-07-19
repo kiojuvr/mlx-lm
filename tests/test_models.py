@@ -771,11 +771,11 @@ class TestModels(unittest.TestCase):
                     L=2,
                     kv_cache=QuantizedGlmMlaKVCache(),
                     kv_latent=(
-                        mx.zeros((1, 1, 2048, 64), dtype=mx.uint32),
-                        mx.zeros((1, 1, 2048, 8), dtype=mx.float16),
-                        mx.zeros((1, 1, 2048, 8), dtype=mx.float16),
+                        mx.zeros((1, 1, 2049, 64), dtype=mx.uint32),
+                        mx.zeros((1, 1, 2049, 8), dtype=mx.float16),
+                        mx.zeros((1, 1, 2049, 8), dtype=mx.float16),
                     ),
-                    k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                    k_pe=mx.zeros((1, 1, 2049, 64), dtype=mx.float16),
                     topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
                 )
             )
@@ -825,13 +825,29 @@ class TestModels(unittest.TestCase):
                 B=1,
                 L=2,
                 kv_cache=GlmMlaKVCache(),
-                kv_latent=mx.zeros((1, 1, 2048, 512), dtype=mx.float16),
-                k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                kv_latent=mx.zeros((1, 1, 2049, 512), dtype=mx.float16),
+                k_pe=mx.zeros((1, 1, 2049, 64), dtype=mx.float16),
                 topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
             )
 
             self.assertTrue(ready)
             self.assertEqual(reason, "native_sparse_mla")
+
+            prefix_ready, prefix_reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
+                    fake_attention,
+                    B=1,
+                    L=2,
+                    kv_cache=GlmMlaKVCache(),
+                    kv_latent=mx.zeros((1, 1, 2048, 512), dtype=mx.float16),
+                    k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
+                    topk_indices=mx.zeros(
+                        (1, 1, 2, 2048), dtype=mx.uint32
+                    ),
+                )
+            )
+            self.assertTrue(prefix_ready)
+            self.assertEqual(prefix_reason, "native_sparse_mla")
         finally:
             (
                 glm_moe_dsa._NATIVE_SPARSE_MLA_LOOKUP_DONE,
@@ -870,6 +886,23 @@ class TestModels(unittest.TestCase):
 
             self.assertTrue(ready)
             self.assertEqual(reason, "native_indexer")
+
+            fake_attention.indexer.weights_proj = type(
+                "FakeProjection",
+                (),
+                {"weight": mx.zeros((32, 4096), dtype=mx.float32)},
+            )()
+            strict_ready, strict_reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_indexer_decision(
+                    fake_attention,
+                    q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
+                    x=mx.zeros((1, 64, 4096), dtype=mx.float16),
+                    k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
+                    mask=mx.ones((64, 4096), dtype=mx.bool_),
+                )
+            )
+            self.assertFalse(strict_ready)
+            self.assertEqual(strict_reason, "fp32_indexer_weights")
         finally:
             glm_moe_dsa._native_indexer_available = old_available
             self._restore_env(saved_env)
@@ -1330,14 +1363,14 @@ class TestModels(unittest.TestCase):
         captured = {}
 
         def fake_kernel(
-            q_latent, q_pe_arg, kv_latent, k_pe_arg, indices, scale, causal
+            q_latent, q_pe_arg, kv_latent, k_pe_arg, indices, scale, **kwargs
         ):
             captured.update(
                 kv_latent=kv_latent,
                 k_pe=k_pe_arg,
                 indices=indices,
                 scale=scale,
-                causal=causal,
+                **kwargs,
             )
             return q_latent
 
@@ -1373,6 +1406,246 @@ class TestModels(unittest.TestCase):
             )
         finally:
             glm_moe_dsa._native_sparse_mla_kernel = original_kernel
+
+    def test_glm_moe_dsa_native_sparse_attention_repairs_partial_causal_prefix(
+        self,
+    ):
+        from mlx_lm.models import glm_moe_dsa
+
+        self.assertEqual(
+            glm_moe_dsa._causal_topk_prefix_rows(7429, 7419, 2048), 2038
+        )
+        self.assertEqual(glm_moe_dsa._causal_topk_prefix_rows(16, 16, 16), 16)
+        self.assertEqual(glm_moe_dsa._causal_topk_prefix_rows(31, 16, 16), 1)
+        self.assertEqual(glm_moe_dsa._causal_topk_prefix_rows(32, 16, 16), 0)
+
+        class FakeAttention:
+            scale = 0.25
+            embed_q = staticmethod(lambda x: x)
+            _gather_cached_latent = (
+                glm_moe_dsa.GlmMoeDsaAttention._gather_cached_latent
+            )
+            _unembed_out_project = staticmethod(lambda x: x)
+
+        latent = mx.arange(6 * 64, dtype=mx.float32).reshape(1, 1, 6, 64)
+        latent = (latent / 64).astype(mx.float16)
+        k_pe = mx.arange(6 * 4, dtype=mx.float32).reshape(1, 1, 6, 4)
+        k_pe = (k_pe / 16).astype(mx.float16)
+        q_nope = mx.ones((1, 1, 5, 64), dtype=mx.float16)
+        q_pe = mx.ones((1, 1, 5, 4), dtype=mx.float16)
+        # At offset 1, row 0 has only keys {0, 1}; its third entry represents
+        # indexer padding and must not be counted as another key 0.
+        topk = mx.array(
+            [[[[0, 1, 0], [2, 0, 1], [0, 2, 3], [1, 3, 4], [2, 4, 5]]]],
+            dtype=mx.uint32,
+        )
+        captured = {}
+
+        def fake_kernel(
+            q_latent, q_pe_arg, kv_latent, k_pe_arg, indices, scale, **kwargs
+        ):
+            captured.update(
+                kv_latent=kv_latent,
+                k_pe=k_pe_arg,
+                indices=indices,
+                scale=scale,
+                **kwargs,
+            )
+            return q_latent
+
+        original_kernel = glm_moe_dsa._native_sparse_mla_kernel
+        try:
+            glm_moe_dsa._native_sparse_mla_kernel = lambda: fake_kernel
+
+            float_output, float_reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_attention(
+                    FakeAttention(),
+                    q_nope,
+                    q_pe,
+                    GlmMlaKVCache(),
+                    latent,
+                    k_pe,
+                    topk,
+                )
+            )
+            mx.eval(float_output)
+            self.assertEqual(float_reason, "native_sparse_mla")
+            self.assertTrue(captured["causal"])
+            self.assertTrue(captured["topk_valid_prefix"])
+            self.assertTrue(captured["causal_prefix_indices"])
+            self.assertEqual(captured["causal_prefix_rows"], 2)
+            self.assertEqual(captured["indices"].shape, (1, 1, 3, 3))
+            self.assertTrue(mx.array_equal(captured["indices"], topk[:, :, 2:]))
+
+            cache = QuantizedGlmMlaKVCache(group_size=64, bits=8)
+            cache.update_and_fetch(latent, k_pe)
+            mx.eval(cache.state)
+            captured.clear()
+            quantized_output, quantized_reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_attention(
+                    FakeAttention(),
+                    q_nope,
+                    q_pe,
+                    cache,
+                    cache.state[0],
+                    cache.state[1],
+                    topk,
+                )
+            )
+            mx.eval(quantized_output, captured["kv_latent"], captured["k_pe"])
+            self.assertEqual(
+                quantized_reason, "native_sparse_mla_quantized_kv_compact"
+            )
+            self.assertFalse(captured["causal"])
+            self.assertTrue(
+                mx.array_equal(
+                    captured["topk_length"],
+                    mx.array([[2, 3, 3, 3, 3]], dtype=mx.uint32),
+                )
+            )
+            expected_prefix = mx.broadcast_to(
+                mx.arange(3).reshape(1, 3), (2, 3)
+            ).reshape(-1)
+            gathered_prefix = captured["kv_latent"].reshape(5, 3, 64)[:2]
+            expected = mx.take(latent.reshape(6, 64), expected_prefix, axis=0)
+            self.assertTrue(
+                mx.allclose(gathered_prefix.reshape(6, 64), expected, atol=0.05)
+            )
+        finally:
+            glm_moe_dsa._native_sparse_mla_kernel = original_kernel
+
+    def test_glm_moe_dsa_native_sparse_kernel_partial_prefix_matches_dense(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        kernel = glm_moe_dsa._native_sparse_mla_kernel()
+        if kernel is None:
+            self.skipTest("native sparse MLA kernel is unavailable")
+
+        B, H, L, total_context, K = 1, 64, 4, 2050, 2048
+        latent_dim, rope_dim = 512, 64
+        mx.random.seed(73)
+        q_latent = mx.random.normal(
+            (B, H, L, latent_dim), dtype=mx.float16
+        ) * 0.02
+        q_pe = mx.random.normal((B, H, L, rope_dim), dtype=mx.float16) * 0.02
+        kv_latent = mx.random.normal(
+            (B, 1, total_context, latent_dim), dtype=mx.float16
+        ) * 0.02
+        k_pe = mx.random.normal(
+            (B, 1, total_context, rope_dim), dtype=mx.float16
+        ) * 0.02
+        # Rows 0 and 1 are synthesized by the kernel. Rows 2 and 3 use this
+        # compact top-k table after both have at least K causal keys.
+        topk = mx.broadcast_to(
+            mx.arange(K, dtype=mx.uint32).reshape(1, 1, 1, K),
+            (B, 1, L - 2, K),
+        )
+        scale = (latent_dim + rope_dim) ** -0.5
+
+        output = kernel(
+            q_latent,
+            q_pe,
+            kv_latent,
+            k_pe,
+            topk,
+            scale,
+            causal=True,
+            topk_valid_prefix=True,
+            causal_prefix_indices=True,
+            causal_prefix_rows=2,
+        )
+
+        selected_latent = mx.broadcast_to(
+            kv_latent[:, :, :K, :], (B, H, K, latent_dim)
+        )
+        selected_pe = mx.broadcast_to(k_pe[:, :, :K, :], (B, H, K, rope_dim))
+        scores = q_latent.astype(mx.float32) @ selected_latent.astype(
+            mx.float32
+        ).swapaxes(-1, -2)
+        scores = scores + q_pe.astype(mx.float32) @ selected_pe.astype(
+            mx.float32
+        ).swapaxes(-1, -2)
+        scores = scores * scale
+        valid_lengths = mx.array([K - 1, K, K, K]).reshape(1, 1, L, 1)
+        valid = mx.arange(K).reshape(1, 1, 1, K) < valid_lengths
+        scores = mx.where(valid, scores, -float("inf"))
+        weights = mx.softmax(scores, axis=-1, precise=True)
+        reference = weights @ selected_latent.astype(mx.float32)
+        mx.eval(output, reference)
+
+        self.assertTrue(
+            mx.allclose(
+                output.astype(mx.float32), reference, rtol=2e-2, atol=2e-2
+            ).item()
+        )
+
+    def test_glm_moe_dsa_native_sparse_kernel_topk_length_matches_dense(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        kernel = glm_moe_dsa._native_sparse_mla_kernel()
+        if kernel is None:
+            self.skipTest("native sparse MLA kernel is unavailable")
+
+        B, H, L, K = 1, 64, 2, 16
+        latent_dim, rope_dim = 512, 64
+        mx.random.seed(79)
+        q_latent = mx.random.normal(
+            (B, H, L, latent_dim), dtype=mx.float16
+        ) * 0.02
+        q_pe = mx.random.normal((B, H, L, rope_dim), dtype=mx.float16) * 0.02
+        kv_latent = mx.random.normal(
+            (B, 1, L * K, latent_dim), dtype=mx.float16
+        ) * 0.02
+        k_pe = mx.random.normal(
+            (B, 1, L * K, rope_dim), dtype=mx.float16
+        ) * 0.02
+        topk = mx.arange(L * K, dtype=mx.uint32).reshape(B, 1, L, K)
+        topk_length = mx.array([[3, 5]], dtype=mx.uint32)
+        scale = (latent_dim + rope_dim) ** -0.5
+
+        output = kernel(
+            q_latent,
+            q_pe,
+            kv_latent,
+            k_pe,
+            topk,
+            scale,
+            causal=False,
+            topk_length=topk_length,
+        )
+
+        selected_latent = kv_latent.reshape(B, 1, L, K, latent_dim)
+        selected_latent = mx.broadcast_to(
+            selected_latent, (B, H, L, K, latent_dim)
+        )
+        selected_pe = k_pe.reshape(B, 1, L, K, rope_dim)
+        selected_pe = mx.broadcast_to(selected_pe, (B, H, L, K, rope_dim))
+        scores = mx.sum(
+            q_latent.astype(mx.float32)[..., None, :]
+            * selected_latent.astype(mx.float32),
+            axis=-1,
+        )
+        scores = scores + mx.sum(
+            q_pe.astype(mx.float32)[..., None, :]
+            * selected_pe.astype(mx.float32),
+            axis=-1,
+        )
+        scores = scores * scale
+        valid = mx.arange(K).reshape(1, 1, 1, K) < topk_length.reshape(
+            B, 1, L, 1
+        )
+        scores = mx.where(valid, scores, -float("inf"))
+        weights = mx.softmax(scores, axis=-1, precise=True)
+        reference = mx.sum(
+            weights[..., None] * selected_latent.astype(mx.float32), axis=-2
+        )
+        mx.eval(output, reference)
+
+        self.assertTrue(
+            mx.allclose(
+                output.astype(mx.float32), reference, rtol=2e-2, atol=2e-2
+            ).item()
+        )
 
     def test_glm_moe_dsa_quantized_fast_prefill_dequantizes_selected_kv(self):
         from mlx_lm.models import glm_moe_dsa
@@ -1912,6 +2185,196 @@ class TestModels(unittest.TestCase):
         self.assertTrue(
             mx.array_equal(sanitized["mtp.layer.self_attn.q_a_proj.weight"], base * 6)
         )
+
+    def test_glm_moe_dsa_sanitize_decomposes_raw_kv_b_proj(self):
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="F", num_hidden_layers=1
+        )
+        args = model.args
+        head_dim = args.qk_nope_head_dim + args.v_head_dim
+        raw = mx.arange(
+            args.num_attention_heads * head_dim * args.kv_lora_rank,
+            dtype=mx.float32,
+        ).reshape(args.num_attention_heads * head_dim, args.kv_lora_rank)
+
+        prefix = "model.layers.0.self_attn"
+        sanitized = model.sanitize({f"{prefix}.kv_b_proj.weight": raw})
+
+        self.assertNotIn(f"{prefix}.kv_b_proj.weight", sanitized)
+        reshaped = raw.reshape(
+            args.num_attention_heads, head_dim, args.kv_lora_rank
+        )
+        expected_k = reshaped[:, : args.qk_nope_head_dim, :].swapaxes(-1, -2)
+        expected_v = reshaped[:, args.qk_nope_head_dim :, :]
+        self.assertTrue(
+            mx.array_equal(sanitized[f"{prefix}.embed_q.weight"], expected_k)
+        )
+        self.assertTrue(
+            mx.array_equal(sanitized[f"{prefix}.unembed_out.weight"], expected_v)
+        )
+
+        indexer_weight = mx.ones(
+            (args.index_n_heads, args.hidden_size), dtype=mx.bfloat16
+        )
+        sanitized = model.sanitize(
+            {f"{prefix}.indexer.weights_proj.weight": indexer_weight}
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.indexer.weights_proj.weight"].dtype,
+            mx.float32,
+        )
+        self.assertFalse(
+            model.cast_predicate(f"{prefix}.indexer.weights_proj.weight")
+        )
+        self.assertFalse(
+            model.quant_predicate(f"{prefix}.indexer.weights_proj", None)
+        )
+
+    def test_glm_moe_dsa_sanitize_converts_raw_mtp_layer(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="F", num_hidden_layers=1
+        )
+        args = model.args
+        head_dim = args.qk_nope_head_dim + args.v_head_dim
+        raw_kv_b = mx.arange(
+            args.num_attention_heads * head_dim * args.kv_lora_rank,
+            dtype=mx.float32,
+        ).reshape(args.num_attention_heads * head_dim, args.kv_lora_rank)
+        raw = {"model.layers.1.self_attn.kv_b_proj.weight": raw_kv_b}
+        for expert in range(args.n_routed_experts):
+            raw[
+                f"model.layers.1.mlp.experts.{expert}.gate_proj.weight"
+            ] = mx.full((2, 3), expert, dtype=mx.float32)
+
+        env_key = glm_moe_dsa.GLM_DSA_MTP_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        try:
+            os.environ[env_key] = "1"
+            sanitized = model.sanitize(raw)
+        finally:
+            self._restore_env(saved_env)
+
+        self.assertNotIn("mtp.layer.self_attn.kv_b_proj.weight", sanitized)
+        self.assertEqual(
+            sanitized["mtp.layer.self_attn.embed_q.weight"].shape,
+            (args.num_attention_heads, args.kv_lora_rank, args.qk_nope_head_dim),
+        )
+        self.assertEqual(
+            sanitized["mtp.layer.self_attn.unembed_out.weight"].shape,
+            (args.num_attention_heads, args.v_head_dim, args.kv_lora_rank),
+        )
+        stacked = sanitized["mtp.layer.mlp.switch_mlp.gate_proj.weight"]
+        self.assertEqual(stacked.shape, (args.n_routed_experts, 2, 3))
+        self.assertTrue(mx.array_equal(stacked[:, 0, 0], mx.arange(4)))
+
+    def test_glm_moe_dsa_indexer_config_is_applied(self):
+        from mlx_lm.models import deepseek_v32, glm_moe_dsa
+
+        base_args = self._make_glm_moe_dsa_model().args
+        self.assertEqual(base_args.indexer_norm_eps, 1e-6)
+        self.assertTrue(base_args.indexer_rope_interleave)
+        self.assertEqual(deepseek_v32.ModelArgs().indexer_norm_eps, 1e-5)
+        self.assertFalse(deepseek_v32.ModelArgs().indexer_rope_interleave)
+        args = glm_moe_dsa.ModelArgs.from_dict(
+            {
+                **vars(base_args),
+                "indexer_norm_eps": 2e-6,
+                "indexer_rope_interleave": False,
+            }
+        )
+        model = glm_moe_dsa.Model(args)
+        indexer = model.model.layers[0].self_attn.indexer
+
+        self.assertEqual(args.indexer_norm_eps, 2e-6)
+        self.assertFalse(args.indexer_rope_interleave)
+        self.assertEqual(indexer.k_norm.eps, 2e-6)
+        self.assertFalse(indexer.rope.traditional)
+
+        checkpoint_args = glm_moe_dsa.ModelArgs.from_dict(
+            {
+                **vars(base_args),
+                "indexer_rope_interleave": True,
+                "indexer_rope_traditional": False,
+            }
+        )
+        checkpoint_model = glm_moe_dsa.Model(checkpoint_args)
+        self.assertTrue(
+            checkpoint_model.model.layers[0].self_attn.indexer.rope.traditional
+        )
+
+        with self.assertRaisesRegex(ValueError, "one entry per decoder layer"):
+            glm_moe_dsa.ModelArgs.from_dict(
+                {**vars(base_args), "indexer_types": ["full"]}
+            )
+        with self.assertRaisesRegex(ValueError, "unsupported GLM DSA indexer types"):
+            glm_moe_dsa.ModelArgs.from_dict(
+                {**vars(base_args), "indexer_types": ["full", "invalid"]}
+            )
+        with self.assertRaisesRegex(ValueError, "first GLM DSA layer"):
+            glm_moe_dsa.ModelArgs.from_dict(
+                {**vars(base_args), "indexer_types": ["shared", "full"]}
+            )
+
+    def test_glm_moe_dsa_pipeline_starts_each_stage_on_full_indexer(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        class FakeGroup:
+            def __init__(self, rank, size):
+                self._rank = rank
+                self._size = size
+
+            def rank(self):
+                return self._rank
+
+            def size(self):
+                return self._size
+
+        pattern = "FSSSFSSSFSSS"
+        intervals = []
+        for rank in range(3):
+            model = self._make_glm_moe_dsa_model(
+                index_topk_pattern=pattern, num_hidden_layers=len(pattern)
+            )
+            model.model.pipeline(FakeGroup(rank, 3))
+            intervals.append((model.model.start_idx, model.model.end_idx))
+            self.assertEqual(
+                model.args.indexer_types[model.model.start_idx], "full"
+            )
+
+        self.assertEqual(sorted(intervals), [(0, 4), (4, 8), (8, 12)])
+
+        official_types = [
+            "full" if (max(idx - 3 + 1, 0) % 4) == 0 else "shared"
+            for idx in range(78)
+        ]
+        self.assertEqual(official_types.count("full"), 21)
+        for pipeline_size in (1, 2, 3, 4, 8, 21):
+            boundaries = glm_moe_dsa._index_share_pipeline_boundaries(
+                official_types, pipeline_size
+            )
+            self.assertEqual(boundaries[0], 0)
+            self.assertEqual(boundaries[-1], len(official_types))
+            self.assertEqual(len(boundaries), pipeline_size + 1)
+            self.assertEqual(boundaries, sorted(set(boundaries)))
+            self.assertTrue(
+                all(official_types[start] == "full" for start in boundaries[:-1])
+            )
+        with self.assertRaisesRegex(ValueError, "every stage"):
+            glm_moe_dsa._index_share_pipeline_boundaries(official_types, 22)
+
+    def test_glm_moe_dsa_shared_layer_rejects_missing_sparse_topk(self):
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="FS", num_hidden_layers=2
+        )
+        attention = model.model.layers[1].self_attn
+        cache = make_prompt_cache(model)[1]
+        hidden = mx.random.normal((1, 5, model.args.hidden_size))
+        positions = mx.arange(5)
+        mask = positions[:, None] >= positions[None, :]
+        with self.assertRaisesRegex(ValueError, "requires top-k indices"):
+            attention(hidden, mask, cache, None)
 
     def test_glm_moe_dsa_mtp_scaffold_instantiates_opt_in(self):
         from mlx_lm.models import glm_moe_dsa
@@ -2874,6 +3337,113 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, args.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
+
+    def test_glm_moe_dsa_indexer_boundary_and_fp32_reference(self):
+        from mlx_lm.models.cache import KVCache
+
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="F", num_hidden_layers=1
+        )
+        model.set_dtype(mx.float16)
+        attention = model.model.layers[0].self_attn
+        indexer = attention.indexer
+        indexer.weights_proj.weight = indexer.weights_proj.weight.astype(
+            mx.float32
+        )
+
+        cache = KVCache()
+        x = mx.random.normal((1, 4, model.args.hidden_size)).astype(mx.float16)
+        qr = mx.random.normal((1, 4, model.args.q_lora_rank)).astype(mx.float16)
+        self.assertIsNone(attention._indexer_topk(x, qr, None, cache))
+
+        x_next = mx.random.normal((1, 1, model.args.hidden_size)).astype(mx.float16)
+        qr_next = mx.random.normal((1, 1, model.args.q_lora_rank)).astype(mx.float16)
+        engaged = attention._indexer_topk(x_next, qr_next, None, cache)
+        self.assertEqual(engaged.shape, (1, 1, 1, model.args.index_topk))
+
+        q = mx.random.normal(
+            (1, indexer.n_heads, 2, indexer.head_dim)
+        ).astype(mx.float16)
+        k = mx.random.normal((1, 1, 6, indexer.head_dim)).astype(mx.float16)
+        hidden = mx.random.normal((1, 2, model.args.hidden_size)).astype(mx.float16)
+        actual = attention._dense_indexer_topk(q, hidden, k, None)
+
+        scores = (
+            q.astype(mx.float32)
+            @ k.astype(mx.float32).swapaxes(-1, -2)
+        ) * indexer.softmax_scale
+        scores = mx.maximum(scores, 0)
+        weights = indexer.weights_proj(hidden.astype(mx.float32)).astype(mx.float32)
+        weights = weights * (indexer.n_heads**-0.5)
+        scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(
+            axis=1, keepdims=True
+        )
+        expected = mx.argpartition(
+            scores, kth=-indexer.index_topk, axis=-1
+        )[..., -indexer.index_topk :]
+        self.assertTrue(
+            mx.array_equal(mx.sort(actual, axis=-1), mx.sort(expected, axis=-1))
+        )
+
+        block_sentinel = mx.zeros(
+            (1, 1, 5, indexer.index_topk), dtype=mx.uint32
+        )
+        original_native = attention._native_indexer_topk
+        original_block = attention._block_indexer_topk
+        try:
+            attention._native_indexer_topk = lambda *args, **kwargs: None
+            attention._block_indexer_topk = (
+                lambda *args, **kwargs: block_sentinel
+            )
+            block_result = attention._indexer_topk(
+                mx.random.normal((1, 5, model.args.hidden_size)).astype(mx.float16),
+                mx.random.normal((1, 5, model.args.q_lora_rank)).astype(mx.float16),
+                mx.tril(mx.ones((5, 5), dtype=mx.bool_)),
+            )
+        finally:
+            attention._native_indexer_topk = original_native
+            attention._block_indexer_topk = original_block
+        self.assertIs(block_result, block_sentinel)
+
+    def test_glm_moe_dsa_block_indexer_matches_fp32_dense_reference(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="F", num_hidden_layers=1
+        )
+        attention = model.model.layers[0].self_attn
+        indexer = attention.indexer
+        query_length = 5
+        total_length = 9
+        q = mx.random.normal(
+            (1, indexer.n_heads, query_length, indexer.head_dim)
+        ).astype(mx.float16)
+        hidden = mx.random.normal(
+            (1, query_length, model.args.hidden_size)
+        ).astype(mx.float16)
+        k = mx.random.normal((1, 1, total_length, indexer.head_dim)).astype(
+            mx.float16
+        )
+        query_positions = mx.arange(total_length - query_length, total_length)
+        mask = query_positions[:, None] >= mx.arange(total_length)[None, :]
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV,
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_QUERY_CHUNK_ENV] = "2"
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV] = "4"
+            dense = attention._dense_indexer_topk(q, hidden, k, mask)
+            block = attention._block_indexer_topk(q, hidden, k, mask)
+            mx.eval(dense, block)
+        finally:
+            self._restore_env(saved_env)
+
+        self.assertTrue(
+            mx.array_equal(mx.sort(dense, axis=-1), mx.sort(block, axis=-1))
+        )
 
     def test_glm_moe_dsa_mla_int8_kv_cache(self):
         from mlx_lm.generate import BatchGenerator, generate_step

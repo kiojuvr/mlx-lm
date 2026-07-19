@@ -931,6 +931,12 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         )
         self.assertEqual([len(c.caches) for c in loaded_cache], [2, 1, 2, 1])
         self.assertIn("checkpoint_glm_dsa_metadata", metadata)
+        self.assertEqual(
+            json.loads(metadata["checkpoint_glm_dsa_metadata"])[
+                "prompt_cache_semantics_version"
+            ],
+            model.prompt_cache_semantics_version,
+        )
         self.assertIn("checkpoint_glm_mla_kv_quantization", metadata)
         self.assertIn("checkpoint_glm_mla_kv_settings", metadata)
         self.assertEqual(
