@@ -222,6 +222,9 @@ python -m mlx_lm server \
   --generation-shutdown-timeout 0 \
   --checkpoint-shutdown-save-limit 0 \
   --request-max-tokens-floor 384000 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --chat-template-args '{"reasoning_effort":"max"}' \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
@@ -268,7 +271,17 @@ state, and ask the user before continuing. This is intentionally suited to
 personal OpenCode serving; do not use it as-is for multi-user serving where
 independent conversations need separate loop histories.
 
-The recommended server command intentionally leaves `--temp` and `--top-p` unset so request-side clients can control sampling. OpenCode requests in the tested setup omitted repetition controls, so the server supplies a mild `--repetition-penalty 1.05` over the most recent 1024 tokens. Request-level `repetition_penalty` and `repetition_context_size` still take precedence. Set the penalty to `0` to disable it for an A/B run.
+The recommended command follows the [official Z.AI GLM-5.2 guide](https://docs.z.ai/guides/llm/glm-5.2): `temperature=1.0`, `top_p=0.95`, and `reasoning_effort=max` for complex agentic work. Select one GLM-5.2 thinking mode at server startup with the existing chat-template option:
+
+```sh
+--chat-template-args '{"reasoning_effort":"max"}'
+--chat-template-args '{"reasoning_effort":"high"}'
+--chat-template-args '{"enable_thinking":false}'
+```
+
+These are server defaults only. Request-level `temperature` and `top_p` take precedence. For reasoning, Chat Completions accepts the OpenAI-compatible top-level `"reasoning_effort": "high"`, while the Responses API accepts `"reasoning": {"effort": "high"}`. Either request form overrides the server's `--chat-template-args` reasoning default. GLM-5.2 accepts only `high` and `max`; the server rejects other effort strings instead of allowing the chat template to silently map them to a different mode.
+
+OpenCode requests in the tested setup omitted repetition controls, so the server supplies a mild `--repetition-penalty 1.05` over the most recent 1024 tokens. Request-level `repetition_penalty` and `repetition_context_size` still take precedence. Set the penalty to `0` to disable it for an A/B run.
 
 `--loop-guard-*` is a server-side fuse for exact repeated token loops during long decode, including repeated reasoning/thought spans. The default guard watches for repeated 8/16/32/64-token windows after 256 generated tokens; set `--loop-guard-ngram-size 0` to disable it only for controlled diagnosis. Keep the guard enabled in normal use: the repetition penalty reduces the chance of entering a loop, while the guard bounds damage if prevention fails.
 

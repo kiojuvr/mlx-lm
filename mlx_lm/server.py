@@ -107,6 +107,7 @@ DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT = 2
 DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE = "disabled"
 DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS = 8192
+GLM52_REASONING_EFFORTS = ("high", "max")
 
 
 def _mtp_speculative_prompt_cache_key(model_key):
@@ -262,6 +263,7 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    reasoning_effort: Optional[str]
 
 
 @dataclass
@@ -1533,10 +1535,7 @@ class ResponseGenerator:
                 "If you think this is an error, file an issue here: "
                 "https://github.com/ml-explore/mlx-lm/issues"
             )
-        chat_template_args = self.model_provider.cli_args.chat_template_args
-        if args.chat_template_kwargs:
-            chat_template_args = chat_template_args.copy()
-            chat_template_args.update(args.chat_template_kwargs)
+        chat_template_args = self._chat_template_args(args)
         return tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -1544,6 +1543,22 @@ class ResponseGenerator:
             tools=tools,
             **chat_template_args,
         )
+
+    def _chat_template_args(self, args):
+        """Merge server and request chat-template controls by specificity."""
+        chat_template_args = self.model_provider.cli_args.chat_template_args
+        request_template_args = getattr(args, "chat_template_kwargs", None)
+        request_reasoning_effort = getattr(args, "reasoning_effort", None)
+
+        if not request_template_args and request_reasoning_effort is None:
+            return chat_template_args
+
+        chat_template_args = chat_template_args.copy()
+        if request_template_args:
+            chat_template_args.update(request_template_args)
+        if request_reasoning_effort is not None:
+            chat_template_args["reasoning_effort"] = request_reasoning_effort
+        return chat_template_args
 
     @staticmethod
     def _encode_rendered_suffix(tokenizer, rendered_suffix):
@@ -2640,10 +2655,7 @@ class ResponseGenerator:
                         "https://github.com/ml-explore/mlx-lm/issues"
                     )
 
-                chat_template_args = self.model_provider.cli_args.chat_template_args
-                if args.chat_template_kwargs:
-                    chat_template_args = chat_template_args.copy()
-                    chat_template_args.update(args.chat_template_kwargs)
+                chat_template_args = self._chat_template_args(args)
                 template_kwargs = dict(tools=tools, **chat_template_args)
                 prompt = tokenizer.apply_chat_template(
                     messages,
@@ -3806,12 +3818,23 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.reasoning_effort = self._request_reasoning_effort()
+            self.validate_model_parameters()
+        except ValueError as e:
+            logging.warning("Invalid request parameters: %s", e)
+            response = json.dumps({"error": str(e)}).encode()
+            self._set_completion_headers(400)
+            self.send_header("Content-Length", str(len(response)))
+            if self._end_headers_safely():
+                self._write_response_bytes(response)
+            return
         logging.info(
             "request parameters: path=%s stream=%s model=%s "
             "max_tokens=%s requested_max_tokens=%s max_tokens_source=%s "
             "max_tokens_floor_applied=%s temperature=%s top_p=%s "
-            "repetition_penalty=%s repetition_context_size=%s",
+            "repetition_penalty=%s repetition_context_size=%s "
+            "reasoning_effort=%s",
             self.path,
             self.stream,
             self.requested_model,
@@ -3823,6 +3846,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self.top_p,
             self.repetition_penalty,
             self.repetition_context_size,
+            self.reasoning_effort,
         )
 
         # Get stop sequences
@@ -3845,6 +3869,18 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_responses_completion(request, stop_words)
         else:
             self.handle_completion(request, stop_words)
+
+    def _request_reasoning_effort(self):
+        if self.path in ("/v1/responses", "/responses"):
+            reasoning = self.body.get("reasoning")
+            if reasoning is None:
+                return None
+            if not isinstance(reasoning, dict):
+                raise ValueError("reasoning must be a JSON object")
+            return reasoning.get("effort")
+        if self.path in ("/v1/chat/completions", "/chat/completions"):
+            return self.body.get("reasoning_effort")
+        return None
 
     def _validate(
         self,
@@ -3894,6 +3930,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
+        self._validate("reasoning_effort", str, optional=True)
+
+        if (
+            self.reasoning_effort is not None
+            and self.reasoning_effort not in GLM52_REASONING_EFFORTS
+        ):
+            allowed = ", ".join(GLM52_REASONING_EFFORTS)
+            raise ValueError(f"reasoning_effort must be one of: {allowed}")
 
         if self.logit_bias is not None:
             try:
@@ -4231,6 +4275,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            reasoning_effort=self.reasoning_effort,
         )
 
         client_connected = True
@@ -4789,6 +4834,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=-1,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            reasoning_effort=self.reasoning_effort,
         )
 
         client_connected = True

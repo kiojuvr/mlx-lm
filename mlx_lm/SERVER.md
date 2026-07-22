@@ -66,6 +66,12 @@ curl localhost:8080/v1/chat/completions \
 - `top_p`: (Optional) A float specifying the nucleus sampling parameter.
   Defaults to `1.0`.
 
+- `reasoning_effort`: (Optional) A GLM-5.2 chat-template reasoning mode,
+  either `high` or `max`, for Chat Completions requests. It overrides the
+  server's `--chat-template-args` reasoning default. The Responses API uses
+  `"reasoning": {"effort": "high"}` instead. Disable GLM-5.2 thinking with
+  `"chat_template_kwargs": {"enable_thinking": false}`.
+
 - `top_k`: (Optional) An integer specifying the top-k sampling parameter.
   Defaults to `0` (disabled).
 

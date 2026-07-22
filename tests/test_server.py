@@ -1506,6 +1506,45 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         arguments = request.messages[1]["tool_calls"][0]["function"]["arguments"]
         self.assertEqual(arguments, {"query": "prefill"})
 
+    def test_request_reasoning_effort_overrides_chat_template_defaults(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        cli_template_args = {"custom_flag": "cli"}
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                chat_template_args={
+                    **cli_template_args,
+                    "reasoning_effort": "max",
+                },
+            )
+        )
+        tokenizer = types.SimpleNamespace(
+            has_chat_template=True,
+            has_tool_calling=True,
+            apply_chat_template=mock.Mock(return_value="rendered"),
+        )
+        request = types.SimpleNamespace(
+            request_type="chat",
+            messages=[{"role": "user", "content": "think"}],
+            tools=None,
+            role_mapping=None,
+        )
+        args = types.SimpleNamespace(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "reasoning_effort": "max",
+            },
+            reasoning_effort="high",
+        )
+
+        self.assertEqual(
+            generator._render_prompt_text(tokenizer, request, args), "rendered"
+        )
+        template_kwargs = tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(template_kwargs["reasoning_effort"], "high")
+        self.assertTrue(template_kwargs["enable_thinking"])
+        self.assertEqual(template_kwargs["custom_flag"], "cli")
+        self.assertEqual(cli_template_args, {"custom_flag": "cli"})
+
     def test_rendered_checkpoint_uses_exact_as_cached_prefix(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
@@ -1768,6 +1807,13 @@ class TestServerCLI(unittest.TestCase):
 
         self.assertEqual(args.repetition_penalty, 1.05)
         self.assertEqual(args.repetition_context_size, 1024)
+
+    def test_setup_arg_parser_accepts_reasoning_chat_template_args(self):
+        args = setup_arg_parser().parse_args(
+            ["--chat-template-args", '{"reasoning_effort":"max"}']
+        )
+
+        self.assertEqual(args.chat_template_args, {"reasoning_effort": "max"})
 
     def test_setup_arg_parser_disable_batching(self):
         args = setup_arg_parser().parse_args(["--disable-batching"])
@@ -2721,6 +2767,46 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_handle_chat_completions_reasoning_effort(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 1,
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "Hello!"}],
+        }
+
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+        post_data["reasoning_effort"] = "low"
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort must be one of", response.text)
+
+    def test_handle_responses_reasoning_effort(self):
+        url = f"http://localhost:{self.port}/v1/responses"
+        post_data = {
+            "model": "chat_model",
+            "max_output_tokens": 1,
+            "reasoning": {"effort": "high"},
+            "reasoning_effort": "low",
+            "input": "Hello!",
+        }
+
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+        post_data["reasoning"] = {"effort": "low"}
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort must be one of", response.text)
+
+        post_data["reasoning"] = "high"
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning must be a JSON object", response.text)
 
     def test_session_loop_guard_preflight_returns_message(self):
         cli_args = self.response_generator.model_provider.cli_args
