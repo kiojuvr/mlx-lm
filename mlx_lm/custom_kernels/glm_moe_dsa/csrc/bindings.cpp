@@ -133,4 +133,20 @@ NB_MODULE(_ext, m) {
       "inv_order"_a,
       "scores"_a,
       "stream"_a = nb::none());
+  m.def(
+      "deepseek_affine_gather_qmm_pair_concat_blocks",
+      &omlx::glm_kernels::deepseek_affine_gather_qmm_pair_concat_blocks,
+      "x"_a,
+      "weight0"_a,
+      "scales0"_a,
+      "biases0"_a,
+      "weight1"_a,
+      "scales1"_a,
+      "biases1"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "group_size"_a,
+      "bits"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
 }

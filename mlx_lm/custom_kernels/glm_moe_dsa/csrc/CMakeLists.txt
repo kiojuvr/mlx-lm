@@ -45,6 +45,7 @@ target_link_libraries(omlx_glm_kernel_ops PUBLIC mlx)
 if(MLX_BUILD_METAL)
   set(OMLX_GLM_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal
+      ${CMAKE_CURRENT_LIST_DIR}/deepseek_affine_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/fused_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.metal)

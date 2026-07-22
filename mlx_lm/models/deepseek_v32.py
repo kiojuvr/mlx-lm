@@ -1,7 +1,9 @@
 # Copyright © 2025 Apple Inc.
 
 import math
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
@@ -14,6 +16,188 @@ from .cache import CacheList, KVCache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+
+GLM_MOE_PREFILL_GATE_UP_ENV = "MLX_LM_GLM_MOE_PREFILL_GATE_UP"
+GLM_MOE_PREFILL_WEIGHTED_SUM_ENV = "MLX_LM_GLM_MOE_PREFILL_WEIGHTED_SUM"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _glm_moe_prefill_weighted_sum_available(config) -> bool:
+    if getattr(config, "model_type", None) != "glm_moe_dsa":
+        return False
+    if not _env_flag(GLM_MOE_PREFILL_WEIGHTED_SUM_ENV, True):
+        return False
+    try:
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+
+        return fast.has_symbol("glm_moe_weighted_sum")
+    except Exception:
+        return False
+
+
+def _glm_moe_prefill_gate_up_available(config) -> bool:
+    if getattr(config, "model_type", None) != "glm_moe_dsa":
+        return False
+    if not _env_flag(GLM_MOE_PREFILL_GATE_UP_ENV, True):
+        return False
+    try:
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+
+        return fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=None)
+def _glm_moe_block_builder(num_experts: int, block_rows: int):
+    source = r"""
+        const uint expert = thread_index_in_threadgroup;
+        threadgroup atomic_int local_count;
+        if (expert == 0) {
+            atomic_store_explicit(&local_count, 0, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (expert >= NUM_EXPERTS) return;
+
+        int lo = 0;
+        int hi = M;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (indices[mid] < int(expert)) lo = mid + 1;
+            else hi = mid;
+        }
+        const int start = lo;
+        hi = M;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (indices[mid] <= int(expert)) lo = mid + 1;
+            else hi = mid;
+        }
+        const int end = lo;
+        for (int row = start; row < end; row += BLOCK_ROWS) {
+            const int slot = atomic_fetch_add_explicit(
+                &local_count, 1, memory_order_relaxed);
+            if (slot < MAX_BLOCKS) {
+                block_meta[slot * 3] = row;
+                block_meta[slot * 3 + 1] = int(expert);
+                block_meta[slot * 3 + 2] = min(BLOCK_ROWS, end - row);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (expert == 0) {
+            block_count[0] = atomic_load_explicit(
+                &local_count, memory_order_relaxed);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name=f"glm_moe_block_builder_e{num_experts}_m{block_rows}",
+        input_names=["indices"],
+        output_names=["block_meta", "block_count"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+def _glm_moe_build_blocks(indices, num_experts, block_rows):
+    indices = indices.astype(mx.int32)
+    max_blocks = (indices.size + block_rows - 1) // block_rows + num_experts
+    return _glm_moe_block_builder(num_experts, block_rows)(
+        inputs=[indices],
+        template=[
+            ("NUM_EXPERTS", num_experts),
+            ("BLOCK_ROWS", block_rows),
+            ("M", indices.size),
+            ("MAX_BLOCKS", max_blocks),
+        ],
+        grid=(num_experts, 1, 1),
+        threadgroup=(num_experts, 1, 1),
+        output_shapes=[(max_blocks, 3), (1,)],
+        output_dtypes=[mx.int32, mx.int32],
+    )
+
+
+def _glm_moe_sorted_gate_up(x, indices, up_proj, gate_proj):
+    """Fuse GLM gate/up only for the exact supported prefill quantization."""
+    try:
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+        projections = (up_proj, gate_proj)
+        if not all(
+            isinstance(proj, QuantizedSwitchLinear) for proj in projections
+        ):
+            return None
+        if not (
+            x.ndim == 3
+            and x.shape[-2] == 1
+            and x.dtype in (mx.float16, mx.bfloat16)
+            and indices.size >= 64
+            and up_proj.group_size == gate_proj.group_size == 64
+            and up_proj.bits == gate_proj.bits
+            and up_proj.bits in (2, 3)
+            and up_proj.mode == gate_proj.mode == "affine"
+            and up_proj.output_dims == gate_proj.output_dims
+            and up_proj.num_experts == gate_proj.num_experts
+            and up_proj.get("biases") is not None
+            and gate_proj.get("biases") is not None
+            and "bias" not in up_proj
+            and "bias" not in gate_proj
+            and up_proj["weight"].dtype == gate_proj["weight"].dtype == mx.uint32
+            and up_proj["scales"].dtype == gate_proj["scales"].dtype == x.dtype
+            and up_proj["biases"].dtype == gate_proj["biases"].dtype == x.dtype
+            and fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
+        ):
+            return None
+
+        block_rows, variant = (32, 2) if indices.size >= 8192 else (16, 1)
+        block_meta, block_count = _glm_moe_build_blocks(
+            indices, up_proj.num_experts, block_rows
+        )
+        pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks(
+            x,
+            up_proj["weight"],
+            up_proj["scales"],
+            up_proj["biases"],
+            gate_proj["weight"],
+            gate_proj["scales"],
+            gate_proj["biases"],
+            block_meta,
+            block_count,
+            up_proj.group_size,
+            up_proj.bits,
+            variant,
+        )
+        hidden_dims = up_proj.output_dims
+        return pair[..., :hidden_dims], pair[..., hidden_dims:]
+    except Exception:
+        return None
+
+
+def _glm_moe_sorted_weighted_sum(x_sorted, inv_order, scores):
+    """Reduce sorted GLM routed outputs, falling back without recomputation."""
+    try:
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+
+        if (
+            scores.shape[-1] == 8
+            and x_sorted.shape[-1] == 6144
+            and scores.dtype == mx.float32
+            and fast.has_symbol("glm_moe_weighted_sum")
+        ):
+            return fast.glm_moe_weighted_sum(x_sorted, inv_order, scores)
+    except Exception:
+        pass
+
+    routed = x_sorted[inv_order]
+    routed = routed.reshape(*scores.shape, x_sorted.shape[-1])
+    return (routed * scores[..., None]).sum(axis=-2).astype(x_sorted.dtype)
 
 
 @dataclass
@@ -376,8 +560,36 @@ class DeepseekV32MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        use_prefill_weighted_sum = (
+            self.sharding_group is None
+            and inds.size >= 64
+            and _glm_moe_prefill_weighted_sum_available(self.config)
+        )
+        use_prefill_gate_up = (
+            self.sharding_group is None
+            and inds.size >= 64
+            and _glm_moe_prefill_gate_up_available(self.config)
+        )
+        if use_prefill_weighted_sum or use_prefill_gate_up:
+            y = self.switch_mlp(
+                x,
+                inds,
+                scores=scores if use_prefill_weighted_sum else None,
+                sorted_weighted_sum=(
+                    _glm_moe_sorted_weighted_sum
+                    if use_prefill_weighted_sum
+                    else None
+                ),
+                sorted_gate_up=(
+                    _glm_moe_sorted_gate_up if use_prefill_gate_up else None
+                ),
+                inverse_scatter=use_prefill_weighted_sum,
+            )
+            if not use_prefill_weighted_sum:
+                y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        else:
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(x)
 

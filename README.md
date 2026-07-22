@@ -15,8 +15,9 @@ This branch is not intended as an upstream `mlx-lm` PR. Several changes intentio
 - Server-side support for `--kv-bits`, `--kv-group-size`, and `--quantized-kv-start`.
 - Local GLM-5.2 runtime cache layout designed for one-command invalidation.
 - Vendored GLM MoE DSA native custom kernels for optional native DSA indexer
-  score/top-k, sparse MLA prefill, and experimental q projection probes. These
-  are built from this repository and no longer require a runtime oMLX checkout.
+  score/top-k, sparse MLA prefill, routed-MoE prefill reduction and gate/up
+  fusion, and experimental q projection probes. These are built from this
+  repository and no longer require a runtime oMLX checkout.
 
 ### Native custom-kernel build
 
@@ -91,6 +92,35 @@ python benchmarks/glm52_prefill_benchmark.py \
   --native-q8-vup-benchmark-q-len 256 \
   --json-output glm52-native-smoke-bench.json
 ```
+
+### GLM routed-MoE prefill kernels
+
+Supported GLM-5.2 prefill calls use two native routed-MoE optimizations by
+default. The first consumes the expert-sorted down-projection output directly,
+combines inverse scatter with the FP32 router-weighted sum, and avoids
+materializing the unsorted top-k expert tensor. The second evaluates the
+3-bit or 2-bit affine gate and up projections with one shared block plan and a
+paired Metal dispatch. Both paths require at least 64 routed rows and leave the
+single-token decode path unchanged.
+
+The gate/up path has strict predicates: affine mode, group size 64, matching
+2-bit or 3-bit gate/up quantization, `uint32` packed weights, scale/bias dtype
+matching the activation, no added linear bias, and no expert sharding. Mixed or
+custom quantization that does not satisfy every predicate continues through the
+existing MLX `gather_qmm` path. The weighted-sum path likewise requires the GLM
+top-8 / hidden-size-6144 native shape and FP32 router scores.
+
+For controlled A/B measurements, set either environment variable to `0`:
+
+```sh
+MLX_LM_GLM_MOE_PREFILL_GATE_UP=0
+MLX_LM_GLM_MOE_PREFILL_WEIGHTED_SUM=0
+```
+
+An isolated M3 Ultra synthetic measurement using the model dimensions
+6144→2048 measured the paired gate/up projection at about 16.0x the two-dispatch
+baseline for 512 tokens and 18.3x for 2048 tokens. This isolates routed-MoE
+gate/up projection only and is not an end-to-end prefill speedup claim.
 
 ### Recommended target model
 

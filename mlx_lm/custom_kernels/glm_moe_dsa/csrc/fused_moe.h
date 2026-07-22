@@ -42,4 +42,19 @@ mx::array glm_moe_weighted_sum(
     const mx::array& scores,
     mx::StreamOrDevice s = {});
 
+mx::array deepseek_affine_gather_qmm_pair_concat_blocks(
+    const mx::array& x,
+    const mx::array& weight0,
+    const mx::array& scales0,
+    const mx::array& biases0,
+    const mx::array& weight1,
+    const mx::array& scales1,
+    const mx::array& biases1,
+    const mx::array& block_meta,
+    const mx::array& block_count,
+    int group_size,
+    int bits,
+    int variant = 0,
+    mx::StreamOrDevice s = {});
+
 } // namespace omlx::glm_kernels

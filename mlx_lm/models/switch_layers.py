@@ -9,11 +9,22 @@ import mlx.nn as nn
 from .activations import swiglu
 
 
-def _gather_sort(x, indices):
+def _inverse_permutation(order, inverse_scatter=False):
+    if inverse_scatter:
+        return mx.put_along_axis(
+            mx.zeros_like(order),
+            order,
+            mx.arange(order.size, dtype=order.dtype),
+            axis=0,
+        )
+    return mx.argsort(order)
+
+
+def _gather_sort(x, indices, inverse_scatter=False):
     *_, M = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
+    inv_order = _inverse_permutation(order, inverse_scatter)
     return x.flatten(0, -3)[order // M], indices[order], inv_order
 
 
@@ -173,7 +184,16 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
-    def __call__(self, x, indices) -> mx.array:
+    def __call__(
+        self,
+        x,
+        indices,
+        *,
+        scores=None,
+        sorted_weighted_sum=None,
+        sorted_gate_up=None,
+        inverse_scatter=False,
+    ) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
@@ -182,16 +202,27 @@ class SwitchGLU(nn.Module):
         idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            x, idx, inv_order = _gather_sort(
+                x, indices, inverse_scatter=inverse_scatter
+            )
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        gate_up = None
+        if do_sort and sorted_gate_up is not None:
+            gate_up = sorted_gate_up(x, idx, self.up_proj, self.gate_proj)
+        if gate_up is None:
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        else:
+            x_up, x_gate = gate_up
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,
             sorted_indices=do_sort,
         )
+
+        if do_sort and scores is not None and sorted_weighted_sum is not None:
+            return sorted_weighted_sum(x, inv_order, scores)
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)

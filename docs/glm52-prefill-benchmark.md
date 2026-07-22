@@ -1033,11 +1033,45 @@ python -m mlx_lm server \
   --decode-concurrency 2
 ```
 
+## Routed-MoE prefill fusion
+
+GLM sparse MoE prefill now keeps the expert-sorted route order through the down
+projection. A native top-8 weighted-sum kernel applies the inverse permutation
+and FP32 router scores directly, avoiding the generic unsort, routed-tensor
+materialization, multiplication, and reduction sequence. The inverse
+permutation itself is built by scatter instead of a second sort. Set
+`MLX_LM_GLM_MOE_PREFILL_WEIGHTED_SUM=0` for a baseline run.
+
+For supported 2-bit and 3-bit affine weights, gate and up projections share one
+expert block plan and one paired Metal dispatch. This path is enabled only for
+sorted prefill route counts of at least 64, group size 64, identical gate/up
+quantization, matching activation/scale/bias dtypes, packed `uint32` weights,
+no added bias, and non-sharded experts. Other mixed/custom quantization remains
+on `mx.gather_qmm`. Set `MLX_LM_GLM_MOE_PREFILL_GATE_UP=0` to compare against
+that fallback. Decode has eight routed rows and therefore never enters either
+prefill fusion.
+
+Isolated M3 Ultra measurements with hidden size 6144, expert intermediate size
+2048, four synthetic experts, and 3-bit affine weights gave:
+
+| Prompt tokens | Existing two `gather_qmm` calls | Paired gate/up | Isolated speedup |
+|---:|---:|---:|---:|
+| 512 | 168.19 ms | 10.50 ms | 16.01x |
+| 2048 | 666.27 ms | 36.35 ms | 18.33x |
+
+These numbers isolate the gate/up projections, include block-plan construction,
+and do not represent whole-model prefill speedup. The native weighted reduction
+was separately measured at 3.9x for 1024 tokens and 6.35x for 4096 tokens versus
+the generic routed reduction.
+
 ## Validation In This Pass
 
 Unit validation covered:
 
 - exact GLM DSA fast prefill output closeness against the fallback path
+- routed-MoE native weighted-sum closeness against the generic unsort/reduction
+- routed-MoE paired affine gate/up closeness against two `gather_qmm` calls
+- mixed/custom quantization predicates falling back without changing decode
 - exact GLM DSA fast prefill output closeness with `QuantizedGlmMlaKVCache`
 - sparse prefill waiting until the configured minimum effective context
 - sparse prefill falling back while the causal prefix is shorter than top-k

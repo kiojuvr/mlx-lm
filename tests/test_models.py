@@ -3,6 +3,8 @@ import copy
 import importlib
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -29,6 +31,138 @@ from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
+    def test_glm_moe_prefill_weighted_sum_policy(self):
+        from mlx_lm.models.deepseek_v32 import (
+            GLM_MOE_PREFILL_GATE_UP_ENV,
+            GLM_MOE_PREFILL_WEIGHTED_SUM_ENV,
+            _glm_moe_prefill_gate_up_available,
+            _glm_moe_prefill_weighted_sum_available,
+        )
+
+        other = SimpleNamespace(model_type="deepseek_v32")
+        glm = SimpleNamespace(model_type="glm_moe_dsa")
+        self.assertFalse(_glm_moe_prefill_weighted_sum_available(other))
+        with patch.dict(
+            os.environ, {GLM_MOE_PREFILL_WEIGHTED_SUM_ENV: "0"}, clear=False
+        ):
+            self.assertFalse(_glm_moe_prefill_weighted_sum_available(glm))
+        with patch.dict(
+            os.environ, {GLM_MOE_PREFILL_GATE_UP_ENV: "0"}, clear=False
+        ):
+            self.assertFalse(_glm_moe_prefill_gate_up_available(glm))
+
+    def test_glm_moe_native_weighted_sum_matches_reference(self):
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+        from mlx_lm.models.deepseek_v32 import _glm_moe_sorted_weighted_sum
+
+        if not fast.has_symbol("glm_moe_weighted_sum"):
+            self.skipTest("native GLM MoE weighted-sum kernel is unavailable")
+
+        num_tokens, topk, dims = 8, 8, 6144
+        num_routes = num_tokens * topk
+        order = mx.random.permutation(mx.arange(num_routes, dtype=mx.uint32))
+        inv_order = mx.put_along_axis(
+            mx.zeros_like(order),
+            order,
+            mx.arange(num_routes, dtype=mx.uint32),
+            axis=0,
+        )
+        x_sorted = mx.random.normal((num_routes, 1, dims), dtype=mx.bfloat16)
+        scores = mx.softmax(
+            mx.random.normal((1, num_tokens, topk), dtype=mx.float32), axis=-1
+        )
+        expected = (
+            x_sorted[inv_order].reshape(1, num_tokens, topk, dims)
+            * scores[..., None]
+        ).sum(axis=-2).astype(mx.bfloat16)
+        actual = _glm_moe_sorted_weighted_sum(x_sorted, inv_order, scores)
+        mx.eval(expected, actual)
+        self.assertTrue(mx.allclose(expected, actual, rtol=1e-2, atol=3.2e-2))
+
+    def test_glm_moe_native_gate_up_matches_reference(self):
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+        from mlx_lm.models.deepseek_v32 import _glm_moe_sorted_gate_up
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+        symbol = "deepseek_affine_gather_qmm_pair_concat_blocks"
+        if not fast.has_symbol(symbol):
+            self.skipTest("native GLM MoE affine gate/up kernel is unavailable")
+
+        experts, input_dims, output_dims = 4, 64, 32
+        for bits in (2, 3):
+            with self.subTest(bits=bits):
+                projections = []
+                for _ in range(2):
+                    projection = QuantizedSwitchLinear(
+                        input_dims,
+                        output_dims,
+                        experts,
+                        bias=False,
+                        group_size=64,
+                        bits=bits,
+                    )
+                    weight = mx.random.normal(
+                        (experts, output_dims, input_dims), dtype=mx.bfloat16
+                    )
+                    (
+                        projection.weight,
+                        projection.scales,
+                        projection.biases,
+                    ) = mx.quantize(
+                        weight, group_size=64, bits=bits, mode="affine"
+                    )
+                    projections.append(projection)
+
+                x = mx.random.normal((64, 1, input_dims), dtype=mx.bfloat16)
+                indices = mx.repeat(mx.arange(experts, dtype=mx.uint32), 16)
+                expected = tuple(
+                    projection(x, indices, sorted_indices=True)
+                    for projection in projections
+                )
+                actual = _glm_moe_sorted_gate_up(x, indices, *projections)
+                self.assertIsNotNone(actual)
+                mx.eval(*expected, *actual)
+                for reference, fused in zip(expected, actual):
+                    self.assertTrue(
+                        mx.allclose(reference, fused, rtol=2e-2, atol=6.3e-2)
+                    )
+
+                self.assertIsNone(
+                    _glm_moe_sorted_gate_up(x[:8], indices[:8], *projections)
+                )
+                projections[0].mode = "custom"
+                self.assertIsNone(
+                    _glm_moe_sorted_gate_up(x, indices, *projections)
+                )
+
+    def test_switch_glu_sorted_weighted_sum_matches_unsorted_reference(self):
+        from mlx_lm.models.deepseek_v32 import _glm_moe_sorted_weighted_sum
+        from mlx_lm.models.switch_layers import SwitchGLU
+
+        switch = SwitchGLU(8, 12, 4)
+        switch.eval()
+        x = mx.random.normal((1, 8, 8), dtype=mx.bfloat16)
+        indices = mx.arange(64, dtype=mx.uint32).reshape(1, 8, 8) % 4
+        scores = mx.softmax(
+            mx.random.normal((1, 8, 8), dtype=mx.float32), axis=-1
+        )
+
+        routed = switch(x, indices)
+        expected = (routed * scores[..., None]).sum(axis=-2).astype(routed.dtype)
+        actual = switch(
+            x,
+            indices,
+            scores=scores,
+            sorted_weighted_sum=_glm_moe_sorted_weighted_sum,
+            sorted_gate_up=lambda sorted_x, sorted_indices, up, gate: (
+                up(sorted_x, sorted_indices, sorted_indices=True),
+                gate(sorted_x, sorted_indices, sorted_indices=True),
+            ),
+            inverse_scatter=True,
+        )
+        mx.eval(expected, actual)
+        self.assertTrue(mx.array_equal(expected, actual).item())
+
     def test_kv_cache(self):
         cache = KVCache()
 

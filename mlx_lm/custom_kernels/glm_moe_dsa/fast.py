@@ -37,6 +37,7 @@ NATIVE_SYMBOLS = (
     "glm_dsa_q4_qa_proj_flat",
     "glm_dsa_q4_qb_proj_flat",
     "glm_moe_weighted_sum",
+    "deepseek_affine_gather_qmm_pair_concat_blocks",
 )
 
 
@@ -439,6 +440,45 @@ def glm_moe_weighted_sum(
         inv_order,
         scores,
         stream=stream or mx.gpu,
+    )
+
+
+def deepseek_affine_gather_qmm_pair_concat_blocks(
+    x: mx.array,
+    weight0: mx.array,
+    scales0: mx.array,
+    biases0: mx.array,
+    weight1: mx.array,
+    scales1: mx.array,
+    biases1: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    group_size: int,
+    bits: int,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(
+        _ext, "deepseek_affine_gather_qmm_pair_concat_blocks"
+    ):
+        return _ext.deepseek_affine_gather_qmm_pair_concat_blocks(
+            x,
+            weight0,
+            scales0,
+            biases0,
+            weight1,
+            scales1,
+            biases1,
+            block_meta,
+            block_count,
+            group_size,
+            bits,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_affine_gather_qmm_pair_concat_blocks native kernel is unavailable"
     )
 
 

@@ -2,8 +2,9 @@
 
 This package vendors the GLM MoE DSA native custom kernels from oMLX so this
 GLM-5.2-focused fork can build and run the native DSA indexer, sparse MLA,
-q8/q4 V-up, and experimental q4 q projection routes without a runtime
-dependency on the changing oMLX repository.
+q8/q4 V-up, routed-MoE weighted reduction and affine gate/up prefill fusion,
+and experimental q4 q projection routes without a runtime dependency on the
+changing oMLX repository.
 
 Vendored source:
 

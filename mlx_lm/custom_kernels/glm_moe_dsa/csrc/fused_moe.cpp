@@ -33,6 +33,49 @@ bool row_contiguous(const array& arr) {
   return arr.flags().row_contiguous && arr.strides(-1) == 1;
 }
 
+struct AffineBlocksVariant {
+  int bm;
+  int bn;
+  int bk;
+  int wm;
+  int wn;
+};
+
+AffineBlocksVariant affine_blocks_variant(int variant) {
+  switch (variant) {
+    case 1:
+      return {16, 32, 32, 1, 2};
+    case 2:
+      return {32, 32, 32, 1, 2};
+    default: {
+      std::ostringstream msg;
+      msg << "Unsupported GLM affine block-list variant " << variant << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+}
+
+int affine_pack_factor(int bits) {
+  return bits == 2 ? 4 : (bits == 3 ? 8 : 0);
+}
+
+int affine_bytes_per_pack(int bits) {
+  return bits == 2 ? 1 : (bits == 3 ? 3 : 0);
+}
+
+bool supported_glm_affine(int group_size, int bits) {
+  return group_size == 64 && (bits == 2 || bits == 3);
+}
+
+int affine_packed_row_bytes(int k, int bits) {
+  const int pack_factor = affine_pack_factor(bits);
+  const int bytes_per_pack = affine_bytes_per_pack(bits);
+  if (pack_factor == 0 || k % pack_factor != 0) {
+    return -1;
+  }
+  return k * bytes_per_pack / pack_factor;
+}
+
 std::string glm_type_name(Dtype dtype) {
   if (dtype == float16) {
     return "float16_t";
@@ -732,6 +775,160 @@ class GlmMoeWeightedSumPrimitive : public Primitive {
 
 };
 
+class GlmAffineGatherPairBlocksPrimitive : public Primitive {
+ public:
+  explicit GlmAffineGatherPairBlocksPrimitive(
+      Stream stream,
+      int group_size,
+      int bits,
+      int variant)
+      : Primitive(stream),
+        group_size_(group_size),
+        bits_(bits),
+        variant_(variant) {
+    (void)affine_blocks_variant(variant_);
+    if (!supported_glm_affine(group_size_, bits_)) {
+      throw std::invalid_argument(
+          "Unsupported GLM affine pair block-list quantization.");
+    }
+  }
+
+  static bool unsupported(
+      const array& x,
+      const array& weight0,
+      const array& scales0,
+      const array& biases0,
+      const array& weight1,
+      const array& scales1,
+      const array& biases1,
+      const array& block_meta,
+      const array& block_count,
+      int group_size,
+      int bits,
+      Stream s) {
+    if (s.device == Device::cpu || !supported_glm_affine(group_size, bits)) {
+      return true;
+    }
+    if (x.dtype() != float16 && x.dtype() != bfloat16) {
+      return true;
+    }
+    if (weight0.dtype() != uint32 || weight1.dtype() != uint32 ||
+        scales0.dtype() != x.dtype() || scales1.dtype() != x.dtype() ||
+        biases0.dtype() != x.dtype() || biases1.dtype() != x.dtype() ||
+        block_meta.dtype() != int32 || block_count.dtype() != int32) {
+      return true;
+    }
+    if (x.ndim() != 3 || x.shape(1) != 1 || weight0.ndim() != 3 ||
+        scales0.ndim() != 3 || biases0.ndim() != 3 || weight1.ndim() != 3 ||
+        scales1.ndim() != 3 || biases1.ndim() != 3 || block_meta.ndim() != 2 ||
+        block_meta.shape(1) != 3 || block_count.size() != 1) {
+      return true;
+    }
+    if (!row_contiguous(x) || !row_contiguous(weight0) ||
+        !row_contiguous(scales0) || !row_contiguous(biases0) ||
+        !row_contiguous(weight1) || !row_contiguous(scales1) ||
+        !row_contiguous(biases1) || !row_contiguous(block_meta) ||
+        !row_contiguous(block_count)) {
+      return true;
+    }
+
+    const int k = x.shape(2);
+    const int experts = weight0.shape(0);
+    const int n = weight0.shape(1);
+    const int packed_bytes = affine_packed_row_bytes(k, bits);
+    if (x.shape(0) <= 0 || k <= 0 || n <= 0 || experts <= 0 ||
+        block_meta.shape(0) <= 0 || packed_bytes <= 0) {
+      return true;
+    }
+    if (weight1.shape() != weight0.shape() || scales1.shape() != scales0.shape() ||
+        biases1.shape() != biases0.shape()) {
+      return true;
+    }
+    return weight0.shape(2) * static_cast<int>(sizeof(uint32_t)) !=
+            packed_bytes ||
+        scales0.shape(0) != experts || scales0.shape(1) != n ||
+        scales0.shape(2) != k / group_size || biases0.shape() != scales0.shape();
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error(
+        "GlmAffineGatherPairBlocksPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+    const auto& x = inputs[0];
+    const auto& weight0 = inputs[1];
+    const auto& block_meta = inputs[7];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+    const auto cfg = affine_blocks_variant(variant_);
+    const int max_blocks = block_meta.shape(0);
+    const int m = x.shape(0);
+    const int k = x.shape(2);
+    const int n = weight0.shape(1);
+
+    std::string kname;
+    concatenate(
+        kname,
+        "deepseek_affine_gather_pair_concat_blocks_rhs_",
+        glm_type_name(x.dtype()),
+        "_gs_",
+        group_size_,
+        "_b_",
+        bits_,
+        "_bm_",
+        cfg.bm,
+        "_bn_",
+        cfg.bn,
+        "_bk_",
+        cfg.bk,
+        "_wm_",
+        cfg.wm,
+        "_wn_",
+        cfg.wn);
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(kname, lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    for (int i = 0; i < 9; ++i) {
+      encoder.set_input_array(inputs[i], i);
+    }
+    encoder.set_output_array(out, 9);
+    encoder.set_bytes(max_blocks, 10);
+    encoder.set_bytes(m, 11);
+    encoder.set_bytes(n, 12);
+    encoder.set_bytes(k, 13);
+    MTL::Size grid_dims((2 * n + cfg.bn - 1) / cfg.bn, max_blocks, 1);
+    MTL::Size group_dims(cfg.wm * cfg.wn * 32, 1, 1);
+    encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(GlmAffineGatherPairBlocksPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const GlmAffineGatherPairBlocksPrimitive&>(other);
+    return group_size_ == rhs.group_size_ && bits_ == rhs.bits_ &&
+        variant_ == rhs.variant_;
+  }
+  auto state() const {
+    return std::make_tuple(group_size_, bits_, variant_);
+  }
+
+ private:
+  int group_size_;
+  int bits_;
+  int variant_;
+};
+
 } // namespace
 
 array glm_dsa_q8_vup_flat(
@@ -1057,6 +1254,64 @@ array glm_moe_weighted_sum(
       std::move(out_shape),
       x_sorted.dtype(),
       std::make_shared<GlmMoeWeightedSumPrimitive>(stream),
+      std::move(inputs));
+}
+
+array deepseek_affine_gather_qmm_pair_concat_blocks(
+    const array& x,
+    const array& weight0,
+    const array& scales0,
+    const array& biases0,
+    const array& weight1,
+    const array& scales1,
+    const array& biases1,
+    const array& block_meta,
+    const array& block_count,
+    int group_size,
+    int bits,
+    int variant,
+    StreamOrDevice s /* = {} */) {
+  const auto cfg = affine_blocks_variant(variant);
+  auto stream = to_stream(s);
+  if (GlmAffineGatherPairBlocksPrimitive::unsupported(
+          x,
+          weight0,
+          scales0,
+          biases0,
+          weight1,
+          scales1,
+          biases1,
+          block_meta,
+          block_count,
+          group_size,
+          bits,
+          stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.deepseek_affine_gather_qmm_pair_concat_blocks] "
+        "unsupported shape or quantization.");
+  }
+  const int n = weight0.shape(1);
+  if (n % cfg.bn != 0) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.deepseek_affine_gather_qmm_pair_concat_blocks] "
+        "output dimension must be divisible by the block N.");
+  }
+  std::vector<array> inputs = {
+      x,
+      weight0,
+      scales0,
+      biases0,
+      weight1,
+      scales1,
+      biases1,
+      block_meta,
+      block_count};
+  Shape out_shape{x.shape(0), 1, 2 * n};
+  return array(
+      std::move(out_shape),
+      x.dtype(),
+      std::make_shared<GlmAffineGatherPairBlocksPrimitive>(
+          stream, group_size, bits, variant),
       std::move(inputs));
 }
 
