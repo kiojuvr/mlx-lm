@@ -18,13 +18,38 @@ mx::array dsa_indexer_scores(
     int causal_q_offset = -1,
     mx::StreamOrDevice s = {});
 
+mx::array dsa_indexer_scores_fp32(
+    const mx::array& queries,
+    const mx::array& keys,
+    const mx::array& weights,
+    float scale,
+    bool causal = true,
+    int unused_causal_prefix_topk = 0,
+    bool skip_causal_future_store = false,
+    int causal_q_offset = -1,
+    mx::StreamOrDevice s = {});
+
 mx::array dsa_indexer_scores_decode(
     const mx::array& queries,
     const mx::array& keys,
     const mx::array& weights,
     mx::StreamOrDevice s = {});
 
+mx::array dsa_indexer_scores_decode_fp32(
+    const mx::array& queries,
+    const mx::array& keys,
+    const mx::array& weights,
+    float scale,
+    mx::StreamOrDevice s = {});
+
 mx::array dsa_topk_indices(
+    const mx::array& scores,
+    int topk,
+    bool bucketed = false,
+    bool causal_valid_prefix = false,
+    mx::StreamOrDevice s = {});
+
+mx::array dsa_topk_indices_fp32(
     const mx::array& scores,
     int topk,
     bool bucketed = false,

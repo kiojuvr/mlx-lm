@@ -837,7 +837,23 @@ def quantize_model(
 
     quantized_config = copy.deepcopy(config)
 
-    quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    model_quant_predicate = getattr(model, "quant_predicate", None)
+    requested_quant_predicate = quant_predicate
+    if requested_quant_predicate is None:
+        quant_predicate = model_quant_predicate
+    elif model_quant_predicate is not None:
+
+        def quant_predicate(path, module):
+            # An explicit mixed/custom recipe may refine how allowed modules
+            # are quantized, but it must not opt a model-protected module back
+            # into quantization. In particular, GLM-5.2 Indexer head weights
+            # must remain FP32 for reference-equivalent top-k selection.
+            if model_quant_predicate(path, module) is False:
+                return False
+            return requested_quant_predicate(path, module)
+
+    else:
+        quant_predicate = requested_quant_predicate
     group_size, bits = defaults_for_mode(mode, group_size, bits)
     quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
     if "quantization" in quantized_config:

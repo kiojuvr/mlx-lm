@@ -25,8 +25,11 @@ else:
 
 NATIVE_SYMBOLS = (
     "dsa_indexer_scores",
+    "dsa_indexer_scores_fp32",
     "dsa_indexer_scores_decode",
+    "dsa_indexer_scores_decode_fp32",
     "dsa_topk_indices",
+    "dsa_topk_indices_fp32",
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
     "glm_dsa_q8_vup_flat",
@@ -100,6 +103,44 @@ def dsa_indexer_scores(
     )
 
 
+def dsa_indexer_scores_fp32(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    scale: float,
+    causal: bool = True,
+    unused_causal_prefix_topk: int = 0,
+    skip_causal_future_store: bool = False,
+    causal_q_offset: int = -1,
+    *,
+    stream=None,
+) -> mx.array:
+    """Compute reference-order Indexer scores with FP32 weights/output."""
+    if _ext is not None and hasattr(_ext, "dsa_indexer_scores_fp32"):
+        return _ext.dsa_indexer_scores_fp32(
+            queries,
+            keys,
+            weights,
+            scale,
+            causal=causal,
+            unused_causal_prefix_topk=unused_causal_prefix_topk,
+            skip_causal_future_store=skip_causal_future_store,
+            causal_q_offset=causal_q_offset,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.dsa_indexer_scores_fp32(
+        queries,
+        keys,
+        weights,
+        scale,
+        causal=causal,
+        unused_causal_prefix_topk=unused_causal_prefix_topk,
+        skip_causal_future_store=skip_causal_future_store,
+        causal_q_offset=causal_q_offset,
+        stream=stream or mx.gpu,
+    )
+
+
 def dsa_indexer_scores_decode(
     queries: mx.array,
     keys: mx.array,
@@ -122,6 +163,32 @@ def dsa_indexer_scores_decode(
     )
 
 
+def dsa_indexer_scores_decode_fp32(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    scale: float,
+    *,
+    stream=None,
+) -> mx.array:
+    """Decode-specialized FP32 Indexer score path."""
+    if _ext is not None and hasattr(_ext, "dsa_indexer_scores_decode_fp32"):
+        return _ext.dsa_indexer_scores_decode_fp32(
+            queries,
+            keys,
+            weights,
+            scale,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.dsa_indexer_scores_decode_fp32(
+        queries,
+        keys,
+        weights,
+        scale,
+        stream=stream or mx.gpu,
+    )
+
+
 def dsa_topk_indices(
     scores: mx.array,
     topk: int,
@@ -139,6 +206,32 @@ def dsa_topk_indices(
             **_native_stream_kwargs(stream),
         )
     return mx.fast.dsa_topk_indices(
+        scores,
+        topk,
+        bucketed=bucketed,
+        causal_valid_prefix=causal_valid_prefix,
+        stream=stream or mx.gpu,
+    )
+
+
+def dsa_topk_indices_fp32(
+    scores: mx.array,
+    topk: int,
+    bucketed: bool = False,
+    causal_valid_prefix: bool = False,
+    *,
+    stream=None,
+) -> mx.array:
+    """Select top-k directly from FP32 scores without 16-bit rounding."""
+    if _ext is not None and hasattr(_ext, "dsa_topk_indices_fp32"):
+        return _ext.dsa_topk_indices_fp32(
+            scores,
+            topk,
+            bucketed=bucketed,
+            causal_valid_prefix=causal_valid_prefix,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.fast.dsa_topk_indices_fp32(
         scores,
         topk,
         bucketed=bucketed,

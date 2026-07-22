@@ -54,26 +54,35 @@ class DSAIndexerScoresPrimitive : public Primitive {
       bool weights_lh,
       int unused_causal_prefix_topk,
       bool skip_causal_future_store,
-      int causal_q_offset)
+      int causal_q_offset,
+      bool fp32_output,
+      float scale)
       : Primitive(stream),
         causal_(causal),
         weights_lh_(weights_lh),
         unused_causal_prefix_topk_(unused_causal_prefix_topk),
         skip_causal_future_store_(skip_causal_future_store),
-        causal_q_offset_(causal_q_offset) {}
+        causal_q_offset_(causal_q_offset),
+        fp32_output_(fp32_output),
+        scale_(scale) {}
 
   static bool unsupported(
       const array& q,
       const array& k,
       const array& weights,
+      bool fp32_output,
       Stream s) {
     if (s.device == Device::cpu) {
       return true;
     }
-    if (q.dtype() != k.dtype() || q.dtype() != weights.dtype()) {
+    if (q.dtype() != k.dtype()) {
       return true;
     }
     if (q.dtype() != float16 && q.dtype() != bfloat16) {
+      return true;
+    }
+    if (fp32_output ? weights.dtype() != float32
+                    : weights.dtype() != q.dtype()) {
       return true;
     }
     if (!row_contiguous(q) || !row_contiguous(k) ||
@@ -167,7 +176,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
     std::string base_name;
     concatenate(
         base_name,
-        "steel_dsa_indexer_score_",
+        fp32_output_ ? "steel_dsa_indexer_score_fp32_"
+                     : "steel_dsa_indexer_score_",
         type_to_name(q),
         "_bm",
         bm,
@@ -203,6 +213,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
     compute_encoder.set_bytes(unused_causal_prefix_topk_, 6);
     compute_encoder.set_bytes(skip_causal_future_store_, 7);
     compute_encoder.set_bytes(causal_q_offset_, 8);
+    compute_encoder.set_bytes(scale_, 9);
 
     MTL::Size group_dims = MTL::Size(wm * wn * 32, 1, 1);
     MTL::Size grid_dims = MTL::Size(tiles_n, tiles_m, B);
@@ -216,7 +227,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
     return causal_ == rhs.causal_ && weights_lh_ == rhs.weights_lh_ &&
         unused_causal_prefix_topk_ == rhs.unused_causal_prefix_topk_ &&
         skip_causal_future_store_ == rhs.skip_causal_future_store_ &&
-        causal_q_offset_ == rhs.causal_q_offset_;
+        causal_q_offset_ == rhs.causal_q_offset_ &&
+        fp32_output_ == rhs.fp32_output_ && scale_ == rhs.scale_;
   }
   auto state() const {
     return std::make_tuple(
@@ -224,7 +236,9 @@ class DSAIndexerScoresPrimitive : public Primitive {
         weights_lh_,
         unused_causal_prefix_topk_,
         skip_causal_future_store_,
-        causal_q_offset_);
+        causal_q_offset_,
+        fp32_output_,
+        scale_);
   }
 
  private:
@@ -233,24 +247,32 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int unused_causal_prefix_topk_;
   bool skip_causal_future_store_;
   int causal_q_offset_;
+  bool fp32_output_;
+  float scale_;
 };
 
 class DSAIndexerDecodeScoresPrimitive : public Primitive {
  public:
-  explicit DSAIndexerDecodeScoresPrimitive(Stream stream) : Primitive(stream) {}
+  DSAIndexerDecodeScoresPrimitive(Stream stream, bool fp32_output, float scale)
+      : Primitive(stream), fp32_output_(fp32_output), scale_(scale) {}
 
   static bool unsupported(
       const array& q,
       const array& k,
       const array& weights,
+      bool fp32_output,
       Stream s) {
     if (s.device == Device::cpu) {
       return true;
     }
-    if (q.dtype() != k.dtype() || q.dtype() != weights.dtype()) {
+    if (q.dtype() != k.dtype()) {
       return true;
     }
     if (q.dtype() != float16 && q.dtype() != bfloat16) {
+      return true;
+    }
+    if (fp32_output ? weights.dtype() != float32
+                    : weights.dtype() != q.dtype()) {
       return true;
     }
     if (!row_contiguous(q) || !row_contiguous(k) ||
@@ -299,7 +321,8 @@ class DSAIndexerDecodeScoresPrimitive : public Primitive {
     std::string base_name;
     concatenate(
         base_name,
-        "steel_dsa_indexer_score_decode_",
+        fp32_output_ ? "steel_dsa_indexer_score_decode_fp32_"
+                     : "steel_dsa_indexer_score_decode_",
         type_to_name(q),
         "_h",
         H,
@@ -318,6 +341,7 @@ class DSAIndexerDecodeScoresPrimitive : public Primitive {
     compute_encoder.set_input_array(weights, 2);
     compute_encoder.set_output_array(out, 3);
     compute_encoder.set_bytes(N, 4);
+    compute_encoder.set_bytes(scale_, 5);
 
     MTL::Size group_dims = MTL::Size(32, keys_per_tg, 1);
     MTL::Size grid_dims = MTL::Size((N + keys_per_tg - 1) / keys_per_tg, B, 1);
@@ -326,12 +350,18 @@ class DSAIndexerDecodeScoresPrimitive : public Primitive {
 
   DEFINE_NAME(OMLXDSAIndexerDecodeScores)
   DEFINE_INPUT_OUTPUT_SHAPE()
-  bool is_equivalent(const Primitive& /* other */) const override {
-    return true;
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const DSAIndexerDecodeScoresPrimitive&>(other);
+    return fp32_output_ == rhs.fp32_output_ && scale_ == rhs.scale_;
   }
   auto state() const {
-    return std::make_tuple();
+    return std::make_tuple(fp32_output_, scale_);
   }
+
+ private:
+  bool fp32_output_;
+  float scale_;
 };
 
 class DSATopKIndicesPrimitive : public Primitive {
@@ -340,17 +370,25 @@ class DSATopKIndicesPrimitive : public Primitive {
       Stream stream,
       int topk,
       bool bucketed,
-      bool causal_valid_prefix)
+      bool causal_valid_prefix,
+      bool fp32_scores)
       : Primitive(stream),
         topk_(topk),
         bucketed_(bucketed),
-        causal_valid_prefix_(causal_valid_prefix) {}
+        causal_valid_prefix_(causal_valid_prefix),
+        fp32_scores_(fp32_scores) {}
 
-  static bool unsupported(const array& scores, int topk, Stream s) {
+  static bool unsupported(
+      const array& scores,
+      int topk,
+      bool fp32_scores,
+      Stream s) {
     if (s.device == Device::cpu) {
       return true;
     }
-    if (scores.dtype() != float16 && scores.dtype() != bfloat16) {
+    if (fp32_scores ? scores.dtype() != float32
+                    : (scores.dtype() != float16 &&
+                       scores.dtype() != bfloat16)) {
       return true;
     }
     if (!row_contiguous(scores)) {
@@ -389,14 +427,23 @@ class DSATopKIndicesPrimitive : public Primitive {
     const int rows = B * L;
 
     std::string base_name;
-    concatenate(
-        base_name,
-        "steel_dsa_topk_indices_",
-        type_to_name(scores),
-        "_topk",
-        topk_,
-        "_t",
-        threads);
+    if (fp32_scores_) {
+      concatenate(
+          base_name,
+          "steel_dsa_topk_indices_fp32_topk",
+          topk_,
+          "_t",
+          threads);
+    } else {
+      concatenate(
+          base_name,
+          "steel_dsa_topk_indices_",
+          type_to_name(scores),
+          "_topk",
+          topk_,
+          "_t",
+          threads);
+    }
 
     bool bucketed = bucketed_;
     metal::MTLFCList func_consts = {
@@ -436,16 +483,19 @@ class DSATopKIndicesPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const DSATopKIndicesPrimitive&>(other);
     return topk_ == rhs.topk_ && bucketed_ == rhs.bucketed_ &&
-        causal_valid_prefix_ == rhs.causal_valid_prefix_;
+        causal_valid_prefix_ == rhs.causal_valid_prefix_ &&
+        fp32_scores_ == rhs.fp32_scores_;
   }
   auto state() const {
-    return std::make_tuple(topk_, bucketed_, causal_valid_prefix_);
+    return std::make_tuple(
+        topk_, bucketed_, causal_valid_prefix_, fp32_scores_);
   }
 
  private:
   int topk_;
   bool bucketed_;
   bool causal_valid_prefix_;
+  bool fp32_scores_;
 };
 
 array dsa_topk_indices_impl(
@@ -453,6 +503,7 @@ array dsa_topk_indices_impl(
     int topk,
     bool bucketed,
     bool causal_valid_prefix,
+    bool fp32_scores,
     StreamOrDevice s) {
   if (scores.ndim() != 4 || scores.shape(1) != 1) {
     std::ostringstream msg;
@@ -470,7 +521,8 @@ array dsa_topk_indices_impl(
   auto stream = to_stream(s);
   auto scores_contiguous = ensure_row_contiguous(scores, stream);
   std::vector<array> inputs = {scores_contiguous};
-  if (DSATopKIndicesPrimitive::unsupported(scores_contiguous, topk, stream)) {
+  if (DSATopKIndicesPrimitive::unsupported(
+          scores_contiguous, topk, fp32_scores, stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_topk_indices] unsupported M3 GLM shape.");
   }
@@ -481,7 +533,7 @@ array dsa_topk_indices_impl(
       std::move(out_shape),
       uint32,
       std::make_shared<DSATopKIndicesPrimitive>(
-          stream, topk, bucketed, causal_valid_prefix),
+          stream, topk, bucketed, causal_valid_prefix, fp32_scores),
       std::move(inputs));
 }
 
@@ -555,7 +607,7 @@ array dsa_indexer_scores(
   auto w = ensure_row_contiguous(astype(weights, final_type, stream), stream);
 
   std::vector<array> inputs = {q, k, w};
-  if (DSAIndexerScoresPrimitive::unsupported(q, k, w, stream)) {
+  if (DSAIndexerScoresPrimitive::unsupported(q, k, w, false, stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_indexer_scores] unsupported M3 GLM shape.");
   }
@@ -570,7 +622,102 @@ array dsa_indexer_scores(
           weights_lh,
           unused_causal_prefix_topk,
           skip_causal_future_store,
-          causal_q_offset),
+          causal_q_offset,
+          false,
+          1.0f),
+      std::move(inputs));
+}
+
+array dsa_indexer_scores_fp32(
+    const array& queries,
+    const array& keys,
+    const array& weights,
+    float scale,
+    bool causal,
+    int unused_causal_prefix_topk,
+    bool skip_causal_future_store,
+    int causal_q_offset,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4 ||
+      (weights.ndim() != 3 && weights.ndim() != 4)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_fp32] expected q/k rank 4 "
+        << "and weights rank 3 or 4, got " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys.shape(1) != 1) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_fp32] keys must have a "
+        "singleton indexer head axis.");
+  }
+  const bool weights_lh = weights.ndim() == 3;
+  bool weights_match = false;
+  if (weights_lh) {
+    weights_match = weights.shape(1) == queries.shape(2) &&
+        weights.shape(2) == queries.shape(1);
+  } else {
+    weights_match = weights.shape(1) == queries.shape(1) &&
+        weights.shape(2) == queries.shape(2) && weights.shape(3) == 1;
+  }
+  if (queries.shape(0) != keys.shape(0) ||
+      queries.shape(0) != weights.shape(0) || !weights_match ||
+      queries.shape(3) != keys.shape(3)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_fp32] incompatible q, k, "
+        << "weights shapes: " << queries.shape() << ", " << keys.shape()
+        << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.dtype() != keys.dtype() ||
+      (queries.dtype() != float16 && queries.dtype() != bfloat16) ||
+      weights.dtype() != float32) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_fp32] expected matching "
+        << "float16/bfloat16 q/k and float32 weights, got "
+        << queries.dtype() << ", " << keys.dtype() << ", " << weights.dtype()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (unused_causal_prefix_topk < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_fp32] "
+        << "unused_causal_prefix_topk must be non-negative, got "
+        << unused_causal_prefix_topk << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (causal_q_offset < -1) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_fp32] causal_q_offset must "
+        << "be -1 or non-negative, got " << causal_q_offset << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(queries, stream);
+  auto k = ensure_row_contiguous(keys, stream);
+  auto w = ensure_row_contiguous(weights, stream);
+
+  std::vector<array> inputs = {q, k, w};
+  if (DSAIndexerScoresPrimitive::unsupported(q, k, w, true, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_fp32] unsupported M3 GLM "
+        "shape.");
+  }
+
+  Shape out_shape{q.shape(0), 1, q.shape(2), k.shape(2)};
+  return array(
+      std::move(out_shape),
+      float32,
+      std::make_shared<DSAIndexerScoresPrimitive>(
+          stream,
+          causal,
+          weights_lh,
+          unused_causal_prefix_topk,
+          skip_causal_future_store,
+          causal_q_offset,
+          true,
+          scale),
       std::move(inputs));
 }
 
@@ -612,7 +759,8 @@ array dsa_indexer_scores_decode(
   auto w = ensure_row_contiguous(astype(weights, final_type, stream), stream);
 
   std::vector<array> inputs = {q, k, w};
-  if (DSAIndexerDecodeScoresPrimitive::unsupported(q, k, w, stream)) {
+  if (DSAIndexerDecodeScoresPrimitive::unsupported(
+          q, k, w, false, stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_indexer_scores_decode] unsupported M3 GLM shape.");
   }
@@ -621,7 +769,63 @@ array dsa_indexer_scores_decode(
   return array(
       std::move(out_shape),
       final_type,
-      std::make_shared<DSAIndexerDecodeScoresPrimitive>(stream),
+      std::make_shared<DSAIndexerDecodeScoresPrimitive>(stream, false, 1.0f),
+      std::move(inputs));
+}
+
+array dsa_indexer_scores_decode_fp32(
+    const array& queries,
+    const array& keys,
+    const array& weights,
+    float scale,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4 || weights.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_decode_fp32] expected q/k "
+        << "rank 4 and weights rank 3, got " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.shape(0) != keys.shape(0) ||
+      queries.shape(0) != weights.shape(0) || queries.shape(1) != 32 ||
+      queries.shape(2) != 1 || queries.shape(3) != 128 ||
+      keys.shape(1) != 1 || keys.shape(3) != 128 ||
+      weights.shape(1) != 1 || weights.shape(2) != 32) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_decode_fp32] incompatible "
+        << "q, k, weights shapes: " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.dtype() != keys.dtype() ||
+      (queries.dtype() != float16 && queries.dtype() != bfloat16) ||
+      weights.dtype() != float32) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_decode_fp32] expected "
+        << "matching float16/bfloat16 q/k and float32 weights, got "
+        << queries.dtype() << ", " << keys.dtype() << ", " << weights.dtype()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(queries, stream);
+  auto k = ensure_row_contiguous(keys, stream);
+  auto w = ensure_row_contiguous(weights, stream);
+
+  std::vector<array> inputs = {q, k, w};
+  if (DSAIndexerDecodeScoresPrimitive::unsupported(
+          q, k, w, true, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_decode_fp32] unsupported M3 "
+        "GLM shape.");
+  }
+
+  Shape out_shape{q.shape(0), 1, 1, k.shape(2)};
+  return array(
+      std::move(out_shape),
+      float32,
+      std::make_shared<DSAIndexerDecodeScoresPrimitive>(stream, true, scale),
       std::move(inputs));
 }
 
@@ -631,7 +835,18 @@ array dsa_topk_indices(
     bool bucketed,
     bool causal_valid_prefix,
     StreamOrDevice s) {
-  return dsa_topk_indices_impl(scores, topk, bucketed, causal_valid_prefix, s);
+  return dsa_topk_indices_impl(
+      scores, topk, bucketed, causal_valid_prefix, false, s);
+}
+
+array dsa_topk_indices_fp32(
+    const array& scores,
+    int topk,
+    bool bucketed,
+    bool causal_valid_prefix,
+    StreamOrDevice s) {
+  return dsa_topk_indices_impl(
+      scores, topk, bucketed, causal_valid_prefix, true, s);
 }
 
 } // namespace omlx::glm_kernels

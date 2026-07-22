@@ -11,6 +11,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    BatchGlmMlaKVCache,
     BatchQuantizedGlmMlaKVCache,
     CacheList,
     GlmMlaKVCache,
@@ -678,6 +679,7 @@ class TestModels(unittest.TestCase):
                 kv_latent=(),
                 k_pe=mx.zeros((1, 1, 2048, 64), dtype=mx.float16),
                 topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+                mask_is_causal=True,
             )
 
             self.assertFalse(ready)
@@ -777,6 +779,7 @@ class TestModels(unittest.TestCase):
                     ),
                     k_pe=mx.zeros((1, 1, 2049, 64), dtype=mx.float16),
                     topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+                    mask_is_causal=True,
                 )
             )
 
@@ -828,10 +831,28 @@ class TestModels(unittest.TestCase):
                 kv_latent=mx.zeros((1, 1, 2049, 512), dtype=mx.float16),
                 k_pe=mx.zeros((1, 1, 2049, 64), dtype=mx.float16),
                 topk_indices=mx.zeros((1, 1, 2, 2048), dtype=mx.uint32),
+                mask_is_causal=True,
             )
 
             self.assertTrue(ready)
             self.assertEqual(reason, "native_sparse_mla")
+
+            custom_ready, custom_reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
+                    fake_attention,
+                    B=1,
+                    L=2,
+                    kv_cache=GlmMlaKVCache(),
+                    kv_latent=mx.zeros((1, 1, 2049, 512), dtype=mx.float16),
+                    k_pe=mx.zeros((1, 1, 2049, 64), dtype=mx.float16),
+                    topk_indices=mx.zeros(
+                        (1, 1, 2, 2048), dtype=mx.uint32
+                    ),
+                    mask=mx.zeros((2, 2049), dtype=mx.float32),
+                )
+            )
+            self.assertFalse(custom_ready)
+            self.assertEqual(custom_reason, "custom_mask")
 
             prefix_ready, prefix_reason = (
                 glm_moe_dsa.GlmMoeDsaAttention._native_sparse_prefill_decision(
@@ -844,6 +865,7 @@ class TestModels(unittest.TestCase):
                     topk_indices=mx.zeros(
                         (1, 1, 2, 2048), dtype=mx.uint32
                     ),
+                    mask_is_causal=True,
                 )
             )
             self.assertTrue(prefix_ready)
@@ -882,17 +904,13 @@ class TestModels(unittest.TestCase):
                 x=mx.zeros((1, 64, 4096), dtype=mx.float16),
                 k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
                 mask=mx.ones((64, 4096), dtype=mx.bool_),
+                mask_is_causal=True,
             )
 
             self.assertTrue(ready)
             self.assertEqual(reason, "native_indexer")
 
-            fake_attention.indexer.weights_proj = type(
-                "FakeProjection",
-                (),
-                {"weight": mx.zeros((32, 4096), dtype=mx.float32)},
-            )()
-            strict_ready, strict_reason = (
+            custom_ready, custom_reason = (
                 glm_moe_dsa.GlmMoeDsaAttention._native_indexer_decision(
                     fake_attention,
                     q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
@@ -901,8 +919,26 @@ class TestModels(unittest.TestCase):
                     mask=mx.ones((64, 4096), dtype=mx.bool_),
                 )
             )
-            self.assertFalse(strict_ready)
-            self.assertEqual(strict_reason, "fp32_indexer_weights")
+            self.assertFalse(custom_ready)
+            self.assertEqual(custom_reason, "custom_mask")
+
+            fake_attention.indexer.weights_proj = type(
+                "FakeProjection",
+                (),
+                {"weight": mx.zeros((32, 4096), dtype=mx.float32)},
+            )()
+            fp32_ready, fp32_reason = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_indexer_decision(
+                    fake_attention,
+                    q=mx.zeros((1, 32, 64, 128), dtype=mx.float16),
+                    x=mx.zeros((1, 64, 4096), dtype=mx.float16),
+                    k=mx.zeros((1, 1, 4096, 128), dtype=mx.float16),
+                    mask=mx.ones((64, 4096), dtype=mx.bool_),
+                    mask_is_causal=True,
+                )
+            )
+            self.assertTrue(fp32_ready)
+            self.assertEqual(fp32_reason, "native_indexer")
         finally:
             glm_moe_dsa._native_indexer_available = old_available
             self._restore_env(saved_env)
@@ -939,6 +975,229 @@ class TestModels(unittest.TestCase):
         finally:
             glm_moe_dsa._native_indexer_available = old_available
             self._restore_env(saved_env)
+
+    def test_glm_moe_dsa_native_fp32_indexer_chunks_preserve_causal_offsets(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        class FakeIndexer:
+            index_topk = 2048
+            softmax_scale = 128**-0.5
+
+        class FakeAttention:
+            indexer = FakeIndexer()
+
+            @staticmethod
+            def _native_indexer_decision(*args, **kwargs):
+                return True, "native_indexer"
+
+            @staticmethod
+            def _indexer_head_weights(x):
+                return mx.ones((x.shape[0], x.shape[1], 32), dtype=mx.float32)
+
+        q = mx.zeros((1, 32, 128, 128), dtype=mx.float16)
+        x = mx.zeros((1, 128, 64), dtype=mx.float16)
+        k = mx.zeros((1, 1, 4096, 128), dtype=mx.float16)
+        mask = mx.ones((128, 4096), dtype=mx.bool_)
+        score_calls = []
+        topk_calls = []
+
+        def fake_scores(q_chunk, _k, weights, **kwargs):
+            score_calls.append(
+                {
+                    "query_length": q_chunk.shape[2],
+                    "weight_dtype": weights.dtype,
+                    **kwargs,
+                }
+            )
+            return mx.zeros(
+                (q_chunk.shape[0], 1, q_chunk.shape[2], _k.shape[2]),
+                dtype=mx.float32,
+            )
+
+        def fake_topk(scores, topk, **kwargs):
+            topk_calls.append({"score_dtype": scores.dtype, **kwargs})
+            return mx.zeros(
+                (scores.shape[0], 1, scores.shape[2], topk), dtype=mx.uint32
+            )
+
+        env_key = glm_moe_dsa.GLM_DSA_NATIVE_INDEXER_MAX_SCORE_BYTES_ENV
+        saved_env = {env_key: os.environ.get(env_key)}
+        old_scores = glm_moe_dsa._native_indexer_scores
+        old_topk = glm_moe_dsa._native_indexer_topk_indices
+        try:
+            os.environ[env_key] = str(4 * 4096 * 64)
+            glm_moe_dsa._native_indexer_scores = fake_scores
+            glm_moe_dsa._native_indexer_topk_indices = fake_topk
+            indices = glm_moe_dsa.GlmMoeDsaAttention._native_indexer_topk(
+                FakeAttention(),
+                q,
+                x,
+                k,
+                mask,
+                mask_is_causal=True,
+            )
+            os.environ[env_key] = str(4 * 4096 * 64 - 1)
+            memory_limited = (
+                glm_moe_dsa.GlmMoeDsaAttention._native_indexer_topk(
+                    FakeAttention(),
+                    q,
+                    x,
+                    k,
+                    mask,
+                    mask_is_causal=True,
+                )
+            )
+        finally:
+            glm_moe_dsa._native_indexer_scores = old_scores
+            glm_moe_dsa._native_indexer_topk_indices = old_topk
+            self._restore_env(saved_env)
+
+        self.assertEqual(indices.shape, (1, 1, 128, 2048))
+        self.assertIsNone(memory_limited)
+        self.assertEqual([call["query_length"] for call in score_calls], [64, 64])
+        self.assertEqual(
+            [call["causal_q_offset"] for call in score_calls], [3968, 4032]
+        )
+        self.assertTrue(all(call["weight_dtype"] == mx.float32 for call in score_calls))
+        self.assertTrue(
+            all(call["scale"] == FakeIndexer.softmax_scale for call in score_calls)
+        )
+        self.assertTrue(
+            all(not call["skip_causal_future_store"] for call in score_calls)
+        )
+        self.assertTrue(all(call["score_dtype"] == mx.float32 for call in topk_calls))
+        self.assertTrue(
+            all(not call["causal_valid_prefix"] for call in topk_calls)
+        )
+
+    def test_glm_moe_dsa_native_fp32_indexer_matches_reference(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        status = glm_moe_dsa.get_glm_dsa_native_indexer_status()
+        if not status["available"]:
+            self.skipTest("native FP32 Indexer extension is unavailable")
+
+        B, H, L, K, D = 1, 32, 3, 4097, 128
+        scale = D**-0.5
+        mx.random.seed(71)
+        q = (mx.random.normal((B, H, L, D)) * 0.05).astype(mx.float16)
+        k = (mx.random.normal((B, 1, K, D)) * 0.05).astype(mx.float16)
+        weights = mx.random.normal((B, L, H)).astype(mx.float32) * 0.05
+        scores = glm_moe_dsa._native_indexer_scores(
+            q,
+            k,
+            weights,
+            scale=scale,
+            causal=True,
+            skip_causal_future_store=False,
+            causal_q_offset=K - L,
+        )
+        self.assertIsNotNone(scores)
+        self.assertEqual(scores.dtype, mx.float32)
+        self.assertEqual(scores.shape, (B, 1, L, K))
+
+        reference = (
+            q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)
+        ) * scale
+        reference = mx.maximum(reference, 0)
+        reference = (
+            reference * weights.swapaxes(-1, -2)[..., None]
+        ).sum(axis=1, keepdims=True)
+        q_positions = mx.arange(K - L, K).reshape(1, 1, L, 1)
+        k_positions = mx.arange(K).reshape(1, 1, 1, K)
+        causal_mask = k_positions <= q_positions
+        reference = mx.where(causal_mask, reference, -float("inf"))
+
+        indices = glm_moe_dsa._native_indexer_topk_indices(
+            scores,
+            2048,
+            bucketed=True,
+            causal_valid_prefix=True,
+        )
+        expected_indices = mx.argpartition(scores, kth=-2048, axis=-1)[
+            ..., -2048:
+        ]
+        valid_diff = mx.where(
+            causal_mask,
+            mx.abs(scores - reference),
+            mx.zeros_like(scores),
+        )
+        mx.eval(scores, reference, indices, expected_indices, valid_diff)
+        self.assertLess(float(mx.max(valid_diff).item()), 2e-4)
+        self.assertTrue(
+            mx.array_equal(
+                mx.sort(indices, axis=-1),
+                mx.sort(expected_indices, axis=-1),
+            ).item()
+        )
+
+    def test_glm_moe_dsa_native_fp32_decode_and_close_topk(self):
+        from mlx_lm.custom_kernels.glm_moe_dsa import fast
+        from mlx_lm.models import glm_moe_dsa
+
+        required = (
+            "dsa_indexer_scores_fp32",
+            "dsa_indexer_scores_decode_fp32",
+            "dsa_topk_indices_fp32",
+        )
+        if fast.missing_symbols(required):
+            self.skipTest("native FP32 Indexer extension is unavailable")
+
+        B, H, K, D = 1, 32, 4099, 128
+        scale = D**-0.5
+        mx.random.seed(72)
+        q = (mx.random.normal((B, H, 1, D)) * 0.05).astype(mx.bfloat16)
+        k = (mx.random.normal((B, 1, K, D)) * 0.05).astype(mx.bfloat16)
+        weights = mx.random.normal((B, 1, H)).astype(mx.float32) * 0.05
+        scores = glm_moe_dsa._native_indexer_scores(
+            q,
+            k,
+            weights,
+            scale=scale,
+            causal=False,
+        )
+        reference = (
+            q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)
+        ) * scale
+        reference = mx.maximum(reference, 0)
+        reference = (
+            reference * weights.swapaxes(-1, -2)[..., None]
+        ).sum(axis=1, keepdims=True)
+
+        close = mx.arange(4096, dtype=mx.float32) * 1e-8
+        close_scores = mx.stack([close, -close], axis=0).reshape(1, 1, 2, 4096)
+        close_indices = fast.dsa_topk_indices_fp32(
+            close_scores, 2048, bucketed=True, stream=mx.gpu
+        )
+        expected_close = mx.argpartition(
+            close_scores, kth=-2048, axis=-1
+        )[..., -2048:]
+        prefix_indices = fast.dsa_topk_indices_fp32(
+            mx.zeros((1, 1, 3, 2048), dtype=mx.float32),
+            2048,
+            causal_valid_prefix=True,
+            stream=mx.gpu,
+        )
+        mx.eval(scores, reference, close_indices, expected_close, prefix_indices)
+
+        self.assertEqual(scores.dtype, mx.float32)
+        self.assertLess(float(mx.max(mx.abs(scores - reference)).item()), 2e-4)
+        self.assertTrue(
+            mx.array_equal(
+                mx.sort(close_indices, axis=-1),
+                mx.sort(expected_close, axis=-1),
+            ).item()
+        )
+        for row, valid_length in enumerate((2046, 2047, 2048)):
+            expected_prefix = mx.concatenate(
+                [
+                    mx.arange(valid_length, dtype=mx.uint32),
+                    mx.zeros(2048 - valid_length, dtype=mx.uint32),
+                ]
+            )
+            self.assertTrue(
+                mx.array_equal(prefix_indices[0, 0, row], expected_prefix).item()
+            )
 
     def test_glm_moe_dsa_native_q4_vup_projection_matches_fallback(self):
         from mlx_lm.models import glm_moe_dsa
@@ -2230,6 +2489,35 @@ class TestModels(unittest.TestCase):
             model.quant_predicate(f"{prefix}.indexer.weights_proj", None)
         )
 
+    def test_glm_moe_dsa_custom_quantization_preserves_indexer_weights_proj(self):
+        from mlx_lm.utils import quantize_model
+
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="F", num_hidden_layers=1
+        )
+
+        def custom_predicate(_path, _module):
+            return {"group_size": 64, "bits": 2, "mode": "affine"}
+
+        model, config = quantize_model(
+            model,
+            {},
+            group_size=64,
+            bits=4,
+            quant_predicate=custom_predicate,
+        )
+
+        indexer = model.model.layers[0].self_attn.indexer
+        protected_path = "model.layers.0.self_attn.indexer.weights_proj"
+        allowed_path = "model.layers.0.self_attn.indexer.wk"
+        self.assertIsInstance(indexer.weights_proj, nn.Linear)
+        self.assertNotIsInstance(indexer.weights_proj, nn.QuantizedLinear)
+        self.assertEqual(indexer.weights_proj.weight.dtype, mx.float32)
+        self.assertIsInstance(indexer.wk, nn.QuantizedLinear)
+        self.assertEqual(indexer.wk.bits, 2)
+        self.assertNotIn(protected_path, config["quantization"])
+        self.assertEqual(config["quantization"][allowed_path]["bits"], 2)
+
     def test_glm_moe_dsa_sanitize_converts_raw_mtp_layer(self):
         from mlx_lm.models import glm_moe_dsa
 
@@ -2465,10 +2753,17 @@ class TestModels(unittest.TestCase):
             cache=mtp_cache,
             prev_topk_indices=topk_indices,
         )
+        model.mtp_logits(
+            mx.array([[7]]),
+            hidden,
+            cache=mtp_cache,
+            mask=mx.ones((1, 7), dtype=mx.bool_),
+            prev_topk_indices=topk_indices,
+        )
         mx.eval([cache.state for cache in mtp_cache])
 
-        self.assertEqual(indexer_calls, 1)
-        self.assertEqual(mtp_cache[1].offset, 6)
+        self.assertEqual(indexer_calls, 2)
+        self.assertEqual(mtp_cache[1].offset, 7)
 
     def test_glm_moe_dsa_forward_with_hidden_matches_logits(self):
         model = self._make_glm_moe_dsa_model()
@@ -3437,12 +3732,206 @@ class TestModels(unittest.TestCase):
             os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_KEY_BLOCK_ENV] = "4"
             dense = attention._dense_indexer_topk(q, hidden, k, mask)
             block = attention._block_indexer_topk(q, hidden, k, mask)
-            mx.eval(dense, block)
+            additive_mask = mx.where(
+                mask,
+                mx.linspace(-0.25, 0.25, total_length, dtype=mx.float32),
+                mx.array(-float("inf"), dtype=mx.float32),
+            )
+            dense_additive = attention._dense_indexer_topk(
+                q, hidden, k, additive_mask
+            )
+            block_additive = attention._block_indexer_topk(
+                q, hidden, k, additive_mask
+            )
+            mx.eval(dense, block, dense_additive, block_additive)
         finally:
             self._restore_env(saved_env)
 
         self.assertTrue(
             mx.array_equal(mx.sort(dense, axis=-1), mx.sort(block, axis=-1))
+        )
+        self.assertTrue(
+            mx.array_equal(
+                mx.sort(dense_additive, axis=-1),
+                mx.sort(block_additive, axis=-1),
+            )
+        )
+
+    def test_glm_moe_dsa_custom_boolean_and_additive_masks_match(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="F", num_hidden_layers=1
+        )
+        model.set_dtype(mx.float16)
+        attention = model.model.layers[0].self_attn
+        length = model.args.index_topk + 3
+        x = mx.random.normal((1, length, model.args.hidden_size)).astype(mx.float16)
+        query_positions = mx.arange(length)[:, None]
+        key_positions = mx.arange(length)[None, :]
+        boolean_mask = (query_positions >= key_positions) & (key_positions != 1)
+        additive_mask = mx.where(
+            boolean_mask,
+            mx.array(0.0, dtype=mx.float32),
+            mx.array(-float("inf"), dtype=mx.float32),
+        )
+
+        bool_output, bool_topk = attention(
+            x,
+            boolean_mask,
+            [GlmMlaKVCache(), KVCache()],
+        )
+        additive_output, additive_topk = attention(
+            x,
+            additive_mask,
+            [GlmMlaKVCache(), KVCache()],
+        )
+        causal_output, causal_topk = attention(
+            x,
+            "causal",
+            [GlmMlaKVCache(), KVCache()],
+            mask_is_causal=True,
+        )
+        causal_array_output, causal_array_topk = attention(
+            x,
+            query_positions >= key_positions,
+            [GlmMlaKVCache(), KVCache()],
+            mask_is_causal=True,
+        )
+        mx.eval(
+            bool_output,
+            bool_topk,
+            additive_output,
+            additive_topk,
+            causal_output,
+            causal_topk,
+            causal_array_output,
+            causal_array_topk,
+        )
+
+        self.assertTrue(
+            mx.allclose(bool_output, additive_output, rtol=1e-3, atol=1e-3)
+        )
+        self.assertTrue(
+            mx.array_equal(
+                mx.sort(bool_topk, axis=-1), mx.sort(additive_topk, axis=-1)
+            )
+        )
+        self.assertTrue(
+            mx.allclose(causal_output, causal_array_output, rtol=1e-3, atol=1e-3)
+        )
+        self.assertTrue(
+            mx.array_equal(
+                mx.sort(causal_topk, axis=-1),
+                mx.sort(causal_array_topk, axis=-1),
+            )
+        )
+
+        selected = mx.array([[[[0, 2], [1, 3]]]], dtype=mx.uint32)
+        custom_bias = mx.array(
+            [[0.0, -0.5, -1.0, -1.5], [-2.0, -2.5, -3.0, -3.5]],
+            dtype=mx.float32,
+        )
+        sparse_bias = attention._dense_sparse_mask(custom_bias, selected, 4)
+        expected_bias = mx.array(
+            [[[[0.0, -float("inf"), -1.0, -float("inf")],
+               [-float("inf"), -2.5, -float("inf"), -3.5]]]],
+            dtype=mx.float32,
+        )
+        self.assertTrue(mx.array_equal(sparse_bias, expected_bias).item())
+        self.assertTrue(glm_moe_dsa._has_canonical_causal_cache(None))
+        self.assertTrue(
+            glm_moe_dsa._has_canonical_causal_cache(GlmMlaKVCache())
+        )
+        self.assertFalse(
+            glm_moe_dsa._has_canonical_causal_cache(BatchGlmMlaKVCache([1]))
+        )
+        with self.assertRaisesRegex(ValueError, "rank 2 or 4"):
+            glm_moe_dsa._validate_attention_mask(
+                mx.ones((1, 2, 4), dtype=mx.bool_),
+                batch_size=1,
+                num_heads=model.args.num_attention_heads,
+                query_length=2,
+                key_length=4,
+            )
+        with self.assertRaisesRegex(ValueError, "boolean or floating point"):
+            glm_moe_dsa._validate_attention_mask(
+                mx.ones((2, 4), dtype=mx.int32),
+                batch_size=1,
+                num_heads=model.args.num_attention_heads,
+                query_length=2,
+                key_length=4,
+            )
+
+        masked_x = x[:, :2]
+        fully_masked = mx.zeros((2, 2), dtype=mx.bool_)
+        fully_masked_additive = mx.full(
+            (2, 2), -float("inf"), dtype=mx.float32
+        )
+        bool_zero, _ = attention(
+            masked_x, fully_masked, [GlmMlaKVCache(), KVCache()]
+        )
+        additive_zero, _ = attention(
+            masked_x, fully_masked_additive, [GlmMlaKVCache(), KVCache()]
+        )
+        mx.eval(bool_zero, additive_zero)
+        self.assertTrue(mx.array_equal(bool_zero, mx.zeros_like(bool_zero)).item())
+        self.assertTrue(
+            mx.array_equal(additive_zero, mx.zeros_like(additive_zero)).item()
+        )
+
+    def test_glm_moe_dsa_fast_sparse_prefill_preserves_custom_mask(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        model = self._make_glm_moe_dsa_model(
+            index_topk_pattern="F", num_hidden_layers=1
+        )
+        model.set_dtype(mx.float16)
+        attention = model.model.layers[0].self_attn
+        prefix = mx.random.normal((1, 5, model.args.hidden_size)).astype(mx.float16)
+        query = mx.random.normal((1, 2, model.args.hidden_size)).astype(mx.float16)
+        prefix_positions = mx.arange(5)
+        prefix_mask = prefix_positions[:, None] >= prefix_positions[None, :]
+        query_positions = mx.arange(5, 7)[:, None]
+        key_positions = mx.arange(7)[None, :]
+        custom_mask = (query_positions >= key_positions) & (key_positions != 0)
+
+        env_keys = [
+            glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV,
+            glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV,
+        ]
+        saved_env = {key: os.environ.get(key) for key in env_keys}
+
+        def run(fast_prefill: bool):
+            os.environ[glm_moe_dsa.GLM_DSA_FAST_PREFILL_ENV] = (
+                "1" if fast_prefill else "0"
+            )
+            os.environ[glm_moe_dsa.GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT_ENV] = "0"
+            cache = [GlmMlaKVCache(), KVCache()]
+            prefix_output, _ = attention(
+                prefix,
+                prefix_mask,
+                cache,
+                mask_is_causal=True,
+            )
+            mx.eval(prefix_output, [entry.state for entry in cache])
+            output, topk = attention(query, custom_mask, cache)
+            mx.eval(output, topk)
+            return output, topk
+
+        try:
+            fast_output, fast_topk = run(True)
+            dense_output, dense_topk = run(False)
+        finally:
+            self._restore_env(saved_env)
+
+        self.assertTrue(
+            mx.allclose(fast_output, dense_output, rtol=1e-3, atol=1e-3)
+        )
+        self.assertTrue(
+            mx.array_equal(
+                mx.sort(fast_topk, axis=-1), mx.sort(dense_topk, axis=-1)
+            )
         )
 
     def test_glm_moe_dsa_mla_int8_kv_cache(self):

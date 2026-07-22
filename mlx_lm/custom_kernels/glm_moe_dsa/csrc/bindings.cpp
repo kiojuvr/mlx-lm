@@ -26,6 +26,18 @@ NB_MODULE(_ext, m) {
       "causal_q_offset"_a = -1,
       "stream"_a = nb::none());
   m.def(
+      "dsa_indexer_scores_fp32",
+      &omlx::glm_kernels::dsa_indexer_scores_fp32,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "scale"_a,
+      "causal"_a = true,
+      "unused_causal_prefix_topk"_a = 0,
+      "skip_causal_future_store"_a = false,
+      "causal_q_offset"_a = -1,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_indexer_scores_decode",
       &omlx::glm_kernels::dsa_indexer_scores_decode,
       "queries"_a,
@@ -33,8 +45,24 @@ NB_MODULE(_ext, m) {
       "weights"_a,
       "stream"_a = nb::none());
   m.def(
+      "dsa_indexer_scores_decode_fp32",
+      &omlx::glm_kernels::dsa_indexer_scores_decode_fp32,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "scale"_a,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
+      "scores"_a,
+      "topk"_a,
+      "bucketed"_a = false,
+      "causal_valid_prefix"_a = false,
+      "stream"_a = nb::none());
+  m.def(
+      "dsa_topk_indices_fp32",
+      &omlx::glm_kernels::dsa_topk_indices_fp32,
       "scores"_a,
       "topk"_a,
       "bucketed"_a = false,

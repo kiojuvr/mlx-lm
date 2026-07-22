@@ -1133,8 +1133,10 @@ def _native_q8_vup_reference(x, q_weight, scales, biases):
     return reference.transpose(0, 2, 1, 3).reshape(B, L, H * V)
 
 
-def _native_indexer_smoke_reference(q, k, weights, *, causal=True):
-    scores = q @ k.swapaxes(-1, -2)
+def _native_indexer_smoke_reference(q, k, weights, scale, *, causal=True):
+    scores = (
+        q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)
+    ) * scale
     scores = mx.maximum(scores, 0)
     scores = scores * weights.swapaxes(-1, -2)[..., None]
     scores = scores.sum(axis=1, keepdims=True)
@@ -1159,21 +1161,25 @@ def _run_native_indexer_smoke(row, args, status):
         K = max(4096, args.native_smoke_k_len)
         D = 128
         topk = 2048
+        scale = D**-0.5
         mx.random.seed(args.native_smoke_seed + 3)
         q = mx.random.normal((B, H, L, D), dtype=mx.float16) * 0.02
         k = mx.random.normal((B, 1, K, D), dtype=mx.float16) * 0.02
-        weights = mx.random.normal((B, L, H), dtype=mx.float16) * 0.02
+        weights = mx.random.normal((B, L, H), dtype=mx.float32) * 0.02
         scores = glm_moe_dsa._native_indexer_scores(
             q,
             k,
             weights,
+            scale=scale,
             causal=True,
             skip_causal_future_store=False,
             causal_q_offset=K - L,
         )
         if scores is None:
             raise RuntimeError("native DSA indexer score kernel unavailable")
-        reference = _native_indexer_smoke_reference(q, k, weights, causal=True)
+        reference = _native_indexer_smoke_reference(
+            q, k, weights, scale, causal=True
+        )
         q_positions = mx.arange(L).reshape(1, 1, L, 1)
         k_positions = mx.arange(K).reshape(1, 1, 1, K)
         causal_mask = k_positions <= (K - L + q_positions)
@@ -1219,8 +1225,61 @@ def _run_native_indexer_smoke(row, args, status):
                 ),
             }
         )
+        if args.native_smoke_benchmark_runs > 0:
+            native_timings = benchmark_mx_callable(
+                lambda: glm_moe_dsa._native_indexer_topk_indices(
+                    glm_moe_dsa._native_indexer_scores(
+                        q,
+                        k,
+                        weights,
+                        scale=scale,
+                        causal=True,
+                        skip_causal_future_store=False,
+                        causal_q_offset=K - L,
+                    ),
+                    topk,
+                    bucketed=True,
+                    causal_valid_prefix=True,
+                ),
+                args.native_smoke_benchmark_runs,
+                args.native_smoke_benchmark_warmup_runs,
+            )
+            reference_timings = benchmark_mx_callable(
+                lambda: mx.argpartition(
+                    _native_indexer_smoke_reference(
+                        q, k, weights, scale, causal=True
+                    ),
+                    kth=-topk,
+                    axis=-1,
+                )[..., -topk:],
+                args.native_smoke_benchmark_runs,
+                args.native_smoke_benchmark_warmup_runs,
+            )
+            native_mean = native_timings["mean"]
+            reference_mean = reference_timings["mean"]
+            row.update(
+                {
+                    "native_indexer_smoke_native_seconds_mean": native_mean,
+                    "native_indexer_smoke_native_seconds_min": native_timings["min"],
+                    "native_indexer_smoke_native_seconds_p50": native_timings["p50"],
+                    "native_indexer_smoke_reference_seconds_mean": reference_mean,
+                    "native_indexer_smoke_reference_seconds_min": (
+                        reference_timings["min"]
+                    ),
+                    "native_indexer_smoke_reference_seconds_p50": (
+                        reference_timings["p50"]
+                    ),
+                    "native_indexer_smoke_speedup_mean": (
+                        reference_mean / native_mean if native_mean > 0 else None
+                    ),
+                    "native_indexer_smoke_benchmark_error": None,
+                }
+            )
     except Exception as exc:
-        row["native_indexer_smoke_error"] = repr(exc)
+        if row.get("native_indexer_smoke_passed"):
+            row["native_indexer_smoke_benchmark_error"] = repr(exc)
+        else:
+            row["native_indexer_smoke_error"] = repr(exc)
 
 
 def _run_native_indexer_decode_smoke(row, args, status):
@@ -1236,21 +1295,25 @@ def _run_native_indexer_decode_smoke(row, args, status):
         K = max(4096, args.native_smoke_k_len)
         D = 128
         topk = 2048
+        scale = D**-0.5
         mx.random.seed(args.native_smoke_seed + 4)
         q = mx.random.normal((B, H, L, D), dtype=mx.float16) * 0.02
         k = mx.random.normal((B, 1, K, D), dtype=mx.float16) * 0.02
-        weights = mx.random.normal((B, L, H), dtype=mx.float16) * 0.02
+        weights = mx.random.normal((B, L, H), dtype=mx.float32) * 0.02
         scores = glm_moe_dsa._native_indexer_scores(
             q,
             k,
             weights,
+            scale=scale,
             causal=False,
             skip_causal_future_store=False,
             causal_q_offset=-1,
         )
         if scores is None:
             raise RuntimeError("native DSA decode indexer score kernel unavailable")
-        reference = _native_indexer_smoke_reference(q, k, weights, causal=False)
+        reference = _native_indexer_smoke_reference(
+            q, k, weights, scale, causal=False
+        )
         diff = mx.abs(scores.astype(mx.float32) - reference.astype(mx.float32))
         topk_indices = glm_moe_dsa._native_indexer_topk_indices(
             scores,
@@ -1382,6 +1445,14 @@ def run_native_kernel_smoke(args):
         "native_indexer_smoke_min_topk_margin": None,
         "native_indexer_smoke_passed": False,
         "native_indexer_smoke_error": None,
+        "native_indexer_smoke_native_seconds_mean": None,
+        "native_indexer_smoke_native_seconds_min": None,
+        "native_indexer_smoke_native_seconds_p50": None,
+        "native_indexer_smoke_reference_seconds_mean": None,
+        "native_indexer_smoke_reference_seconds_min": None,
+        "native_indexer_smoke_reference_seconds_p50": None,
+        "native_indexer_smoke_speedup_mean": None,
+        "native_indexer_smoke_benchmark_error": None,
         "native_indexer_decode_smoke_available": bool(
             indexer_status["available"]
             and indexer_status.get("decode_scores_available")
@@ -2891,6 +2962,14 @@ def print_table(rows, output_format):
         "native_indexer_smoke_min_topk_margin",
         "native_indexer_smoke_passed",
         "native_indexer_smoke_error",
+        "native_indexer_smoke_native_seconds_mean",
+        "native_indexer_smoke_native_seconds_min",
+        "native_indexer_smoke_native_seconds_p50",
+        "native_indexer_smoke_reference_seconds_mean",
+        "native_indexer_smoke_reference_seconds_min",
+        "native_indexer_smoke_reference_seconds_p50",
+        "native_indexer_smoke_speedup_mean",
+        "native_indexer_smoke_benchmark_error",
         "native_indexer_decode_smoke_available",
         "native_indexer_decode_smoke_source",
         "native_indexer_decode_smoke_import_error",

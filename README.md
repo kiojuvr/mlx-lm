@@ -301,6 +301,27 @@ pool loops such as the same action signature repeating via
 
 `--kv-bits 8` is not a prefill-compute speedup by itself. Its value is that GLM MLA int8 KV cache reduces long-context KV memory and keeps 200K+ prompts inside the intended memory envelope. The native DSA indexer score/top-k route remains compatible with this setting because it uses the DSA indexer cache, not the GLM MLA KV cache.
 
+The GLM-5.2 Indexer precision contract is independent of MLA KV quantization.
+`indexer.weights_proj` remains an FP32 `Linear`, including when a custom or
+mixed quantization predicate requests quantization globally. The model's hard
+exclusion cannot be overridden by that predicate. The native Indexer uses the
+versioned FP32 symbols only: Q/K stay FP16 or BF16, while head weights,
+post-scale/ReLU accumulation, score output, and top-k selection stay FP32. If
+those symbols are absent, inference falls back to the exact FP32 block/dense
+implementation instead of using the older 16-bit score ABI.
+
+Native FP32 score storage is query-chunked so one score tensor stays within
+`MLX_LM_GLM_DSA_NATIVE_INDEXER_MAX_SCORE_BYTES` (default 256 MiB). Each chunk
+keeps its absolute causal offset. If even one 64-query Metal tile would exceed
+the limit, the model uses the memory-bounded exact block Indexer instead.
+
+Direct GLM attention/MTP custom masks support boolean hard masks and floating
+additive masks with rank 2 or 4. Only internally proven, unpadded full-causal
+masks may enter the causal-only native Indexer/native sparse kernels; custom,
+batched-padding, windowed, and other cache-generated masks retain their values
+through the exact fallback and fast selected-KV paths. A fully masked query row
+has defined zero attention output.
+
 Prompt checkpointing remains the dominant TTFT optimization for repeated coding-agent prefixes. For latency-focused 200K+ serving, `--disable-batching` keeps requests on the single-request path that reuses disk prompt checkpoints and saves post-response continued/delta checkpoints asynchronously. Keep `--checkpoint-prefill-frontier-save disabled` for interactive OpenCode sessions: synchronous frontier saves during prefill can write multi-GB checkpoint files before the first decoded token, blocking the active response long enough to trip operation timeouts. Existing prefix/frontier/delta checkpoints are still eligible for lookup and reuse when this is disabled. Enable prefill frontier saves only for controlled cache-building runs where a long foreground save is acceptable. `--checkpoint-delta-chunk-tokens 8192` stores long post-response deltas as a chain of smaller delta checkpoint files; this avoids repeatedly rewriting one huge suffix and lets later saves extend the deepest reusable checkpoint. Use `--checkpoint-delta-chunk-tokens 0` only when you need the legacy single-file delta behavior for comparison. Disable final exact checkpoints for this long-running server profile: 190K-token exact checkpoints are around 11GB each on the tested setup and can spend tens of seconds writing only to be pruned immediately. The measured cold-prefill sweep now favors `--prefill-step-size 8192`, `--prefill-max-qk-tokens 67108864`, and adaptive GLM DSA prefill disabled (`--glm-dsa-adaptive-prefill-step-size 0`). The QK cap shrinks only the chunks whose query-by-context product would get too large; the 8192-token first chunk crosses the native sparse handoff immediately, then later chunks shrink automatically as the cap requires. Keep `MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT` at its default/effective 131072 handoff for the Python selected-KV sparse path; lowering that handoff increased runtime and memory in the tested 128K runs. The vendored native DSA indexer route is enabled by default through `MLX_LM_GLM_DSA_NATIVE_INDEXER` and can replace the Python/MLX indexer score plus top-k path for supported GLM-5.2 M3 prefill chunks at context 4096 and above. Its single-query decode score probe is separate and remains disabled unless `MLX_LM_GLM_DSA_NATIVE_DECODE_INDEXER=1`; the 8K exact-hit 64-token A/B measured it slightly slower than the existing decode path. The vendored native sparse MLA route has its own lower handoff, `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_MIN_CONTEXT` (default 6144). `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1` lets it consume int8 GLM MLA KV cache by temporarily dequantizing the full latent KV cache for the native kernel; the recommended `MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144` has been profiled through 204800 tokens with all chunks on the native sparse route and no dense fallback. Keep larger values bounded until your target context length is profiled. Do not force `MLX_LM_GLM_DSA_FAST_PREFILL_KEY_BLOCK=2048` unless you are profiling it; the default key block is 8192. If Metal recovery or memory pressure appears on your real prompt distribution, retry with `--prefill-step-size 4096` first, then 2048 and 1024.
 
 `--mtp-speculative --num-draft-tokens 1` enables the built-in GLM DSA MTP layer

@@ -79,6 +79,37 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(config["quantization"]["group_size"], 64)
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_custom_quant_predicate_cannot_override_model_exclusion(self):
+        class ProtectedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.protected = nn.Linear(64, 64, bias=False)
+                self.allowed = nn.Linear(64, 64, bias=False)
+
+            @property
+            def quant_predicate(self):
+                return lambda path, _: path != "protected"
+
+        model = ProtectedModel()
+
+        def custom_predicate(_path, _module):
+            return {"group_size": 64, "bits": 2, "mode": "affine"}
+
+        model, config = utils.quantize_model(
+            model,
+            {},
+            group_size=64,
+            bits=4,
+            quant_predicate=custom_predicate,
+        )
+
+        self.assertIsInstance(model.protected, nn.Linear)
+        self.assertNotIsInstance(model.protected, nn.QuantizedLinear)
+        self.assertIsInstance(model.allowed, nn.QuantizedLinear)
+        self.assertEqual(model.allowed.bits, 2)
+        self.assertNotIn("protected", config["quantization"])
+        self.assertEqual(config["quantization"]["allowed"]["bits"], 2)
+
     def test_convert(self):
         mlx_path = os.path.join(self.test_dir, "mlx_model")
 

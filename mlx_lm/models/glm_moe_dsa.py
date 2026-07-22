@@ -49,6 +49,9 @@ GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT_ENV = (
 GLM_DSA_SPARSE_MLA_TILE_ENV = "MLX_LM_GLM_DSA_SPARSE_MLA_TILE"
 GLM_DSA_NATIVE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_INDEXER"
 GLM_DSA_NATIVE_DECODE_INDEXER_ENV = "MLX_LM_GLM_DSA_NATIVE_DECODE_INDEXER"
+GLM_DSA_NATIVE_INDEXER_MAX_SCORE_BYTES_ENV = (
+    "MLX_LM_GLM_DSA_NATIVE_INDEXER_MAX_SCORE_BYTES"
+)
 GLM_DSA_NATIVE_Q8_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q8_VUP"
 GLM_DSA_NATIVE_Q4_VUP_ENV = "MLX_LM_GLM_DSA_NATIVE_Q4_VUP"
 GLM_DSA_Q_A_DENSE_CACHE_ENV = "MLX_LM_GLM_DSA_Q_A_DENSE_CACHE"
@@ -100,6 +103,7 @@ _DEFAULT_FAST_PREFILL_QUERY_CHUNK = 16
 _DEFAULT_FAST_PREFILL_KEY_BLOCK = 8192
 _DEFAULT_SPARSE_PREFILL_MIN_CONTEXT = 131072
 _DEFAULT_NATIVE_SPARSE_PREFILL_MIN_CONTEXT = 6144
+_DEFAULT_NATIVE_INDEXER_MAX_SCORE_BYTES = 256 * 1024 * 1024
 _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS = 8
 _FAST_PREFILL_LARGE_TOPK_WARNING = 1024
 _LOGGER = logging.getLogger(__name__)
@@ -252,6 +256,28 @@ def _native_sparse_prefill_quantized_kv_max_context_length() -> int:
         except ValueError:
             pass
     return 65536
+
+
+def _native_indexer_max_score_bytes() -> int:
+    raw_value = os.environ.get(GLM_DSA_NATIVE_INDEXER_MAX_SCORE_BYTES_ENV)
+    if raw_value is not None:
+        try:
+            return max(4, int(raw_value))
+        except ValueError:
+            pass
+    return _DEFAULT_NATIVE_INDEXER_MAX_SCORE_BYTES
+
+
+def _native_indexer_query_chunk_size(query_length: int, key_length: int) -> int:
+    if query_length == 1:
+        return 1
+    if _native_indexer_max_score_bytes() < 4 * key_length * 64:
+        return 0
+    max_rows = max(1, _native_indexer_max_score_bytes() // (4 * key_length))
+    chunk = min(query_length, max_rows)
+    if chunk >= 64 and chunk < query_length:
+        chunk = (chunk // 64) * 64
+    return max(1, chunk)
 
 
 def _sparse_prefill_min_effective_context_length() -> int:
@@ -762,8 +788,8 @@ def _native_indexer_available():
     fast, _source, _error = _native_indexer_fast_module()
     if fast is None:
         return False
-    return fast.has_symbol("dsa_indexer_scores") and fast.has_symbol(
-        "dsa_topk_indices"
+    return fast.has_symbol("dsa_indexer_scores_fp32") and fast.has_symbol(
+        "dsa_topk_indices_fp32"
     )
 
 
@@ -771,8 +797,8 @@ def _native_decode_indexer_available():
     fast, _source, _error = _native_indexer_fast_module()
     if fast is None:
         return False
-    return fast.has_symbol("dsa_indexer_scores_decode") and fast.has_symbol(
-        "dsa_topk_indices"
+    return fast.has_symbol("dsa_indexer_scores_decode_fp32") and fast.has_symbol(
+        "dsa_topk_indices_fp32"
     )
 
 
@@ -781,6 +807,7 @@ def _native_indexer_scores(
     keys: mx.array,
     weights: mx.array,
     *,
+    scale: float,
     causal: bool,
     skip_causal_future_store: bool = False,
     causal_q_offset: int = -1,
@@ -788,7 +815,7 @@ def _native_indexer_scores(
     fast, _source, _error = _native_indexer_fast_module()
     if (
         fast is None
-        or not fast.has_symbol("dsa_indexer_scores")
+        or not fast.has_symbol("dsa_indexer_scores_fp32")
         or len(queries.shape) != 4
         or len(keys.shape) != 4
         or len(weights.shape) != 3
@@ -802,23 +829,25 @@ def _native_indexer_scores(
         or keys.shape[3] != 128
         or keys.shape[2] < 4096
         or queries.dtype != keys.dtype
-        or queries.dtype != weights.dtype
         or queries.dtype not in (mx.float16, mx.bfloat16)
+        or weights.dtype != mx.float32
     ):
         return None
 
     _B, _H, L, _D = queries.shape
     K = keys.shape[2]
     if L == 1:
-        if not fast.has_symbol("dsa_indexer_scores_decode"):
+        if not fast.has_symbol("dsa_indexer_scores_decode_fp32"):
             return None
         try:
-            return fast.dsa_indexer_scores_decode(
+            scores = fast.dsa_indexer_scores_decode_fp32(
                 queries,
                 keys,
                 weights,
+                scale,
                 stream=mx.gpu,
             )
+            return scores if scores.dtype == mx.float32 else None
         except Exception:
             return None
 
@@ -837,10 +866,11 @@ def _native_indexer_scores(
         k = mx.pad(k, [(0, 0), (0, 0), (0, k_pad), (0, 0)])
 
     try:
-        scores = fast.dsa_indexer_scores(
+        scores = fast.dsa_indexer_scores_fp32(
             q,
             k,
             w,
+            scale,
             causal=causal,
             unused_causal_prefix_topk=0,
             skip_causal_future_store=skip_causal_future_store,
@@ -848,6 +878,8 @@ def _native_indexer_scores(
             stream=mx.gpu,
         )
     except Exception:
+        return None
+    if scores.dtype != mx.float32:
         return None
     if q_pad or k_pad:
         scores = scores[:, :, :L, :K]
@@ -864,16 +896,16 @@ def _native_indexer_topk_indices(
     fast, _source, _error = _native_indexer_fast_module()
     if (
         fast is None
-        or not fast.has_symbol("dsa_topk_indices")
+        or not fast.has_symbol("dsa_topk_indices_fp32")
         or len(scores.shape) != 4
         or scores.shape[1] != 1
         or topk != 2048
         or scores.shape[-1] < topk
-        or scores.dtype not in (mx.float16, mx.bfloat16)
+        or scores.dtype != mx.float32
     ):
         return None
     try:
-        return fast.dsa_topk_indices(
+        return fast.dsa_topk_indices_fp32(
             scores,
             topk,
             bucketed=bucketed,
@@ -905,11 +937,15 @@ def get_glm_dsa_native_sparse_prefill_status():
 
 def get_glm_dsa_native_indexer_status():
     fast, source, import_error = _native_indexer_fast_module()
-    scores_available = fast is not None and fast.has_symbol("dsa_indexer_scores")
-    decode_scores_available = fast is not None and fast.has_symbol(
-        "dsa_indexer_scores_decode"
+    scores_available = fast is not None and fast.has_symbol(
+        "dsa_indexer_scores_fp32"
     )
-    topk_available = fast is not None and fast.has_symbol("dsa_topk_indices")
+    decode_scores_available = fast is not None and fast.has_symbol(
+        "dsa_indexer_scores_decode_fp32"
+    )
+    topk_available = fast is not None and fast.has_symbol(
+        "dsa_topk_indices_fp32"
+    )
     return {
         "enabled": _native_indexer_enabled(),
         "decode_enabled": _native_decode_indexer_enabled(),
@@ -920,6 +956,8 @@ def get_glm_dsa_native_indexer_status():
         "decode_scores_available": decode_scores_available,
         "topk_available": topk_available,
         "min_context": 4096,
+        "score_dtype": "float32",
+        "max_score_bytes": _native_indexer_max_score_bytes(),
     }
 
 
@@ -1117,6 +1155,85 @@ def _slice_attention_mask(
     return mask[..., query_start:query_stop, key_start:key_stop]
 
 
+def _normalize_attention_mask(
+    mask: Optional[mx.array], query_length: int, key_length: int
+):
+    """Materialize the string causal mask used by the generic MLX API."""
+    if not isinstance(mask, str):
+        return mask
+    if mask != "causal":
+        raise ValueError(f"unsupported attention mask: {mask!r}")
+    query_positions = mx.arange(key_length - query_length, key_length)
+    key_positions = mx.arange(key_length)
+    return query_positions[:, None] >= key_positions[None, :]
+
+
+def _apply_attention_mask(scores: mx.array, mask: Optional[mx.array]):
+    """Apply boolean hard masks or additive masks to attention-like scores."""
+    if mask is None:
+        return scores
+    if isinstance(mask, str):
+        mask = _normalize_attention_mask(mask, scores.shape[-2], scores.shape[-1])
+    if mask.dtype == mx.bool_:
+        return mx.where(mask, scores, mx.array(-float("inf"), scores.dtype))
+    if not mx.issubdtype(mask.dtype, mx.floating):
+        raise ValueError("custom attention masks must be boolean or floating point")
+    return scores + mask.astype(scores.dtype)
+
+
+def _validate_attention_mask(
+    mask: Optional[mx.array],
+    batch_size: int,
+    num_heads: int,
+    query_length: int,
+    key_length: int,
+):
+    if mask is None:
+        return
+    if isinstance(mask, str):
+        raise ValueError("string attention masks must be normalized before validation")
+    if mask.dtype != mx.bool_ and not mx.issubdtype(mask.dtype, mx.floating):
+        raise ValueError("custom attention masks must be boolean or floating point")
+    if len(mask.shape) not in (2, 4):
+        raise ValueError("custom attention masks must have rank 2 or 4")
+    if tuple(mask.shape[-2:]) != (query_length, key_length):
+        raise ValueError(
+            "custom attention mask query/key dimensions do not match attention"
+        )
+    if len(mask.shape) == 4:
+        mask_batch, mask_heads = mask.shape[:2]
+        if mask_batch not in (1, batch_size):
+            raise ValueError("custom attention mask batch dimension is not broadcastable")
+        if mask_heads not in (1, num_heads):
+            raise ValueError("custom attention mask head dimension is not broadcastable")
+
+
+def _attention_mask_valid_rows(mask: Optional[mx.array]):
+    if mask is None:
+        return None
+    if mask.dtype == mx.bool_:
+        return mx.any(mask, axis=-1, keepdims=True)
+    return mx.any(mx.isfinite(mask), axis=-1, keepdims=True)
+
+
+def _ensure_attention_mask_has_valid_key(
+    mask: Optional[mx.array], valid_rows: Optional[mx.array]
+):
+    """Give fully-masked rows a dummy key; their outputs are zeroed later."""
+    if mask is None or valid_rows is None:
+        return mask
+    first_key = mx.arange(mask.shape[-1]) == 0
+    dummy_key = (~valid_rows) & first_key
+    if mask.dtype == mx.bool_:
+        return mask | dummy_key
+    return mx.where(dummy_key, mx.array(0, dtype=mask.dtype), mask)
+
+
+def _has_canonical_causal_cache(cache: Optional[Any]) -> bool:
+    """Whether cache.make_mask produces an unpadded, unwindowed causal mask."""
+    return cache is None or type(cache) in (GlmMlaKVCache, QuantizedGlmMlaKVCache)
+
+
 def _gather_attention_mask(mask: Optional[mx.array], indices: mx.array):
     if mask is None:
         return None
@@ -1131,6 +1248,9 @@ def _gather_attention_mask(mask: Optional[mx.array], indices: mx.array):
         raise ValueError("unsupported attention mask rank for sparse gather")
 
     mB, mH, mL, S = mask.shape
+    if mB == 1 and B != 1:
+        mask = mx.broadcast_to(mask, (B, mH, mL, S))
+        mB = B
     if mB != B or mL != L:
         raise ValueError("mask shape does not match top-k indices")
     if mH == 1 and iH != 1:
@@ -1312,6 +1432,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         qr: mx.array,
         mask: Optional[mx.array],
         cache: Optional[Any] = None,
+        mask_is_causal: bool = False,
     ):
         indexer = self.indexer
         b, s, _ = x.shape
@@ -1329,9 +1450,13 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             k, _ = cache.update_and_fetch(
                 k, mx.zeros([b, 1, s, 0], dtype=k.dtype)
             )
+        mask = _normalize_attention_mask(mask, q.shape[2], k.shape[2])
+        _validate_attention_mask(mask, b, self.num_heads, q.shape[2], k.shape[2])
         if k.shape[2] <= indexer.index_topk:
             return None
-        native_indices = self._native_indexer_topk(q, x, k, mask)
+        native_indices = self._native_indexer_topk(
+            q, x, k, mask, mask_is_causal=mask_is_causal
+        )
         if native_indices is not None:
             return native_indices
         if _fast_prefill_enabled() and b == 1 and s > 1:
@@ -1367,6 +1492,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         mask: Optional[mx.array],
     ):
         indexer = self.indexer
+        mask = _normalize_attention_mask(mask, q.shape[2], k.shape[2])
+        _validate_attention_mask(
+            mask, q.shape[0], self.num_heads, q.shape[2], k.shape[2]
+        )
         scores = (
             q.astype(mx.float32)
             @ k.astype(mx.float32).swapaxes(-1, -2)
@@ -1376,8 +1505,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
         scores = scores.sum(axis=1, keepdims=True)
-        if mask is not None:
-            scores = mx.where(mask, scores, -float("inf"))
+        scores = _apply_attention_mask(scores, mask)
         return mx.argpartition(scores, kth=-indexer.index_topk, axis=-1)[
             ..., -indexer.index_topk :
         ]
@@ -1388,6 +1516,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         x: mx.array,
         k: mx.array,
         mask: Optional[mx.array],
+        mask_is_causal: bool = False,
     ):
         indexer = self.indexer
         if not _fast_prefill_enabled():
@@ -1399,8 +1528,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if isinstance(mask, str):
             if mask != "causal":
                 return False, "mask_type"
-        elif mask is not None and len(mask.shape) not in (2, 4):
-            return False, "mask_rank"
+            mask_is_causal = True
+        elif mask is not None:
+            if not mask_is_causal:
+                return False, "custom_mask"
+            if len(mask.shape) not in (2, 4):
+                return False, "mask_rank"
         B, H, L, D = q.shape
         if B != 1:
             return False, "batch_size_not_one"
@@ -1419,16 +1552,6 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "mixed_index_head_dim"
         if indexer.index_topk != 2048:
             return False, f"unsupported_topk:{indexer.index_topk}"
-        projection = getattr(indexer, "weights_proj", None)
-        projection_weight = getattr(projection, "weight", None)
-        if (
-            projection_weight is not None
-            and projection_weight.dtype == mx.float32
-        ):
-            # The native Indexer currently accepts and stores only 16-bit
-            # scores. Keep FP32 reference semantics until that kernel supports
-            # FP32 head weights and score output end-to-end.
-            return False, "fp32_indexer_weights"
         if k.shape[2] < 4096:
             return False, "below_native_indexer_min_context"
         if q.dtype not in (mx.float16, mx.bfloat16):
@@ -1443,47 +1566,74 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         x: mx.array,
         k: mx.array,
         mask: Optional[mx.array],
+        mask_is_causal: bool = False,
     ):
-        use_native, reason = self._native_indexer_decision(q, x, k, mask)
+        use_native, reason = self._native_indexer_decision(
+            q, x, k, mask, mask_is_causal=mask_is_causal
+        )
         if not use_native:
             _record_native_indexer_decision(False, reason)
             return None
 
         indexer = self.indexer
-        weights = self._indexer_head_weights(x).astype(q.dtype)
-        weights = weights * indexer.softmax_scale
-        if weights.dtype != q.dtype:
-            _record_native_indexer_decision(False, "mixed_weight_dtype")
+        weights = self._indexer_head_weights(x)
+        if weights.dtype != mx.float32:
+            _record_native_indexer_decision(False, "non_fp32_weight")
             return None
-        causal = mask is not None
-        scores = _profile_stage(
-            "native_indexer_scores",
-            lambda: _native_indexer_scores(
-                q,
-                k,
-                weights,
-                causal=causal,
-                skip_causal_future_store=causal,
-                causal_q_offset=k.shape[2] - q.shape[2] if causal else -1,
-            ),
-            inputs=(q, k, weights),
+        causal = mask_is_causal or (
+            isinstance(mask, str) and mask == "causal"
         )
-        if scores is None:
-            _record_native_indexer_decision(False, "scores_unavailable")
+        query_length = q.shape[2]
+        key_length = k.shape[2]
+        query_chunk = _native_indexer_query_chunk_size(query_length, key_length)
+        if query_chunk == 0:
+            _record_native_indexer_decision(False, "score_memory_limit")
             return None
-        indices = _profile_stage(
-            "native_indexer_topk",
-            lambda: _native_indexer_topk_indices(
-                scores,
-                indexer.index_topk,
-                bucketed=True,
-                causal_valid_prefix=causal,
-            ),
-            inputs=scores,
+        chunked = query_chunk < query_length
+        query_offset = key_length - query_length
+        index_chunks = []
+        for start in range(0, query_length, query_chunk):
+            stop = min(start + query_chunk, query_length)
+            q_chunk = q[:, :, start:stop, :]
+            weight_chunk = weights[:, start:stop, :]
+            use_causal_prefix_shortcut = causal and not chunked
+            scores = _profile_stage(
+                "native_indexer_scores",
+                lambda q_chunk=q_chunk, weight_chunk=weight_chunk, start=start: (
+                    _native_indexer_scores(
+                        q_chunk,
+                        k,
+                        weight_chunk,
+                        scale=indexer.softmax_scale,
+                        causal=causal,
+                        skip_causal_future_store=use_causal_prefix_shortcut,
+                        causal_q_offset=(query_offset + start) if causal else -1,
+                    )
+                ),
+                inputs=(q_chunk, k, weight_chunk),
+            )
+            if scores is None:
+                _record_native_indexer_decision(False, "scores_unavailable")
+                return None
+            indices = _profile_stage(
+                "native_indexer_topk",
+                lambda scores=scores: _native_indexer_topk_indices(
+                    scores,
+                    indexer.index_topk,
+                    bucketed=True,
+                    causal_valid_prefix=use_causal_prefix_shortcut,
+                ),
+                inputs=scores,
+            )
+            if indices is None:
+                _record_native_indexer_decision(False, "topk_unavailable")
+                return None
+            index_chunks.append(indices)
+        indices = (
+            index_chunks[0]
+            if len(index_chunks) == 1
+            else mx.concatenate(index_chunks, axis=2)
         )
-        if indices is None:
-            _record_native_indexer_decision(False, "topk_unavailable")
-            return None
         _record_native_indexer_decision(True, reason)
         return indices
 
@@ -1497,6 +1647,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         indexer = self.indexer
         B, _, L, _ = q.shape
         total_length = k.shape[2]
+        mask = _normalize_attention_mask(mask, L, total_length)
+        _validate_attention_mask(mask, B, self.num_heads, L, total_length)
         topk = indexer.index_topk
         query_chunk = _fast_prefill_query_chunk_size(L)
         key_block = _fast_prefill_key_block_size(total_length, topk)
@@ -1525,8 +1677,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 mask_block = _slice_attention_mask(
                     mask, q_start, q_stop, k_start, k_stop
                 )
-                if mask_block is not None:
-                    block_scores = mx.where(mask_block, block_scores, -float("inf"))
+                block_scores = _apply_attention_mask(block_scores, mask_block)
 
                 block_len = block_scores.shape[-1]
                 if block_len > topk:
@@ -1637,6 +1788,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         kv_latent: Any,
         k_pe: mx.array,
         topk_indices: mx.array,
+        mask: Optional[mx.array] = None,
+        mask_is_causal: bool = False,
     ):
         if not _fast_prefill_enabled():
             return False, "fast_prefill_disabled"
@@ -1644,6 +1797,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             return False, "disabled"
         if _native_sparse_mla_kernel() is None:
             return False, "missing_symbol"
+        if isinstance(mask, str):
+            if mask != "causal":
+                return False, "mask_type"
+            mask_is_causal = True
+        if not mask_is_causal:
+            return False, "custom_mask"
         if L <= 1:
             return False, "decode"
         if len(topk_indices.shape) != 4:
@@ -2085,9 +2244,17 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         sparse_mask = mx.put_along_axis(
             sparse_mask, topk_indices, mx.array(True), axis=-1
         )
-        if mask is not None:
-            sparse_mask = sparse_mask & mask
-        return sparse_mask
+        if mask is None:
+            return sparse_mask
+        if mask.dtype == mx.bool_:
+            return sparse_mask & mask
+        if not mx.issubdtype(mask.dtype, mx.floating):
+            raise ValueError("custom attention masks must be boolean or floating point")
+        return mx.where(
+            sparse_mask,
+            mask,
+            mx.array(-float("inf"), dtype=mask.dtype),
+        )
 
     def _native_sparse_prefill_attention(
         self,
@@ -2201,13 +2368,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         k_pe: mx.array,
         topk_indices: mx.array,
         mask: Optional[mx.array],
+        mask_is_causal: bool = False,
     ):
         _, _, L, _ = q_nope.shape
         query_chunk = _fast_prefill_query_chunk_size(L)
         topk = topk_indices.shape[-1]
         gather_mask = mask
         if (
-            isinstance(kv_cache, (GlmMlaKVCache, QuantizedGlmMlaKVCache))
+            mask_is_causal
+            and isinstance(kv_cache, (GlmMlaKVCache, QuantizedGlmMlaKVCache))
             and _has_full_topk_causal_prefix(k_pe.shape[2], L, topk)
         ):
             gather_mask = None
@@ -2293,12 +2462,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             (q_pe * self.scale)[..., None, :] * k_pe_selected,
             axis=-1,
         )
-        if mask_selected is not None:
-            pe_scores = mx.where(
-                mask_selected,
-                pe_scores,
-                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-            )
+        pe_scores = _apply_attention_mask(pe_scores, mask_selected)
         q_nope = _profile_stage(
             "latent_kv_projection",
             lambda: self.embed_q(q_nope),
@@ -2335,12 +2499,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             latent_step = latent_selected[:, :, index, :, :]
             k_pe_step = k_pe_selected[:, :, index, :, :]
             pe_scores = (q_pe_step * self.scale) @ k_pe_step.swapaxes(-1, -2)
-            if mask_selected is not None:
-                pe_scores = mx.where(
-                    mask_selected[:, :, index : index + 1, :],
-                    pe_scores,
-                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-                )
+            selected_step_mask = (
+                None
+                if mask_selected is None
+                else mask_selected[:, :, index : index + 1, :]
+            )
+            pe_scores = _apply_attention_mask(pe_scores, selected_step_mask)
             output = scaled_dot_product_attention(
                 q_nope_step,
                 latent_step,
@@ -2358,6 +2522,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
+        mask_is_causal: bool = False,
     ):
         B, L, D = x.shape
         profile_total = _prefill_profile_enabled() and L > 1
@@ -2416,6 +2581,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             update_kv_cache,
             inputs=(x, q_pe),
         )
+        mask = _normalize_attention_mask(mask, L, k_pe.shape[2])
+        _validate_attention_mask(mask, B, self.num_heads, L, k_pe.shape[2])
+        mask_valid_rows = None
+        if not mask_is_causal:
+            mask_valid_rows = _attention_mask_valid_rows(mask)
+            mask = _ensure_attention_mask_has_valid_key(mask, mask_valid_rows)
 
         kv_cache = cache[0] if cache is not None else None
         kv_latent_dequantized = not hasattr(kv_cache, "dequantize_keys")
@@ -2435,7 +2606,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if cache is None:
             cache = [None] * 2
 
-        if self.share_mtp_iteration_topk and prev_topk_indices is not None:
+        if (
+            self.share_mtp_iteration_topk
+            and prev_topk_indices is not None
+            and mask_is_causal
+        ):
             if cache[1] is not None:
                 _profile_stage(
                     "dsa_indexer_cache_update",
@@ -2446,7 +2621,13 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         elif self.indexer is not None:
             topk_indices = _profile_stage(
                 "dsa_indexer_topk",
-                lambda: self._indexer_topk(x, qr, mask, cache=cache[1]),
+                lambda: self._indexer_topk(
+                    x,
+                    qr,
+                    mask,
+                    cache=cache[1],
+                    mask_is_causal=mask_is_causal,
+                ),
                 inputs=(x, qr, mask),
             )
         else:
@@ -2504,6 +2685,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                             kv_latent=kv_latent,
                             k_pe=k_pe,
                             topk_indices=topk_indices,
+                            mask=mask,
+                            mask_is_causal=mask_is_causal,
                         )
                     )
                 if not short_verify and not native_sparse_prefill:
@@ -2598,16 +2781,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 k_pe,
                 topk_indices,
                 mask,
+                mask_is_causal=mask_is_causal,
             )
         if output is None:
             ensure_kv_latent_dequantized()
             pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
-            if mask is not None:
-                pe_scores = mx.where(
-                    mask,
-                    pe_scores,
-                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-                )
+            pe_scores = _apply_attention_mask(pe_scores, mask)
 
             if L == 1:
                 q_nope = self.embed_q(q_nope)
@@ -2632,6 +2811,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             if L == 1:
                 output = self._unembed_out_project(output)
 
+        if mask_valid_rows is not None:
+            output = mx.where(mask_valid_rows, output, mx.zeros_like(output))
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = _profile_stage(
             "o_projection", lambda: self.o_proj(output), inputs=output
@@ -2658,6 +2839,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV32DecoderLayer):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
+        mask_is_causal: bool = False,
     ):
         profile_decode_total = _GLM_DSA_PROFILE_SCOPE.get() == "decode"
         total_start = time.perf_counter() if profile_decode_total else None
@@ -2665,7 +2847,11 @@ class GlmMoeDsaDecoderLayer(DeepseekV32DecoderLayer):
             "input_layernorm", lambda: self.input_layernorm(x), inputs=x
         )
         r, topk_indices = self.self_attn(
-            normed_x, mask, cache, prev_topk_indices
+            normed_x,
+            mask,
+            cache,
+            prev_topk_indices,
+            mask_is_causal=mask_is_causal,
         )
         h = x + r
         normed_h = _profile_stage(
@@ -2734,8 +2920,10 @@ class GlmMoeDsaModel(DeepseekV32Model):
 
         if cache is None:
             cache = [None] * self.num_layers
+        mask_cache = cache[0][0] if cache[0] else None
+        mask_is_causal = _has_canonical_causal_cache(mask_cache)
         mask = create_attention_mask(
-            h, cache[0][0] if cache[0] else None, return_array=True
+            h, mask_cache, return_array=True
         )
 
         # Receive from the previous process in the pipeline
@@ -2745,7 +2933,11 @@ class GlmMoeDsaModel(DeepseekV32Model):
         prev_topk_indices = None
         for i in range(self.num_layers):
             h, prev_topk_indices = self.layers[self.start_idx + i](
-                h, mask, cache[i], prev_topk_indices
+                h,
+                mask,
+                cache[i],
+                prev_topk_indices,
+                mask_is_causal=mask_is_causal,
             )
 
         # Send to the next process in the pipeline
@@ -2797,6 +2989,7 @@ class GlmMoeDsaMTPPredictor(nn.Module):
         cache: Optional[Any] = None,
         prev_topk_indices: Optional[mx.array] = None,
         return_logits_hidden: bool = True,
+        mask_is_causal: bool = False,
     ):
         offset = cache[0].offset if cache is not None and cache[0] is not None else 0
         if offset == 0 and inputs_embeds.shape[1] > 0:
@@ -2811,7 +3004,13 @@ class GlmMoeDsaMTPPredictor(nn.Module):
         hidden = self.eh_proj(
             mx.concatenate([inputs_embeds, previous_hidden_states], axis=-1)
         )
-        hidden, topk_indices = self.layer(hidden, mask, cache, prev_topk_indices)
+        hidden, topk_indices = self.layer(
+            hidden,
+            mask,
+            cache,
+            prev_topk_indices,
+            mask_is_causal=mask_is_causal,
+        )
         logits_hidden = self.shared_head(hidden) if return_logits_hidden else None
         return hidden, logits_hidden, topk_indices
 
@@ -2986,6 +3185,10 @@ class Model(DSV32Model):
             raise RuntimeError(f"GLM DSA MTP is disabled; set {GLM_DSA_MTP_ENV}=1")
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(inputs)
+        mask_cache = cache[0] if cache is not None else None
+        mask_is_causal = (
+            mask is None or (isinstance(mask, str) and mask == "causal")
+        ) and _has_canonical_causal_cache(mask_cache)
         if mask is None:
             mask = create_attention_mask(
                 inputs_embeds,
@@ -2998,6 +3201,7 @@ class Model(DSV32Model):
             mask,
             cache,
             prev_topk_indices,
+            mask_is_causal=mask_is_causal,
         )
         return self.lm_head(logits_hidden), logits_hidden, topk_indices
 
@@ -3014,6 +3218,10 @@ class Model(DSV32Model):
             raise RuntimeError(f"GLM DSA MTP is disabled; set {GLM_DSA_MTP_ENV}=1")
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(inputs)
+        mask_cache = cache[0] if cache is not None else None
+        mask_is_causal = (
+            mask is None or (isinstance(mask, str) and mask == "causal")
+        ) and _has_canonical_causal_cache(mask_cache)
         if mask is None:
             mask = create_attention_mask(
                 inputs_embeds,
@@ -3027,6 +3235,7 @@ class Model(DSV32Model):
             cache,
             prev_topk_indices,
             return_logits_hidden=False,
+            mask_is_causal=mask_is_causal,
         )
         return hidden, topk_indices
 
@@ -3044,6 +3253,10 @@ class Model(DSV32Model):
             raise RuntimeError(f"GLM DSA MTP is disabled; set {GLM_DSA_MTP_ENV}=1")
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(inputs)
+        mask_cache = cache[0] if cache is not None else None
+        mask_is_causal = (
+            mask is None or (isinstance(mask, str) and mask == "causal")
+        ) and _has_canonical_causal_cache(mask_cache)
         if mask is None:
             mask = create_attention_mask(
                 inputs_embeds,
@@ -3057,6 +3270,7 @@ class Model(DSV32Model):
             cache,
             prev_topk_indices,
             return_logits_hidden=False,
+            mask_is_causal=mask_is_causal,
         )
         logits_hidden = self.mtp.shared_head(hidden[:, -1:, :])
         if topk_indices is not None and topk_indices.shape[2] > 1:
