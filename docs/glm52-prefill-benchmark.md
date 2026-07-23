@@ -1,5 +1,39 @@
 # GLM-5.2 Prefill Benchmark And Batching Notes
 
+## Historical serving snapshot
+
+The following July 9, 2026 OpenCode task log used a single-device M3 Ultra
+512 GB Mac Studio, the 3.5 bpw dynamic-quantized GLM-5.2 checkpoint, MLX
+0.31.2, an int8 GLM MLA KV cache, and native sparse MLA over quantized KV.
+Disk candidates were present, but the live server cache covered most useful
+prefixes.
+
+Prefill TPS is fresh prefill tokens divided by summed prefill chunk time.
+First-token time also includes lookup, scheduling, and final decode-step
+overhead.
+
+| Workload | Prompt tokens | Reused tokens | Fresh prompt tokens | Prefill time | Prefill TPS | First token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cold small first request | 3,458 | 0 | 3,458 | 22.308s | 155.0 | 22.859s |
+| Mostly cached tool turn | 12,918 | 12,654 | 264 | 2.735s | 96.2 | 2.945s |
+| Larger suffix turn | 43,143 | 32,699 | 10,444 | 71.657s | 145.7 | 71.960s |
+| Final long decode turn | 44,417 | 44,086 | 331 | 3.279s | 100.6 | 3.549s |
+
+| Workload | Prompt tokens | Generated tokens | Decode seconds | Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Final long completed turn | 44,417 | 5,041 | 320.230 | 15.742 |
+| Short tool-call turns | 12,918–43,945 | 141–474 | 8.849–29.032 | about 15.9–16.3 |
+| 8K synthetic exact-hit baseline | 8,192 | 64 | 3.897 | 16.420 |
+| 8K native decode Indexer probe | 8,192 | 64 | 4.088 | 15.657 |
+
+```text
+generation progress: prompt_tokens=44417 generated_tokens=4096 decode_seconds=260.206 decode_tps=15.741
+generation complete: prompt_tokens=44417 generated_tokens=5041 decode_seconds=320.230 decode_tps=15.742
+```
+
+These numbers are historical target-only baselines unless a row is explicitly
+marked MTP. Use fresh benchmark runs for current performance comparisons.
+
 This fork now includes a lightweight prefill benchmark:
 
 ```sh
@@ -166,8 +200,8 @@ benchmark mirrors the normal OpenCode request and does not request token
 log-probabilities, so greedy MTP rows also report
 `mtp_speculative_target_logsumexp_skipped` and
 `mtp_speculative_return_logprobs=false`.
-Production MTP also defaults to an adaptive low-acceptance guard: after 16 draft
-tokens, acceptance below `0.20` switches the rest of that request to regular
+Production MTP also defaults to an adaptive low-acceptance guard: after 8 draft
+tokens, acceptance below `0.50` switches the rest of that request to regular
 one-token target decode without rebuilding the target cache. A vocabulary-head-
 free MTP cache update keeps the combined cache reusable for the next request.
 Benchmark rows expose
