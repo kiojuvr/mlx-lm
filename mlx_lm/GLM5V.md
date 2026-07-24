@@ -170,8 +170,13 @@ restore thinking with request-level `reasoning_effort` or
 `chat_template_kwargs.enable_thinking`; this is useful for diagnosis, but the
 model can repeat reasoning or emit an extra `</think>` after an otherwise
 complete answer. The server suppresses a duplicate closing control token and
-guards both reasoning and visible output loops. An explicit request
-`temperature` overrides the Vision-specific default.
+can guard repeated reasoning with `--reasoning-loop-guard-*`. Visible-output
+scanning is independent and disabled by default; enable
+`--output-loop-guard-*` explicitly only when the risk of truncating legitimate
+repeated code, JSON, logs, or fixtures is acceptable. Exact token-loop
+detection excludes tool-call payloads, which are bounded separately by
+`--tool-call-max-tokens`. An explicit request `temperature` overrides the
+Vision-specific default.
 
 ## Initial limitations
 

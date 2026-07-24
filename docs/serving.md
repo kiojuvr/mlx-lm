@@ -125,9 +125,10 @@ observed with sampled image generation: repeated reasoning, a second
 loops. Text-only requests keep the profile's normal reasoning and sampling
 defaults. A client can explicitly opt an image request back into thinking with
 `"reasoning_effort": "high"`/`"max"` or
-`"chat_template_kwargs": {"enable_thinking": true}`; the in-response loop
-guards remain active for that experimental path. An explicit request
-`temperature` overrides `--vision-temperature`.
+`"chat_template_kwargs": {"enable_thinking": true}`; the reasoning loop guard
+remains active for that experimental path. Visible-output loop scanning is a
+separate opt-in described below. An explicit request `temperature` overrides
+`--vision-temperature`.
 
 The defaults allow at most 8 images, 20 MiB and 40 million decoded pixels per
 image, and 64 million decoded pixels in total. These are configurable with
@@ -205,18 +206,33 @@ accepts `"reasoning": {"effort": "high"}`. GLM-5.2 accepts `high` and `max`.
 ## Loop guards and progress
 
 `--loop-guard-*` bounds the damage if an exact repeated token loop still
-occurs. With the recommended maximum of 64 it watches every repeated token
-period from 1 through 64 after the configured minimum generation length. Set
-`--loop-guard-ngram-size 0` only for controlled diagnosis. Periods shorter
-than 8 tokens require enough repeats to cover at least the same 24-token
-evidence window as the default 8-token/3-repeat guard.
+occurs. `--loop-guard-ngram-size` is the maximum checked period: the guard
+watches 8-, 16-, 32-, and 64-token windows up to that maximum, plus the exact
+configured value when it is nonstandard. Each check is scoped to one continuous
+reasoning or visible-output span. State transitions reset it, and tool-call
+payloads are excluded. Use `--tool-call-max-tokens` to bound an unclosed
+tool-call span. Set `--loop-guard-ngram-size 0` only for controlled diagnosis.
 
-`--reasoning-loop-guard-*` retains its historical name but now checks reasoning
-and visible assistant output independently. This catches repeated normalized
-text that does not align with exact token n-grams, including Japanese text
-whose sentences are not separated by spaces. A visible-output loop is stopped
-without injecting a guard message into the answer; a reasoning loop retains
-the visible recovery message.
+`--reasoning-loop-guard-*` checks repeated normalized reasoning spans that do
+not align with exact token n-grams, including Japanese text whose sentences are
+not separated by spaces. On detection, it retains the visible recovery
+message. Block-based matches must be consecutive at the current text tail and
+must not exceed the configured maximum span. Visible assistant output has an independent
+`--output-loop-guard-*` guard. It is disabled by default because valid code,
+JSON, logs, and test fixtures can contain repeated text.
+
+To opt into the initial Vision branch's visible-output scanning, add:
+
+```sh
+--output-loop-guard-min-chars 60 \
+--output-loop-guard-repeats 4 \
+--output-loop-guard-max-span-chars 2048
+```
+
+Existing `--reasoning-loop-guard-*` options remain accepted and continue to
+guard reasoning, but no longer enable visible-output scanning. Enable the output
+guard only when truncating legitimate repeated output is an acceptable tradeoff.
+
 `--reasoning-max-tokens` is a separate hard fuse and defaults to disabled; it
 is intentionally omitted from the normal long-running profile.
 

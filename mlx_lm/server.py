@@ -664,6 +664,7 @@ class TokenLoopGuard:
         self.repeats = max(0, int(repeats))
         self.min_tokens = max(0, int(min_tokens))
         self.tokens = []
+        self.state = None
         self.last_ngram_size = None
         self.last_repeat_count = None
 
@@ -671,7 +672,19 @@ class TokenLoopGuard:
     def enabled(self):
         return self.ngram_size > 0 and self.repeats > 1
 
-    def append(self, token: int) -> bool:
+    def reset(self):
+        self.tokens.clear()
+        self.state = None
+        self.last_ngram_size = None
+        self.last_repeat_count = None
+
+    def append(self, token: int, *, state: Optional[str] = "normal") -> bool:
+        if state not in {"reasoning", "normal"}:
+            self.reset()
+            return False
+        if state != self.state:
+            self.reset()
+            self.state = state
         self.tokens.append(int(token))
         return self.has_loop()
 
@@ -680,13 +693,13 @@ class TokenLoopGuard:
         self.last_repeat_count = None
         if not self.enabled or len(self.tokens) < self.min_tokens:
             return False
-        baseline_window_size = min(8, self.ngram_size) * self.repeats
-        for ngram_size in range(1, self.ngram_size + 1):
-            repeat_count = max(
-                self.repeats,
-                (baseline_window_size + ngram_size - 1) // ngram_size,
-            )
-            window_size = ngram_size * repeat_count
+        ngram_sizes = [8, 16, 32, 64, self.ngram_size]
+        seen = set()
+        for ngram_size in ngram_sizes:
+            if ngram_size in seen or ngram_size <= 0 or ngram_size > self.ngram_size:
+                continue
+            seen.add(ngram_size)
+            window_size = ngram_size * self.repeats
             if len(self.tokens) < window_size:
                 continue
             tail = self.tokens[-window_size:]
@@ -696,7 +709,7 @@ class TokenLoopGuard:
                 for i in range(ngram_size, window_size, ngram_size)
             ):
                 self.last_ngram_size = ngram_size
-                self.last_repeat_count = repeat_count
+                self.last_repeat_count = self.repeats
                 return True
         return False
 
@@ -733,6 +746,12 @@ class TextLoopGuard:
         self.repeats = max(0, int(repeats))
         self.max_span_chars = max(0, int(max_span_chars))
         self.check_interval_chars = max(1, int(check_interval_chars))
+        self.raw_tail = ""
+        self.raw_chars = 0
+        self.last_checked_raw_chars = 0
+        self.last_decision = None
+
+    def reset(self):
         self.raw_tail = ""
         self.raw_chars = 0
         self.last_checked_raw_chars = 0
@@ -810,12 +829,24 @@ class TextLoopGuard:
                 self.raw_tail,
             )
         ]
-        counts = {}
-        for block in blocks:
-            if len(block) < self.min_chars or not any(ch.isalnum() for ch in block):
+        repeated = None
+        count = 0
+        for block in reversed(blocks):
+            if not block:
                 continue
-            count = counts.get(block, 0) + 1
-            counts[block] = count
+            if (
+                len(block) < self.min_chars
+                or len(block) > self.max_span_chars
+                or not any(ch.isalnum() for ch in block)
+            ):
+                break
+            if repeated is None:
+                repeated = block
+                count = 1
+            elif block == repeated:
+                count += 1
+            else:
+                break
             if count >= self.repeats:
                 self.last_decision = TextLoopGuardDecision(
                     span_chars=len(block),
@@ -836,28 +867,77 @@ class GenerationTextLoopGuard:
         repeats: int = 4,
         max_span_chars: int = 2048,
         check_interval_chars: int = 64,
+        *,
+        output_min_chars: int = 0,
+        output_repeats: int = 4,
+        output_max_span_chars: int = 2048,
     ):
         self.guards = {
-            state: TextLoopGuard(
+            "reasoning": TextLoopGuard(
                 min_chars,
                 repeats,
                 max_span_chars,
                 check_interval_chars,
-            )
-            for state in ("reasoning", "normal")
+            ),
+            "normal": TextLoopGuard(
+                output_min_chars,
+                output_repeats,
+                output_max_span_chars,
+                check_interval_chars,
+            ),
         }
+        self.state = None
         self.last_state = None
         self.last_decision = None
 
     def append(self, state: str, text: str) -> bool:
         self.last_state = None
         self.last_decision = None
+        if state != self.state:
+            for guard in self.guards.values():
+                guard.reset()
+            self.state = state
         guard = self.guards.get(state)
         if guard is None or not guard.append(text):
             return False
         self.last_state = state
         self.last_decision = guard.last_decision
         return True
+
+
+def _make_generation_text_loop_guard(args):
+    return GenerationTextLoopGuard(
+        _prompt_checkpoint_policy_int(
+            args,
+            "reasoning_loop_guard_min_chars",
+            0,
+        ),
+        _prompt_checkpoint_policy_int(
+            args,
+            "reasoning_loop_guard_repeats",
+            4,
+        ),
+        _prompt_checkpoint_policy_int(
+            args,
+            "reasoning_loop_guard_max_span_chars",
+            2048,
+        ),
+        output_min_chars=_prompt_checkpoint_policy_int(
+            args,
+            "output_loop_guard_min_chars",
+            0,
+        ),
+        output_repeats=_prompt_checkpoint_policy_int(
+            args,
+            "output_loop_guard_repeats",
+            4,
+        ),
+        output_max_span_chars=_prompt_checkpoint_policy_int(
+            args,
+            "output_loop_guard_max_span_chars",
+            2048,
+        ),
+    )
 
 
 class SessionLoopGuardDecision(NamedTuple):
@@ -4743,21 +4823,6 @@ class APIHandler(BaseHTTPRequestHandler):
             "reasoning_max_tokens",
             0,
         )
-        reasoning_loop_guard_min_chars = _prompt_checkpoint_policy_int(
-            self.response_generator.cli_args,
-            "reasoning_loop_guard_min_chars",
-            0,
-        )
-        reasoning_loop_guard_repeats = _prompt_checkpoint_policy_int(
-            self.response_generator.cli_args,
-            "reasoning_loop_guard_repeats",
-            4,
-        )
-        reasoning_loop_guard_max_span_chars = _prompt_checkpoint_policy_int(
-            self.response_generator.cli_args,
-            "reasoning_loop_guard_max_span_chars",
-            2048,
-        )
         decode_started_at = time.perf_counter()
         tool_state_tokens = 0
         reasoning_state_tokens = 0
@@ -4770,10 +4835,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.response_generator.cli_args.loop_guard_repeats,
             self.response_generator.cli_args.loop_guard_min_tokens,
         )
-        text_loop_guard = GenerationTextLoopGuard(
-            reasoning_loop_guard_min_chars,
-            reasoning_loop_guard_repeats,
-            reasoning_loop_guard_max_span_chars,
+        text_loop_guard = _make_generation_text_loop_guard(
+            self.response_generator.cli_args
         )
 
         try:
@@ -4850,7 +4913,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     finish_reason = "stop"
                     ctx.stop()
                     break
-                if loop_guard.append(gen.token):
+                if loop_guard.append(gen.token, state=gen.state):
                     logging.warning(
                         "Stopping generation after detecting repeated token loop "
                         "(ngram_size=%s repeats=%s generated_tokens=%s)",
@@ -5271,21 +5334,6 @@ class APIHandler(BaseHTTPRequestHandler):
             "reasoning_max_tokens",
             0,
         )
-        reasoning_loop_guard_min_chars = _prompt_checkpoint_policy_int(
-            self.response_generator.cli_args,
-            "reasoning_loop_guard_min_chars",
-            0,
-        )
-        reasoning_loop_guard_repeats = _prompt_checkpoint_policy_int(
-            self.response_generator.cli_args,
-            "reasoning_loop_guard_repeats",
-            4,
-        )
-        reasoning_loop_guard_max_span_chars = _prompt_checkpoint_policy_int(
-            self.response_generator.cli_args,
-            "reasoning_loop_guard_max_span_chars",
-            2048,
-        )
         tool_state_tokens = 0
         reasoning_state_tokens = 0
         tool_call_limit_reached = False
@@ -5297,10 +5345,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.response_generator.cli_args.loop_guard_repeats,
             self.response_generator.cli_args.loop_guard_min_tokens,
         )
-        text_loop_guard = GenerationTextLoopGuard(
-            reasoning_loop_guard_min_chars,
-            reasoning_loop_guard_repeats,
-            reasoning_loop_guard_max_span_chars,
+        text_loop_guard = _make_generation_text_loop_guard(
+            self.response_generator.cli_args
         )
 
         if self.stream:
@@ -5335,6 +5381,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
         try:
             for gen in response_gen:
+                text_loop_decision = None
+                text_loop_state = None
                 tokens.append(gen.token)
                 if gen.state == "tool":
                     tool_state_tokens += 1
@@ -5344,7 +5392,68 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_state_tokens += 1
                 else:
                     reasoning_state_tokens = 0
-                if loop_guard.append(gen.token):
+                if text_loop_guard.append(gen.state, gen.text):
+                    text_loop_decision = text_loop_guard.last_decision
+                    text_loop_state = text_loop_guard.last_state
+                if gen.state == "tool":
+                    tool_text += gen.text
+                elif gen.state == "reasoning":
+                    if gen.text:
+                        reasoning_text += gen.text
+                        if text_loop_state == "reasoning":
+                            guard_message = _text_loop_guard_message(
+                                text_loop_decision
+                            )
+                            logging.warning(
+                                "Stopping generation after detecting repeated "
+                                "reasoning text loop (span_chars=%s repeats=%s "
+                                "repeated_chars=%s generated_tokens=%s "
+                                "sample=%r)",
+                                text_loop_decision.span_chars,
+                                text_loop_decision.repeats,
+                                text_loop_decision.repeated_chars,
+                                len(tokens),
+                                text_loop_decision.sample,
+                            )
+                            full_text += guard_message
+                            if self.stream:
+                                if not stream_write(self._sse_event(
+                                    "response.output_text.delta", {
+                                        "type": "response.output_text.delta",
+                                        "item_id": msg_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": guard_message,
+                                    })):
+                                    client_connected = False
+                            finish_reason = "stop"
+                            reasoning_loop_guard_reached = True
+                            ctx.stop()
+                            break
+                elif gen.state == "normal":
+                    if prev_state == "tool":
+                        tool_calls_raw.append(tool_text)
+                        tool_text = ""
+                        made_tool_call = True
+                    if gen.text:
+                        full_text += gen.text
+                        if text_loop_state == "normal":
+                            logging.warning(
+                                "Stopping generation after detecting repeated "
+                                "normal text loop (span_chars=%s repeats=%s "
+                                "repeated_chars=%s generated_tokens=%s "
+                                "sample=%r)",
+                                text_loop_decision.span_chars,
+                                text_loop_decision.repeats,
+                                text_loop_decision.repeated_chars,
+                                len(tokens),
+                                text_loop_decision.sample,
+                            )
+                            finish_reason = "stop"
+                            output_loop_guard_reached = True
+                            ctx.stop()
+                            break
+                if loop_guard.append(gen.token, state=gen.state):
                     logging.warning(
                         "Stopping generation after detecting repeated token loop "
                         "(ngram_size=%s repeats=%s generated_tokens=%s)",
@@ -5387,82 +5496,27 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_limit_reached = True
                     ctx.stop()
                     break
-                if gen.state == "tool":
-                    tool_text += gen.text
-                elif gen.state == "reasoning":
-                    if gen.text:
-                        reasoning_text += gen.text
-                        if text_loop_guard.append(gen.state, gen.text):
-                            text_loop_decision = text_loop_guard.last_decision
-                            guard_message = _text_loop_guard_message(
-                                text_loop_decision
-                            )
-                            logging.warning(
-                                "Stopping generation after detecting repeated "
-                                "reasoning text loop (span_chars=%s repeats=%s "
-                                "repeated_chars=%s generated_tokens=%s "
-                                "sample=%r)",
-                                text_loop_decision.span_chars,
-                                text_loop_decision.repeats,
-                                text_loop_decision.repeated_chars,
-                                len(tokens),
-                                text_loop_decision.sample,
-                            )
-                            full_text += guard_message
-                            if self.stream:
-                                if not stream_write(self._sse_event(
-                                    "response.output_text.delta", {
-                                        "type": "response.output_text.delta",
-                                        "item_id": msg_id,
-                                        "output_index": 0,
-                                        "content_index": 0,
-                                        "delta": guard_message,
-                                    })):
-                                    client_connected = False
-                            finish_reason = "stop"
-                            reasoning_loop_guard_reached = True
-                            ctx.stop()
+                if self.stream and gen.text:
+                    if gen.state == "reasoning":
+                        if not stream_write(self._sse_event(
+                            "response.reasoning_text.delta", {
+                                "type": "response.reasoning_text.delta",
+                                "item_id": msg_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": gen.text,
+                            })):
                             break
-                        if self.stream:
-                            if not stream_write(self._sse_event(
-                                "response.reasoning_text.delta", {
-                                    "type": "response.reasoning_text.delta",
-                                    "item_id": msg_id, "output_index": 0,
-                                    "content_index": 0, "delta": gen.text,
-                                })):
-                                break
-                elif gen.state == "normal":
-                    if prev_state == "tool":
-                        tool_calls_raw.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    if gen.text:
-                        full_text += gen.text
-                        if text_loop_guard.append(gen.state, gen.text):
-                            text_loop_decision = text_loop_guard.last_decision
-                            logging.warning(
-                                "Stopping generation after detecting repeated "
-                                "normal text loop (span_chars=%s repeats=%s "
-                                "repeated_chars=%s generated_tokens=%s "
-                                "sample=%r)",
-                                text_loop_decision.span_chars,
-                                text_loop_decision.repeats,
-                                text_loop_decision.repeated_chars,
-                                len(tokens),
-                                text_loop_decision.sample,
-                            )
-                            finish_reason = "stop"
-                            output_loop_guard_reached = True
-                            ctx.stop()
+                    elif gen.state == "normal":
+                        if not stream_write(self._sse_event(
+                            "response.output_text.delta", {
+                                "type": "response.output_text.delta",
+                                "item_id": msg_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": gen.text,
+                            })):
                             break
-                        if self.stream:
-                            if not stream_write(self._sse_event(
-                                "response.output_text.delta", {
-                                    "type": "response.output_text.delta",
-                                    "item_id": msg_id, "output_index": 0,
-                                    "content_index": 0, "delta": gen.text,
-                                })):
-                                break
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
                 prev_state = gen.state
@@ -6105,8 +6159,10 @@ def setup_arg_parser():
         type=int,
         default=64,
         help=(
-            "Stop generation when an exact repeated token n-gram loop is "
-            "detected. Use 0 to disable (default: 64)."
+            "Stop generation when an exact repeated token loop is detected "
+            "at candidate periods 8, 16, 32, and 64 up to this size, plus "
+            "this explicitly configured size. Tool-call payloads are "
+            "excluded. Use 0 to disable (default: 64)."
         ),
     )
     parser.add_argument(
@@ -6180,9 +6236,9 @@ def setup_arg_parser():
         type=int,
         default=0,
         help=(
-            "Stop generation when reasoning or visible assistant text ends "
-            "with a repeated normalized span of at least this many "
-            "characters. Use 0 to disable (default: 0)."
+            "Stop generation when reasoning text ends with a repeated "
+            "normalized span of at least this many characters. Use 0 to "
+            "disable (default: 0)."
         ),
     )
     parser.add_argument(
@@ -6191,7 +6247,7 @@ def setup_arg_parser():
         default=4,
         help=(
             "Number of consecutive repeated text spans needed by the "
-            "in-response loop guard (default: 4)."
+            "reasoning loop guard (default: 4)."
         ),
     )
     parser.add_argument(
@@ -6199,8 +6255,36 @@ def setup_arg_parser():
         type=int,
         default=2048,
         help=(
-            "Largest normalized text span length scanned in reasoning and "
-            "visible assistant output (default: 2048)."
+            "Largest normalized text span length scanned in reasoning "
+            "(default: 2048)."
+        ),
+    )
+    parser.add_argument(
+        "--output-loop-guard-min-chars",
+        type=int,
+        default=0,
+        help=(
+            "Stop generation when visible assistant output ends with a "
+            "repeated normalized span of at least this many characters. "
+            "Use 0 to disable (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--output-loop-guard-repeats",
+        type=int,
+        default=4,
+        help=(
+            "Number of consecutive repeated text spans needed by the visible "
+            "assistant output loop guard (default: 4)."
+        ),
+    )
+    parser.add_argument(
+        "--output-loop-guard-max-span-chars",
+        type=int,
+        default=2048,
+        help=(
+            "Largest normalized text span length scanned in visible assistant "
+            "output (default: 2048)."
         ),
     )
     parser.add_argument(
@@ -6222,7 +6306,10 @@ def setup_arg_parser():
         "--loop-guard-min-tokens",
         type=int,
         default=256,
-        help="Minimum generated tokens before the loop guard can stop generation.",
+        help=(
+            "Minimum tracked non-tool tokens in the current generation state "
+            "before the loop guard can stop generation."
+        ),
     )
     parser.add_argument(
         "--chat-template-args",

@@ -34,6 +34,72 @@ generation complete: prompt_tokens=44417 generated_tokens=5041 decode_seconds=32
 These numbers are historical target-only baselines unless a row is explicitly
 marked MTP. Use fresh benchmark runs for current performance comparisons.
 
+## Current 199.8K OpenCode serving snapshot
+
+A July 24–25, 2026 production-style OpenCode task exercised the current
+`glm52-vision-projector` branch on the same single-device M3 Ultra 512 GB Mac
+Studio and `avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw`. The server used MLX 0.31.2,
+an int8 GLM MLA KV cache, native sparse MLA over quantized KV,
+`--prefill-step-size 8192`, `--prefill-max-qk-tokens 67108864`, one prompt and
+decode slot, and batching disabled. Exact/frontier checkpoint saves were
+disabled while asynchronous delta saves and the attached MoonViT adapter
+remained enabled.
+
+This is an observational serving trace rather than a controlled synthetic
+benchmark. It contains 53 completed text-generation turns. The final turn had
+197,407 prompt tokens and generated 2,429 tokens, leaving 199,836 tokens in the
+KV cache. It completed normally with no token, reasoning, output, tool, or
+session loop guard trip.
+
+As in the historical table, prefill TPS below is fresh prefill tokens divided by
+the sum of logged prefill chunk time. The first-token column is request-side
+elapsed time and therefore also includes lookup, queueing, scheduling, and the
+final one-token step.
+
+| Representative text turn | Prompt tokens | Reused tokens | Fresh prefill tokens | Prefill time | Prefill TPS | First token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cold initial request | 5,222 | 0 | 5,221 | 30.662s | 170.3 | 31.793s |
+| 32K larger suffix | 32,776 | 12,551 | 20,224 | 153.216s | 132.0 | 154.058s |
+| 73K larger suffix | 73,257 | 32,895 | 40,361 | 340.061s | 118.7 | 341.243s |
+| 117K larger suffix | 117,022 | 73,435 | 43,586 | 413.886s | 105.3 | 416.120s |
+| 154K low-LCP rewrite | 154,704 | 7,263 | 147,440 | 1,341.224s | 109.9 | 1,378.611s |
+| 191K larger suffix | 191,534 | 178,452 | 13,081 | 152.569s | 85.7 | 154.045s |
+| Final 197K continuation | 197,407 | 197,096 | 310 | 3.731s | 83.1 | 4.455s |
+
+Across all 53 turns, 312,058 fresh prefill tokens took 2,932.946 seconds of
+prefill chunk time, or **106.397 tok/s**. Restricting the aggregation to the six
+30K-or-larger turns with more than 4K fresh tokens gives 286,192 tokens in
+2,624.740 seconds, or **109.036 tok/s**. Tiny suffixes at very long context have
+lower apparent TPS because fixed per-request and per-chunk work dominates a few
+hundred fresh tokens.
+
+Decode throughput declined gradually with context length:
+
+| Prompt context band | Turns | Generated tokens | Decode seconds | Weighted decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Below 32K | 3 | 253 | 18.770s | 13.479 |
+| 32K–100K | 2 | 297 | 24.044s | 12.352 |
+| 100K–150K | 7 | 11,016 | 982.117s | 11.217 |
+| 150K and above | 41 | 22,218 | 2,040.822s | 10.887 |
+| All text turns | 53 | 33,784 | 3,065.753s | 11.020 |
+
+The final 197K turn sustained 10.577 decode tok/s for 2,429 generated tokens.
+Across the 15 turns at 140K or greater that generated at least 500 tokens, the
+weighted rate was 27,422 tokens / 2,494.021 seconds, or **10.995 tok/s**.
+
+```text
+generation progress: prompt_tokens=197407 generated_tokens=2048 decode_seconds=193.554 decode_tps=10.581
+generation complete: prompt_tokens=197407 generated_tokens=2429 cache_tokens=199836 decode_seconds=229.647 decode_tps=10.577
+```
+
+Five image requests followed the completed task and all finished normally.
+They used the separate `vision-input-embeddings` path with a 16-token prefill
+step, so they are excluded from the text aggregates above. Their prompt sizes
+were 246–2,733 tokens, chunk-only language-model prefill measured 35.0–48.7
+tok/s, and decode measured 18.98–20.37 tok/s. The trace does not isolate MoonViT
+wall time from queueing and request setup, so these numbers should be treated as
+Vision smoke-test observations rather than a MoonViT benchmark.
+
 This fork now includes a lightweight prefill benchmark:
 
 ```sh
@@ -1045,10 +1111,13 @@ keep `--checkpoint-shutdown-max-tokens` bounded so Ctrl+C does not spend minutes
 serializing a 200K-class prompt cache during process exit.
 
 The loop guard is intentionally a decode-time fuse, not a sampling replacement:
-it stops exact repeated token n-grams after the configured minimum generated
-token count. If a client can pass request parameters, combine it with conservative
-sampling and a small `repetition_penalty` for prompts that still produce
-near-duplicate reasoning loops.
+it stops exact repeated token n-grams after the configured minimum tracked
+non-tool tokens in the current continuous reasoning or visible-output span.
+State transitions reset the count, and tool-call payloads are not inspected;
+use `--tool-call-max-tokens` to bound an unclosed tool-call span. If a client
+can pass request parameters, combine it with conservative sampling and a small
+`repetition_penalty` for prompts that still produce near-duplicate reasoning
+loops.
 
 For shorter mixed workloads where throughput matters more than per-request TTFT,
 continuous batching remains available:

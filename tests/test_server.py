@@ -61,6 +61,7 @@ from mlx_lm.server import (
     TextLoopGuard,
     TokenLoopGuard,
     VisionRequestError,
+    _make_generation_text_loop_guard,
     _prompt_checkpoint_boundary_store_length,
     _prompt_checkpoint_continued_frontier_args,
     _prompt_checkpoint_continued_store_length,
@@ -161,6 +162,9 @@ class DummyModelProvider:
                 "reasoning_loop_guard_min_chars": 0,
                 "reasoning_loop_guard_repeats": 4,
                 "reasoning_loop_guard_max_span_chars": 2048,
+                "output_loop_guard_min_chars": 0,
+                "output_loop_guard_repeats": 4,
+                "output_loop_guard_max_span_chars": 2048,
                 "prefill_progress_interval_tokens": 0,
                 "checkpoint_save_exact": "enabled",
                 "checkpoint_async_save_backlog_limit": (
@@ -330,24 +334,44 @@ class TestTokenLoopGuard(unittest.TestCase):
 
         self.assertFalse(any(guard.append(t) for t in [1, 2, 3, 4] * 5))
 
-    def test_detects_non_power_of_two_period(self):
-        guard = TokenLoopGuard(ngram_size=64, repeats=3, min_tokens=256)
+    def test_default_candidates_ignore_nonstandard_periods(self):
+        for period_size in (3, 5, 7, 50):
+            with self.subTest(period_size=period_size):
+                guard = TokenLoopGuard(
+                    ngram_size=64,
+                    repeats=3,
+                    min_tokens=256,
+                )
+                period = list(range(period_size))
+                tokens = (period * (320 // period_size + 1))[:320]
+
+                self.assertFalse(any(guard.append(t) for t in tokens))
+
+    def test_detects_stable_candidate_periods(self):
+        for period_size in (8, 16, 32, 64):
+            with self.subTest(period_size=period_size):
+                guard = TokenLoopGuard(
+                    ngram_size=64,
+                    repeats=3,
+                    min_tokens=0,
+                )
+                period = list(range(period_size))
+                results = [guard.append(t) for t in period * 3]
+
+                self.assertFalse(any(results[:-1]))
+                self.assertTrue(results[-1])
+                self.assertEqual(guard.last_ngram_size, period_size)
+                self.assertEqual(guard.last_repeat_count, 3)
+
+    def test_detects_explicit_nonstandard_period(self):
+        guard = TokenLoopGuard(ngram_size=50, repeats=3, min_tokens=0)
         period = list(range(50))
-        results = [guard.append(t) for t in period * 6]
+        results = [guard.append(t) for t in period * 3]
 
-        self.assertFalse(any(results[:255]))
-        self.assertTrue(any(results[255:]))
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
         self.assertEqual(guard.last_ngram_size, 50)
-
-    def test_detects_short_period_after_minimum_length(self):
-        guard = TokenLoopGuard(ngram_size=64, repeats=3, min_tokens=256)
-        period = [11, 22, 33]
-        results = [guard.append(t) for t in period * 86]
-
-        self.assertFalse(any(results[:255]))
-        self.assertTrue(results[255])
-        self.assertEqual(guard.last_ngram_size, 3)
-        self.assertEqual(guard.last_repeat_count, 8)
+        self.assertEqual(guard.last_repeat_count, 3)
 
     def test_short_period_requires_a_full_baseline_window(self):
         guard = TokenLoopGuard(ngram_size=64, repeats=3, min_tokens=256)
@@ -355,6 +379,62 @@ class TestTokenLoopGuard(unittest.TestCase):
 
         self.assertFalse(any(guard.append(t) for t in tokens))
         self.assertIsNone(guard.last_ngram_size)
+
+    def test_tool_and_state_transitions_reset_history(self):
+        guard = TokenLoopGuard(ngram_size=8, repeats=3, min_tokens=0)
+        period = list(range(8))
+
+        self.assertFalse(
+            any(guard.append(t, state="normal") for t in period * 2)
+        )
+        self.assertFalse(
+            any(guard.append(t, state="tool") for t in period * 5)
+        )
+        self.assertFalse(
+            any(guard.append(t, state="normal") for t in period * 2)
+        )
+        results = [guard.append(t, state="normal") for t in period]
+
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+        self.assertEqual(guard.last_ngram_size, 8)
+
+    def test_reasoning_and_normal_states_do_not_share_history(self):
+        period = list(range(8))
+        for first_state, second_state in (
+            ("normal", "reasoning"),
+            ("reasoning", "normal"),
+        ):
+            with self.subTest(first_state=first_state, second_state=second_state):
+                guard = TokenLoopGuard(ngram_size=8, repeats=3, min_tokens=0)
+                self.assertFalse(
+                    any(guard.append(t, state=first_state) for t in period * 2)
+                )
+                first_second_state_period = [
+                    guard.append(t, state=second_state) for t in period
+                ]
+                self.assertFalse(any(first_second_state_period))
+
+                results = [
+                    guard.append(t, state=second_state) for t in period * 2
+                ]
+                self.assertFalse(any(results[:-1]))
+                self.assertTrue(results[-1])
+
+    def test_control_state_resets_and_is_not_scanned(self):
+        guard = TokenLoopGuard(ngram_size=8, repeats=3, min_tokens=0)
+        period = list(range(8))
+        self.assertFalse(
+            any(guard.append(t, state="normal") for t in period * 2)
+        )
+
+        self.assertFalse(guard.append(999, state=None))
+        first_period = [guard.append(t, state="normal") for t in period]
+
+        self.assertFalse(any(first_period))
+        results = [guard.append(t, state="normal") for t in period * 2]
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
 
 
 class TestTextLoopGuard(unittest.TestCase):
@@ -386,7 +466,7 @@ class TestTextLoopGuard(unittest.TestCase):
 
         self.assertFalse(any(guard.append("Wait. ") for _ in range(8)))
 
-    def test_detects_repeated_reasoning_block_with_interleaving(self):
+    def test_ignores_repeated_reasoning_block_with_interleaving(self):
         guard = TextLoopGuard(
             min_chars=60,
             repeats=4,
@@ -402,9 +482,59 @@ class TestTextLoopGuard(unittest.TestCase):
         for idx in range(3):
             self.assertFalse(guard.append(f"{block}\n\n{spacer} {idx}\n\n"))
 
-        self.assertTrue(guard.append(block))
-        self.assertEqual(guard.last_decision.repeats, 4)
-        self.assertIn("approval must already exist", guard.last_decision.sample)
+        self.assertFalse(guard.append(block))
+        self.assertIsNone(guard.last_decision)
+
+    def test_ignores_repeated_block_that_is_not_at_the_tail(self):
+        guard = TextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+        )
+        block = (
+            "The same long diagnostic sentence appears consecutively here "
+            "but is followed by a materially different conclusion."
+        )
+        conclusion = (
+            "The final conclusion is intentionally long enough to be a valid "
+            "block and must break the preceding repeated run."
+        )
+
+        self.assertFalse(guard.append("\n\n".join([block] * 4 + [conclusion])))
+        self.assertIsNone(guard.last_decision)
+
+    def test_repeated_block_honors_max_span(self):
+        over_limit = TextLoopGuard(
+            min_chars=10,
+            repeats=3,
+            max_span_chars=20,
+            check_interval_chars=1,
+        )
+        self.assertFalse(
+            any(over_limit.append("x" * 21 + "\n\n") for _ in range(3))
+        )
+
+        at_limit = TextLoopGuard(
+            min_chars=10,
+            repeats=3,
+            max_span_chars=20,
+            check_interval_chars=1,
+        )
+        results = [at_limit.append("x" * 20 + "\n\n") for _ in range(3)]
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+        self.assertEqual(at_limit.last_decision.span_chars, 20)
+
+    def test_disabled_when_max_span_is_below_minimum(self):
+        guard = TextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=59,
+            check_interval_chars=1,
+        )
+
+        self.assertFalse(any(guard.append("x" * 60) for _ in range(4)))
 
     def test_detects_unspaced_japanese_repeated_span(self):
         guard = TextLoopGuard(
@@ -427,42 +557,119 @@ class TestTextLoopGuard(unittest.TestCase):
 
 
 class TestGenerationTextLoopGuard(unittest.TestCase):
-    def test_detects_visible_normal_output_loop(self):
+    SPAN = (
+        "This repeated span is deliberately long enough to satisfy the "
+        "configured character threshold. "
+    )
+
+    def test_visible_normal_output_guard_is_disabled_by_default(self):
         guard = GenerationTextLoopGuard(
             min_chars=60,
             repeats=4,
             max_span_chars=512,
             check_interval_chars=1,
         )
-        span = (
-            "この画像は、多くのAIアシスタントや大規模言語モデルを比較した"
-            "ベンチマークチャートです。多くのモデルが含まれており、"
-            "多くのカテゴリーに分かれています。"
+
+        self.assertFalse(
+            any(guard.append("normal", self.SPAN) for _ in range(5))
         )
-        results = [guard.append("normal", span) for _ in range(4)]
+        self.assertIsNone(guard.last_state)
+
+    def test_detects_visible_normal_output_loop_when_enabled(self):
+        guard = GenerationTextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+            output_min_chars=60,
+            output_repeats=4,
+            output_max_span_chars=512,
+        )
+        results = [guard.append("normal", self.SPAN) for _ in range(4)]
 
         self.assertFalse(any(results[:-1]))
         self.assertTrue(results[-1])
         self.assertEqual(guard.last_state, "normal")
 
-    def test_reasoning_and_normal_histories_are_isolated(self):
+    def test_detects_reasoning_loop(self):
         guard = GenerationTextLoopGuard(
             min_chars=60,
             repeats=4,
             max_span_chars=512,
             check_interval_chars=1,
         )
-        span = (
-            "This repeated span is deliberately long enough to satisfy the "
-            "configured character threshold. "
+        results = [guard.append("reasoning", self.SPAN) for _ in range(4)]
+
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+        self.assertEqual(guard.last_state, "reasoning")
+
+    def test_state_transitions_reset_history(self):
+        guard = GenerationTextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
         )
 
-        for _ in range(2):
-            self.assertFalse(guard.append("reasoning", span))
-            self.assertFalse(guard.append("normal", span))
+        for _ in range(3):
+            self.assertFalse(guard.append("reasoning", self.SPAN))
+        self.assertFalse(guard.append("tool", self.SPAN * 4))
+        for _ in range(3):
+            self.assertFalse(guard.append("reasoning", self.SPAN))
+        self.assertTrue(guard.append("reasoning", self.SPAN))
+        self.assertEqual(guard.last_state, "reasoning")
 
-        self.assertFalse(guard.append("tool", span * 4))
-        self.assertIsNone(guard.last_state)
+    def test_reasoning_transition_clears_visible_output_history(self):
+        guard = GenerationTextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+            output_min_chars=60,
+            output_repeats=4,
+            output_max_span_chars=512,
+        )
+
+        for _ in range(3):
+            self.assertFalse(guard.append("normal", self.SPAN))
+        self.assertFalse(guard.append("reasoning", self.SPAN))
+        self.assertFalse(guard.append("normal", self.SPAN))
+        for _ in range(2):
+            self.assertFalse(guard.append("normal", self.SPAN))
+        self.assertTrue(guard.append("normal", self.SPAN))
+        self.assertEqual(guard.last_state, "normal")
+
+    def test_factory_keeps_output_settings_independent(self):
+        args = types.SimpleNamespace(
+            reasoning_loop_guard_min_chars=60,
+            reasoning_loop_guard_repeats=5,
+            reasoning_loop_guard_max_span_chars=512,
+            output_loop_guard_min_chars=10,
+            output_loop_guard_repeats=3,
+            output_loop_guard_max_span_chars=30,
+        )
+        guard = _make_generation_text_loop_guard(args)
+        output_span = "x" * 30
+
+        output_results = [
+            guard.append("normal", output_span) for _ in range(3)
+        ]
+        self.assertFalse(any(output_results[:-1]))
+        self.assertTrue(output_results[-1])
+
+        guard = _make_generation_text_loop_guard(args)
+        over_limit_span = "abcdefghijklmnopqrstuvwxyzABCDE"
+        self.assertEqual(len(over_limit_span), 31)
+        self.assertFalse(
+            any(
+                guard.append("normal", over_limit_span + "\n\n")
+                for _ in range(3)
+            )
+        )
+        self.assertFalse(
+            any(guard.append("reasoning", self.SPAN) for _ in range(4))
+        )
 
 
 class TestInResponseTextLoopGuards(unittest.TestCase):
@@ -473,26 +680,61 @@ class TestInResponseTextLoopGuards(unittest.TestCase):
     )
 
     @classmethod
-    def _make_handler(cls, object_type):
-        args = setup_arg_parser().parse_args(
-            [
-                "--reasoning-loop-guard-min-chars",
-                "60",
-                "--reasoning-loop-guard-repeats",
-                "4",
-                "--reasoning-loop-guard-max-span-chars",
-                "512",
-            ]
-        )
+    def _make_handler(
+        cls,
+        object_type,
+        *,
+        state="normal",
+        enable_output_guard=False,
+        token_guard_ngram_size=None,
+        tokens=None,
+        stream=False,
+    ):
+        argv = [
+            "--reasoning-loop-guard-min-chars",
+            "60",
+            "--reasoning-loop-guard-repeats",
+            "4",
+            "--reasoning-loop-guard-max-span-chars",
+            "512",
+        ]
+        if enable_output_guard:
+            argv.extend(
+                [
+                    "--output-loop-guard-min-chars",
+                    "60",
+                    "--output-loop-guard-repeats",
+                    "4",
+                    "--output-loop-guard-max-span-chars",
+                    "512",
+                ]
+            )
+        if token_guard_ngram_size is not None:
+            argv.extend(
+                [
+                    "--loop-guard-ngram-size",
+                    str(token_guard_ngram_size),
+                    "--loop-guard-repeats",
+                    "4",
+                    "--loop-guard-min-tokens",
+                    "0",
+                ]
+            )
+        args = setup_arg_parser().parse_args(argv)
         ctx = types.SimpleNamespace(
             prompt=[1, 2, 3],
             prompt_cache_count=0,
-            tool_parser=None,
+            tool_parser=(
+                (lambda _text, _tools: {"name": "noop", "arguments": {}})
+                if state == "tool"
+                else None
+            ),
             stop=mock.Mock(),
         )
+        token_values = list(range(5)) if tokens is None else tokens
         generated = iter(
-            Response(cls.SPAN, token, "normal", None, 0.0, None, ())
-            for token in range(4)
+            Response(cls.SPAN, token, state, None, 0.0, None, ())
+            for token in token_values
         )
         generator = types.SimpleNamespace(
             cli_args=args,
@@ -538,14 +780,45 @@ class TestInResponseTextLoopGuards(unittest.TestCase):
             "seed": None,
             "chat_template_kwargs": None,
             "reasoning_effort": None,
-            "stream": False,
+            "stream": stream,
             "stream_options": None,
         }.items():
             setattr(handler, name, value)
         return handler, ctx
 
-    def test_visible_normal_loop_stops_chat_completion(self):
+    def test_reasoning_options_do_not_stop_visible_chat_completion(self):
         handler, ctx = self._make_handler("chat.completion")
+
+        handler.handle_completion(types.SimpleNamespace(tools=None), [])
+
+        response = json.loads(handler.wfile.getvalue())
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(response["choices"][0]["message"]["content"], self.SPAN * 5)
+        self.assertEqual(response["usage"]["completion_tokens"], 5)
+        self.assertTrue(ctx.stop.called)
+
+    def test_reasoning_options_do_not_stop_visible_responses(self):
+        handler, ctx = self._make_handler("response")
+
+        handler.handle_responses_completion(
+            types.SimpleNamespace(tools=None),
+            [],
+        )
+
+        response = json.loads(handler.wfile.getvalue())
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            self.SPAN * 5,
+        )
+        self.assertEqual(response["usage"]["output_tokens"], 5)
+        self.assertTrue(ctx.stop.called)
+
+    def test_visible_normal_loop_stops_chat_completion_when_enabled(self):
+        handler, ctx = self._make_handler(
+            "chat.completion",
+            enable_output_guard=True,
+        )
 
         with self.assertLogs(level="WARNING") as captured:
             handler.handle_completion(types.SimpleNamespace(tools=None), [])
@@ -553,11 +826,15 @@ class TestInResponseTextLoopGuards(unittest.TestCase):
         response = json.loads(handler.wfile.getvalue())
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["choices"][0]["message"]["content"], self.SPAN * 4)
+        self.assertEqual(response["usage"]["completion_tokens"], 4)
         self.assertTrue(ctx.stop.called)
         self.assertIn("repeated normal text loop", "\n".join(captured.output))
 
-    def test_visible_normal_loop_stops_responses(self):
-        handler, ctx = self._make_handler("response")
+    def test_visible_normal_loop_stops_responses_when_enabled(self):
+        handler, ctx = self._make_handler(
+            "response",
+            enable_output_guard=True,
+        )
 
         with self.assertLogs(level="WARNING") as captured:
             handler.handle_responses_completion(
@@ -571,8 +848,173 @@ class TestInResponseTextLoopGuards(unittest.TestCase):
             response["output"][0]["content"][0]["text"],
             self.SPAN * 4,
         )
+        self.assertEqual(response["usage"]["output_tokens"], 4)
         self.assertTrue(ctx.stop.called)
         self.assertIn("repeated normal text loop", "\n".join(captured.output))
+
+    def test_reasoning_loop_stops_chat_completion(self):
+        handler, ctx = self._make_handler(
+            "chat.completion",
+            state="reasoning",
+        )
+
+        with self.assertLogs(level="WARNING") as captured:
+            handler.handle_completion(types.SimpleNamespace(tools=None), [])
+
+        response = json.loads(handler.wfile.getvalue())
+        message = response["choices"][0]["message"]
+        self.assertEqual(message["reasoning"], self.SPAN * 4)
+        self.assertIn("reasoning loop guard", message["content"])
+        self.assertEqual(response["usage"]["completion_tokens"], 4)
+        self.assertTrue(ctx.stop.called)
+        self.assertIn("repeated reasoning text loop", "\n".join(captured.output))
+
+    def test_text_loop_has_precedence_over_token_loop_in_both_apis(self):
+        for object_type in ("chat.completion", "response"):
+            with self.subTest(object_type=object_type):
+                handler, _ = self._make_handler(
+                    object_type,
+                    enable_output_guard=True,
+                    token_guard_ngram_size=1,
+                    tokens=[7] * 5,
+                )
+
+                with mock.patch("mlx_lm.server.logging.warning") as warning:
+                    if object_type == "response":
+                        handler.handle_responses_completion(
+                            types.SimpleNamespace(tools=None),
+                            [],
+                        )
+                    else:
+                        handler.handle_completion(
+                            types.SimpleNamespace(tools=None),
+                            [],
+                        )
+
+                warning_text = "\n".join(str(call) for call in warning.call_args_list)
+                self.assertTrue(
+                    any(
+                        "repeated normal" in call.args[0]
+                        or (
+                            "repeated %s text loop" in call.args[0]
+                            and len(call.args) > 1
+                            and call.args[1] == "normal"
+                        )
+                        for call in warning.call_args_list
+                    )
+                )
+                self.assertNotIn("repeated token loop", warning_text)
+                response = json.loads(handler.wfile.getvalue())
+                if object_type == "response":
+                    self.assertEqual(response["usage"]["output_tokens"], 4)
+                else:
+                    self.assertEqual(response["usage"]["completion_tokens"], 4)
+
+    def test_tool_payload_token_loop_is_excluded_in_both_apis(self):
+        period = list(range(8))
+        for object_type in ("chat.completion", "response"):
+            with self.subTest(object_type=object_type):
+                handler, _ = self._make_handler(
+                    object_type,
+                    state="tool",
+                    token_guard_ngram_size=8,
+                    tokens=period * 4,
+                )
+
+                with mock.patch("mlx_lm.server.logging.warning") as warning:
+                    if object_type == "response":
+                        handler.handle_responses_completion(
+                            types.SimpleNamespace(tools=None),
+                            [],
+                        )
+                    else:
+                        handler.handle_completion(
+                            types.SimpleNamespace(tools=None),
+                            [],
+                        )
+
+                warning_text = "\n".join(str(call) for call in warning.call_args_list)
+                self.assertNotIn("repeated token loop", warning_text)
+                response = json.loads(handler.wfile.getvalue())
+                if object_type == "response":
+                    self.assertEqual(response["usage"]["output_tokens"], 32)
+                    self.assertTrue(
+                        any(item["type"] == "function_call" for item in response["output"])
+                    )
+                else:
+                    self.assertEqual(response["usage"]["completion_tokens"], 32)
+                    self.assertEqual(
+                        response["choices"][0]["finish_reason"],
+                        "tool_calls",
+                    )
+
+    def test_default_output_guard_allows_streaming_in_both_apis(self):
+        for object_type in ("chat.completion.chunk", "response"):
+            with self.subTest(object_type=object_type):
+                handler, _ = self._make_handler(
+                    object_type,
+                    stream=True,
+                )
+
+                if object_type == "response":
+                    handler.handle_responses_completion(
+                        types.SimpleNamespace(tools=None),
+                        [],
+                    )
+                else:
+                    handler.handle_completion(
+                        types.SimpleNamespace(tools=None),
+                        [],
+                    )
+
+                payloads = [
+                    json.loads(line.removeprefix("data: "))
+                    for line in handler.wfile.getvalue().decode().splitlines()
+                    if line.startswith("data: {")
+                ]
+                if object_type == "response":
+                    deltas = [
+                        payload["delta"]
+                        for payload in payloads
+                        if payload.get("type") == "response.output_text.delta"
+                    ]
+                    completed = next(
+                        payload
+                        for payload in payloads
+                        if payload.get("type") == "response.completed"
+                    )
+                    self.assertEqual("".join(deltas), self.SPAN * 5)
+                    self.assertEqual(
+                        completed["response"]["usage"]["output_tokens"],
+                        5,
+                    )
+                else:
+                    content = "".join(
+                        payload["choices"][0]
+                        .get("delta", {})
+                        .get("content", "")
+                        for payload in payloads
+                    )
+                    self.assertEqual(content, self.SPAN * 5)
+
+    def test_reasoning_loop_stops_responses(self):
+        handler, ctx = self._make_handler(
+            "response",
+            state="reasoning",
+        )
+
+        with self.assertLogs(level="WARNING") as captured:
+            handler.handle_responses_completion(
+                types.SimpleNamespace(tools=None),
+                [],
+            )
+
+        response = json.loads(handler.wfile.getvalue())
+        text = response["output"][0]["content"][0]["text"]
+        self.assertIn("reasoning loop guard", text)
+        self.assertEqual(response["usage"]["output_tokens"], 4)
+        self.assertTrue(ctx.stop.called)
+        self.assertIn("repeated reasoning text loop", "\n".join(captured.output))
 
 
 class TestGlobalSessionLoopGuard(unittest.TestCase):
@@ -2381,6 +2823,9 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.reasoning_loop_guard_min_chars, 0)
         self.assertEqual(args.reasoning_loop_guard_repeats, 4)
         self.assertEqual(args.reasoning_loop_guard_max_span_chars, 2048)
+        self.assertEqual(args.output_loop_guard_min_chars, 0)
+        self.assertEqual(args.output_loop_guard_repeats, 4)
+        self.assertEqual(args.output_loop_guard_max_span_chars, 2048)
         self.assertEqual(args.prefill_progress_interval_tokens, 0)
         self.assertEqual(args.request_max_tokens_floor, 0)
         self.assertEqual(args.checkpoint_save_exact, "enabled")
@@ -2773,6 +3218,12 @@ class TestServerCLI(unittest.TestCase):
                 "4",
                 "--reasoning-loop-guard-max-span-chars",
                 "1024",
+                "--output-loop-guard-min-chars",
+                "80",
+                "--output-loop-guard-repeats",
+                "5",
+                "--output-loop-guard-max-span-chars",
+                "1536",
                 "--prefill-progress-interval-tokens",
                 "2048",
                 "--loop-guard-repeats",
@@ -2793,6 +3244,9 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.reasoning_loop_guard_min_chars, 60)
         self.assertEqual(args.reasoning_loop_guard_repeats, 4)
         self.assertEqual(args.reasoning_loop_guard_max_span_chars, 1024)
+        self.assertEqual(args.output_loop_guard_min_chars, 80)
+        self.assertEqual(args.output_loop_guard_repeats, 5)
+        self.assertEqual(args.output_loop_guard_max_span_chars, 1536)
         self.assertEqual(args.prefill_progress_interval_tokens, 2048)
         self.assertEqual(args.loop_guard_repeats, 4)
         self.assertEqual(args.loop_guard_min_tokens, 128)
