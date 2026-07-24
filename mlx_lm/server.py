@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import pickle
 import platform
@@ -128,6 +129,16 @@ def _positive_int(value):
         raise argparse.ArgumentTypeError("must be a positive integer") from error
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _nonnegative_float(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a non-negative number") from error
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative number")
     return parsed
 
 
@@ -347,10 +358,26 @@ def _resolve_request_max_tokens(body, cli_args):
 
     requested_max_tokens = max_tokens
     floor = getattr(cli_args, "request_max_tokens_floor", 0) or 0
-    floor_applied = isinstance(max_tokens, int) and floor > 0 and max_tokens < floor
+    floor_applied = (
+        max_tokens_source != "cli_default"
+        and isinstance(max_tokens, int)
+        and floor > 0
+        and max_tokens < floor
+    )
     if floor_applied:
         max_tokens = floor
     return max_tokens, max_tokens_source, requested_max_tokens, floor_applied
+
+
+def _resolve_request_temperature(body, cli_args, *, has_images):
+    if "temperature" in body:
+        return body["temperature"], "request"
+
+    vision_temperature = getattr(cli_args, "vision_temperature", None)
+    if has_images and vision_temperature is not None:
+        return vision_temperature, "vision_default"
+
+    return cli_args.temp, "cli_default"
 
 
 @dataclass
@@ -637,6 +664,8 @@ class TokenLoopGuard:
         self.repeats = max(0, int(repeats))
         self.min_tokens = max(0, int(min_tokens))
         self.tokens = []
+        self.last_ngram_size = None
+        self.last_repeat_count = None
 
     @property
     def enabled(self):
@@ -647,15 +676,17 @@ class TokenLoopGuard:
         return self.has_loop()
 
     def has_loop(self) -> bool:
+        self.last_ngram_size = None
+        self.last_repeat_count = None
         if not self.enabled or len(self.tokens) < self.min_tokens:
             return False
-        ngram_sizes = [8, 16, 32, 64, self.ngram_size]
-        seen = set()
-        for ngram_size in ngram_sizes:
-            if ngram_size in seen or ngram_size <= 0 or ngram_size > self.ngram_size:
-                continue
-            seen.add(ngram_size)
-            window_size = ngram_size * self.repeats
+        baseline_window_size = min(8, self.ngram_size) * self.repeats
+        for ngram_size in range(1, self.ngram_size + 1):
+            repeat_count = max(
+                self.repeats,
+                (baseline_window_size + ngram_size - 1) // ngram_size,
+            )
+            window_size = ngram_size * repeat_count
             if len(self.tokens) < window_size:
                 continue
             tail = self.tokens[-window_size:]
@@ -664,6 +695,8 @@ class TokenLoopGuard:
                 tail[i : i + ngram_size] == first
                 for i in range(ngram_size, window_size, ngram_size)
             ):
+                self.last_ngram_size = ngram_size
+                self.last_repeat_count = repeat_count
                 return True
         return False
 
@@ -735,12 +768,19 @@ class TextLoopGuard:
             self.max_span_chars * self.repeats,
         )
         tail = _normalize_loop_text(self.raw_tail)
-        if tail:
-            tail += " "
         tail = tail[-tail_chars:]
+        candidates = (tail, tail + " ") if tail else ()
+        for candidate in candidates:
+            decision = self._repeated_suffix_decision(candidate)
+            if decision is not None:
+                self.last_decision = decision
+                return True
+        return self.has_repeated_block_loop()
+
+    def _repeated_suffix_decision(self, tail):
         max_span = min(self.max_span_chars, len(tail) // self.repeats)
         if max_span < self.min_chars:
-            return False
+            return None
 
         end = len(tail)
         for span_chars in range(self.min_chars, max_span + 1):
@@ -754,20 +794,19 @@ class TextLoopGuard:
                 == span
                 for repeat in range(2, self.repeats + 1)
             ):
-                self.last_decision = TextLoopGuardDecision(
+                return TextLoopGuardDecision(
                     span_chars=span_chars,
                     repeated_chars=span_chars * self.repeats,
                     repeats=self.repeats,
                     sample=span[:160],
                 )
-                return True
-        return self.has_repeated_block_loop()
+        return None
 
     def has_repeated_block_loop(self) -> bool:
         blocks = [
             _normalize_loop_text(part)
             for part in re.split(
-                r"(?:\n\s*){2,}|(?<=[.!?。！？])\s+",
+                r"(?:\n\s*){2,}|(?<=[.!?])\s+|(?<=[。！？])(?:\s+|(?=\S))",
                 self.raw_tail,
             )
         ]
@@ -786,6 +825,39 @@ class TextLoopGuard:
                 )
                 return True
         return False
+
+
+class GenerationTextLoopGuard:
+    """Track reasoning and visible output separately within one generation."""
+
+    def __init__(
+        self,
+        min_chars: int = 0,
+        repeats: int = 4,
+        max_span_chars: int = 2048,
+        check_interval_chars: int = 64,
+    ):
+        self.guards = {
+            state: TextLoopGuard(
+                min_chars,
+                repeats,
+                max_span_chars,
+                check_interval_chars,
+            )
+            for state in ("reasoning", "normal")
+        }
+        self.last_state = None
+        self.last_decision = None
+
+    def append(self, state: str, text: str) -> bool:
+        self.last_state = None
+        self.last_decision = None
+        guard = self.guards.get(state)
+        if guard is None or not guard.append(text):
+            return False
+        self.last_state = state
+        self.last_decision = guard.last_decision
+        return True
 
 
 class SessionLoopGuardDecision(NamedTuple):
@@ -1640,7 +1712,10 @@ class ResponseGenerator:
                 "If you think this is an error, file an issue here: "
                 "https://github.com/ml-explore/mlx-lm/issues"
             )
-        chat_template_args = self._chat_template_args(args)
+        chat_template_args = self._chat_template_args(
+            args,
+            has_images=bool(getattr(request, "images", None)),
+        )
         return tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -1649,13 +1724,32 @@ class ResponseGenerator:
             **chat_template_args,
         )
 
-    def _chat_template_args(self, args):
+    def _chat_template_args(self, args, *, has_images=False):
         """Merge server and request chat-template controls by specificity."""
         chat_template_args = self.model_provider.cli_args.chat_template_args
         request_template_args = getattr(args, "chat_template_kwargs", None)
         request_reasoning_effort = getattr(args, "reasoning_effort", None)
+        vision_disable_thinking = bool(
+            has_images
+            and getattr(
+                self.model_provider.cli_args,
+                "vision_disable_thinking",
+                False,
+            )
+        )
+        request_controls_thinking = request_reasoning_effort is not None or (
+            request_template_args
+            and (
+                "enable_thinking" in request_template_args
+                or "reasoning_effort" in request_template_args
+            )
+        )
 
-        if not request_template_args and request_reasoning_effort is None:
+        if (
+            not request_template_args
+            and request_reasoning_effort is None
+            and not vision_disable_thinking
+        ):
             return chat_template_args
 
         chat_template_args = chat_template_args.copy()
@@ -1663,6 +1757,8 @@ class ResponseGenerator:
             chat_template_args.update(request_template_args)
         if request_reasoning_effort is not None:
             chat_template_args["reasoning_effort"] = request_reasoning_effort
+        if vision_disable_thinking and not request_controls_thinking:
+            chat_template_args["enable_thinking"] = False
         return chat_template_args
 
     @staticmethod
@@ -2760,7 +2856,10 @@ class ResponseGenerator:
                         "https://github.com/ml-explore/mlx-lm/issues"
                     )
 
-                chat_template_args = self._chat_template_args(args)
+                chat_template_args = self._chat_template_args(
+                    args,
+                    has_images=bool(getattr(request, "images", None)),
+                )
                 template_kwargs = dict(tools=tools, **chat_template_args)
                 prompt = tokenizer.apply_chat_template(
                     messages,
@@ -2896,6 +2995,11 @@ class ResponseGenerator:
             ts = tokenizer.think_start_tokens
             te = tokenizer.think_end_tokens
             transitions["normal"].append((ts, "reasoning"))
+            # A second closing tag after reasoning has already ended is a
+            # malformed control boundary, not visible answer text. Stopping
+            # here prevents the model from leaking </think> and restarting
+            # the answer in a normal-state repetition loop.
+            transitions["normal"].append((te, None))
             transitions["reasoning"] = [(te, "normal")]
             transitions["reasoning"].extend(common_stops)
             sequences[ts] = tokenizer.think_start
@@ -4047,26 +4151,6 @@ class APIHandler(BaseHTTPRequestHandler):
             if self._end_headers_safely():
                 self._write_response_bytes(response)
             return
-        logging.info(
-            "request parameters: path=%s stream=%s model=%s "
-            "max_tokens=%s requested_max_tokens=%s max_tokens_source=%s "
-            "max_tokens_floor_applied=%s temperature=%s top_p=%s "
-            "repetition_penalty=%s repetition_context_size=%s "
-            "reasoning_effort=%s",
-            self.path,
-            self.stream,
-            self.requested_model,
-            self.max_tokens,
-            self.requested_max_tokens,
-            self.max_tokens_source,
-            self.max_tokens_floor_applied,
-            self.temperature,
-            self.top_p,
-            self.repetition_penalty,
-            self.repetition_context_size,
-            self.reasoning_effort,
-        )
-
         # Get stop sequences
         stop_words = self.body.get("stop")
         stop_words = stop_words or []
@@ -4079,6 +4163,38 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.warning("Invalid request body: %s", e)
             self._send_json_error(400, f"Invalid request body: {e}")
             return
+        self.temperature, temperature_source = _resolve_request_temperature(
+            self.body,
+            self.response_generator.cli_args,
+            has_images=bool(request.images),
+        )
+        try:
+            self._validate("temperature", (float, int), min_val=0)
+        except ValueError as e:
+            logging.error("Invalid effective sampling parameters: %s", e)
+            self._send_json_error(500, f"Server sampling configuration is invalid: {e}")
+            return
+        logging.info(
+            "request parameters: path=%s stream=%s model=%s "
+            "max_tokens=%s requested_max_tokens=%s max_tokens_source=%s "
+            "max_tokens_floor_applied=%s temperature=%s "
+            "temperature_source=%s top_p=%s repetition_penalty=%s "
+            "repetition_context_size=%s reasoning_effort=%s has_images=%s",
+            self.path,
+            self.stream,
+            self.requested_model,
+            self.max_tokens,
+            self.requested_max_tokens,
+            self.max_tokens_source,
+            self.max_tokens_floor_applied,
+            self.temperature,
+            temperature_source,
+            self.top_p,
+            self.repetition_penalty,
+            self.repetition_context_size,
+            self.reasoning_effort,
+            bool(request.images),
+        )
         session_loop_decision = (
             self.response_generator.session_loop_guard.decision(
                 self.response_generator.cli_args
@@ -4648,12 +4764,13 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_call_limit_reached = False
         reasoning_limit_reached = False
         reasoning_loop_guard_reached = False
+        output_loop_guard_reached = False
         loop_guard = TokenLoopGuard(
             self.response_generator.cli_args.loop_guard_ngram_size,
             self.response_generator.cli_args.loop_guard_repeats,
             self.response_generator.cli_args.loop_guard_min_tokens,
         )
-        reasoning_loop_guard = TextLoopGuard(
+        text_loop_guard = GenerationTextLoopGuard(
             reasoning_loop_guard_min_chars,
             reasoning_loop_guard_repeats,
             reasoning_loop_guard_max_span_chars,
@@ -4662,17 +4779,14 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             for gen in response:
                 logging.debug(gen.text)
-                reasoning_loop_decision = None
+                text_loop_decision = None
+                text_loop_state = None
 
                 # Collect the text according to our current state and state
                 # transitions. Reasoning or tool or normal text.
                 if gen.state == "reasoning":
                     reasoning_text += gen.text
                     session_reasoning_text += gen.text
-                    if reasoning_loop_guard.append(gen.text):
-                        reasoning_loop_decision = (
-                            reasoning_loop_guard.last_decision
-                        )
                 elif gen.state == "tool":
                     tool_text += gen.text
                 elif gen.state == "normal":
@@ -4683,6 +4797,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         made_tool_call = True
                     text += gen.text
                     session_text += gen.text
+                if text_loop_guard.append(gen.state, gen.text):
+                    text_loop_decision = text_loop_guard.last_decision
+                    text_loop_state = text_loop_guard.last_state
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -4711,30 +4828,34 @@ class APIHandler(BaseHTTPRequestHandler):
                     token_logprobs.append(gen.logprob)
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
-                if reasoning_loop_decision is not None:
-                    guard_message = _text_loop_guard_message(reasoning_loop_decision)
+                if text_loop_decision is not None:
                     logging.warning(
-                        "Stopping generation after detecting repeated reasoning "
-                        "text loop (span_chars=%s repeats=%s repeated_chars=%s "
+                        "Stopping generation after detecting repeated %s text "
+                        "loop (span_chars=%s repeats=%s repeated_chars=%s "
                         "generated_tokens=%s sample=%r)",
-                        reasoning_loop_decision.span_chars,
-                        reasoning_loop_decision.repeats,
-                        reasoning_loop_decision.repeated_chars,
+                        text_loop_state,
+                        text_loop_decision.span_chars,
+                        text_loop_decision.repeats,
+                        text_loop_decision.repeated_chars,
                         len(tokens),
-                        reasoning_loop_decision.sample,
+                        text_loop_decision.sample,
                     )
-                    text += guard_message
-                    session_text += guard_message
+                    if text_loop_state == "reasoning":
+                        guard_message = _text_loop_guard_message(text_loop_decision)
+                        text += guard_message
+                        session_text += guard_message
+                        reasoning_loop_guard_reached = True
+                    else:
+                        output_loop_guard_reached = True
                     finish_reason = "stop"
-                    reasoning_loop_guard_reached = True
                     ctx.stop()
                     break
                 if loop_guard.append(gen.token):
                     logging.warning(
                         "Stopping generation after detecting repeated token loop "
                         "(ngram_size=%s repeats=%s generated_tokens=%s)",
-                        loop_guard.ngram_size,
-                        loop_guard.repeats,
+                        loop_guard.last_ngram_size,
+                        loop_guard.last_repeat_count,
                         len(tokens),
                     )
                     finish_reason = "stop"
@@ -4822,7 +4943,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
                 "requested_max_tokens=%s max_tokens_floor_applied=%s "
                 "made_tool_call=%s tool_call_limit_reached=%s "
-                "reasoning_limit_reached=%s reasoning_loop_guard_reached=%s",
+                "reasoning_limit_reached=%s reasoning_loop_guard_reached=%s "
+                "output_loop_guard_reached=%s",
                 self.request_id,
                 len(ctx.prompt),
                 len(tokens),
@@ -4837,6 +4959,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 tool_call_limit_reached,
                 reasoning_limit_reached,
                 reasoning_loop_guard_reached,
+                output_loop_guard_reached,
             )
 
             if self.stream:
@@ -5168,12 +5291,13 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_call_limit_reached = False
         reasoning_limit_reached = False
         reasoning_loop_guard_reached = False
+        output_loop_guard_reached = False
         loop_guard = TokenLoopGuard(
             self.response_generator.cli_args.loop_guard_ngram_size,
             self.response_generator.cli_args.loop_guard_repeats,
             self.response_generator.cli_args.loop_guard_min_tokens,
         )
-        reasoning_loop_guard = TextLoopGuard(
+        text_loop_guard = GenerationTextLoopGuard(
             reasoning_loop_guard_min_chars,
             reasoning_loop_guard_repeats,
             reasoning_loop_guard_max_span_chars,
@@ -5224,8 +5348,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     logging.warning(
                         "Stopping generation after detecting repeated token loop "
                         "(ngram_size=%s repeats=%s generated_tokens=%s)",
-                        loop_guard.ngram_size,
-                        loop_guard.repeats,
+                        loop_guard.last_ngram_size,
+                        loop_guard.last_repeat_count,
                         len(tokens),
                     )
                     finish_reason = "stop"
@@ -5268,23 +5392,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 elif gen.state == "reasoning":
                     if gen.text:
                         reasoning_text += gen.text
-                        if reasoning_loop_guard.append(gen.text):
-                            reasoning_loop_decision = (
-                                reasoning_loop_guard.last_decision
-                            )
+                        if text_loop_guard.append(gen.state, gen.text):
+                            text_loop_decision = text_loop_guard.last_decision
                             guard_message = _text_loop_guard_message(
-                                reasoning_loop_decision
+                                text_loop_decision
                             )
                             logging.warning(
                                 "Stopping generation after detecting repeated "
                                 "reasoning text loop (span_chars=%s repeats=%s "
                                 "repeated_chars=%s generated_tokens=%s "
                                 "sample=%r)",
-                                reasoning_loop_decision.span_chars,
-                                reasoning_loop_decision.repeats,
-                                reasoning_loop_decision.repeated_chars,
+                                text_loop_decision.span_chars,
+                                text_loop_decision.repeats,
+                                text_loop_decision.repeated_chars,
                                 len(tokens),
-                                reasoning_loop_decision.sample,
+                                text_loop_decision.sample,
                             )
                             full_text += guard_message
                             if self.stream:
@@ -5316,6 +5438,23 @@ class APIHandler(BaseHTTPRequestHandler):
                         made_tool_call = True
                     if gen.text:
                         full_text += gen.text
+                        if text_loop_guard.append(gen.state, gen.text):
+                            text_loop_decision = text_loop_guard.last_decision
+                            logging.warning(
+                                "Stopping generation after detecting repeated "
+                                "normal text loop (span_chars=%s repeats=%s "
+                                "repeated_chars=%s generated_tokens=%s "
+                                "sample=%r)",
+                                text_loop_decision.span_chars,
+                                text_loop_decision.repeats,
+                                text_loop_decision.repeated_chars,
+                                len(tokens),
+                                text_loop_decision.sample,
+                            )
+                            finish_reason = "stop"
+                            output_loop_guard_reached = True
+                            ctx.stop()
+                            break
                         if self.stream:
                             if not stream_write(self._sse_event(
                                 "response.output_text.delta", {
@@ -5343,7 +5482,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "client_connected=%s max_tokens=%s max_tokens_source=%s "
                 "requested_max_tokens=%s max_tokens_floor_applied=%s "
                 "made_tool_call=%s tool_call_limit_reached=%s "
-                "reasoning_limit_reached=%s reasoning_loop_guard_reached=%s",
+                "reasoning_limit_reached=%s reasoning_loop_guard_reached=%s "
+                "output_loop_guard_reached=%s",
                 self.request_id,
                 len(ctx.prompt),
                 len(tokens),
@@ -5358,6 +5498,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 tool_call_limit_reached,
                 reasoning_limit_reached,
                 reasoning_loop_guard_reached,
+                output_loop_guard_reached,
             )
         finally:
             ctx.stop()
@@ -5787,6 +5928,25 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--vision-disable-thinking",
+        action="store_true",
+        help=(
+            "Disable the chat template's thinking preamble by default for "
+            "image requests. An explicit request reasoning_effort or "
+            "chat_template_kwargs thinking control takes precedence."
+        ),
+    )
+    parser.add_argument(
+        "--vision-temperature",
+        type=_nonnegative_float,
+        default=None,
+        help=(
+            "Default sampling temperature for image requests. An explicit "
+            "request temperature takes precedence. If omitted, image requests "
+            "use --temp."
+        ),
+    )
+    parser.add_argument(
         "--vision-allow-local-images",
         action="store_true",
         help=(
@@ -5935,8 +6095,9 @@ def setup_arg_parser():
         type=int,
         default=0,
         help=(
-            "Raise request max_tokens/max_completion_tokens below this value "
-            "to the floor. Use 0 to honor client limits (default: 0)."
+            "Raise an explicit request max_tokens/max_completion_tokens below "
+            "this value to the floor. Requests that omit a limit continue to "
+            "use --max-tokens. Use 0 to honor client limits (default: 0)."
         ),
     )
     parser.add_argument(
@@ -6019,9 +6180,9 @@ def setup_arg_parser():
         type=int,
         default=0,
         help=(
-            "Stop generation when reasoning text ends with a repeated "
-            "normalized span of at least this many characters. Use 0 to "
-            "disable (default: 0)."
+            "Stop generation when reasoning or visible assistant text ends "
+            "with a repeated normalized span of at least this many "
+            "characters. Use 0 to disable (default: 0)."
         ),
     )
     parser.add_argument(
@@ -6029,8 +6190,8 @@ def setup_arg_parser():
         type=int,
         default=4,
         help=(
-            "Number of consecutive repeated reasoning text spans needed by "
-            "the reasoning loop guard (default: 4)."
+            "Number of consecutive repeated text spans needed by the "
+            "in-response loop guard (default: 4)."
         ),
     )
     parser.add_argument(
@@ -6038,8 +6199,8 @@ def setup_arg_parser():
         type=int,
         default=2048,
         help=(
-            "Largest normalized text span length scanned by the reasoning "
-            "loop guard (default: 2048)."
+            "Largest normalized text span length scanned in reasoning and "
+            "visible assistant output (default: 2048)."
         ),
     )
     parser.add_argument(

@@ -116,6 +116,8 @@ layout used here, the MoonViT shard and preprocessor config are inferred:
 python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
   --vision-projector "$HOME/models/glm52-vision-projector" \
+  --vision-disable-thinking \
+  --vision-temperature 0 \
   --disable-batching \
   --host 127.0.0.1 \
   --port 8000
@@ -159,6 +161,17 @@ incorrect. Text-only requests retain the existing batching and checkpoint
 behavior. The server also caps only Vision prefill chunks at 16 tokens by
 default; use `--vision-prefill-step-size` to override that initial-support
 safety limit.
+
+For the tested Alis dynamic checkpoint,
+`--vision-disable-thinking --vision-temperature 0` is the recommended
+interactive-server setting. Text-only requests still use the normal
+chat-template reasoning and sampling defaults. Image requests can explicitly
+restore thinking with request-level `reasoning_effort` or
+`chat_template_kwargs.enable_thinking`; this is useful for diagnosis, but the
+model can repeat reasoning or emit an extra `</think>` after an otherwise
+complete answer. The server suppresses a duplicate closing control token and
+guards both reasoning and visible output loops. An explicit request
+`temperature` overrides the Vision-specific default.
 
 ## Initial limitations
 

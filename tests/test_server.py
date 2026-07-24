@@ -51,6 +51,7 @@ from mlx_lm.server import (
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
     DEFAULT_VISION_PREFILL_STEP_SIZE,
+    GenerationTextLoopGuard,
     GlobalSessionLoopGuard,
     LRUPromptCache,
     ModelProvider,
@@ -68,6 +69,7 @@ from mlx_lm.server import (
     _process_control_tokens,
     _redact_request_body_for_logging,
     _resolve_request_max_tokens,
+    _resolve_request_temperature,
     _run_http_server,
     configure_checkpoint_cache_dir,
     setup_arg_parser,
@@ -265,6 +267,47 @@ class TestProcessControlTokens(unittest.TestCase):
             ["tool", "tool", "tool", "normal", "normal"],
         )
 
+    @staticmethod
+    def _thinking_state_machine(initial_state):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._state_machine_cache = {}
+        tokenizer = types.SimpleNamespace(
+            has_thinking=True,
+            think_start_tokens=(10,),
+            think_end_tokens=(11,),
+            think_start="<think>",
+            think_end="</think>",
+            has_tool_calling=False,
+            eos_token_ids=(12,),
+            convert_ids_to_tokens=lambda token: str(token),
+            encode=lambda text, add_special_tokens=False: [ord(text[0])],
+        )
+        state_machine, _ = generator._make_state_machine(
+            "model",
+            tokenizer,
+            [],
+            initial_state=initial_state,
+        )
+        return state_machine
+
+    def test_think_end_transitions_reasoning_to_normal(self):
+        state_machine = self._thinking_state_machine("reasoning")
+        state = state_machine.make_state()
+
+        state, match, current = state_machine.match(state, 11)
+
+        self.assertEqual(match, (11,))
+        self.assertEqual(current, "normal")
+
+    def test_duplicate_think_end_stops_normal_output(self):
+        state_machine = self._thinking_state_machine("normal")
+        state = state_machine.make_state()
+
+        _, match, current = state_machine.match(state, 11)
+
+        self.assertEqual(match, (11,))
+        self.assertIsNone(current)
+
 
 class TestTokenLoopGuard(unittest.TestCase):
     def test_detects_exact_repeated_ngram(self):
@@ -286,6 +329,32 @@ class TestTokenLoopGuard(unittest.TestCase):
         guard = TokenLoopGuard(ngram_size=0, repeats=3, min_tokens=0)
 
         self.assertFalse(any(guard.append(t) for t in [1, 2, 3, 4] * 5))
+
+    def test_detects_non_power_of_two_period(self):
+        guard = TokenLoopGuard(ngram_size=64, repeats=3, min_tokens=256)
+        period = list(range(50))
+        results = [guard.append(t) for t in period * 6]
+
+        self.assertFalse(any(results[:255]))
+        self.assertTrue(any(results[255:]))
+        self.assertEqual(guard.last_ngram_size, 50)
+
+    def test_detects_short_period_after_minimum_length(self):
+        guard = TokenLoopGuard(ngram_size=64, repeats=3, min_tokens=256)
+        period = [11, 22, 33]
+        results = [guard.append(t) for t in period * 86]
+
+        self.assertFalse(any(results[:255]))
+        self.assertTrue(results[255])
+        self.assertEqual(guard.last_ngram_size, 3)
+        self.assertEqual(guard.last_repeat_count, 8)
+
+    def test_short_period_requires_a_full_baseline_window(self):
+        guard = TokenLoopGuard(ngram_size=64, repeats=3, min_tokens=256)
+        tokens = list(range(253)) + [999] * 3
+
+        self.assertFalse(any(guard.append(t) for t in tokens))
+        self.assertIsNone(guard.last_ngram_size)
 
 
 class TestTextLoopGuard(unittest.TestCase):
@@ -336,6 +405,174 @@ class TestTextLoopGuard(unittest.TestCase):
         self.assertTrue(guard.append(block))
         self.assertEqual(guard.last_decision.repeats, 4)
         self.assertIn("approval must already exist", guard.last_decision.sample)
+
+    def test_detects_unspaced_japanese_repeated_span(self):
+        guard = TextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+        )
+        span = (
+            "この画像は、多くのAIアシスタントや大規模言語モデルを比較した"
+            "ベンチマークチャートです。多くのモデルが含まれており、"
+            "多くのカテゴリーに分かれています。"
+        )
+        results = [guard.append(span) for _ in range(4)]
+
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+        self.assertEqual(guard.last_decision.repeats, 4)
+        self.assertGreaterEqual(guard.last_decision.span_chars, 60)
+
+
+class TestGenerationTextLoopGuard(unittest.TestCase):
+    def test_detects_visible_normal_output_loop(self):
+        guard = GenerationTextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+        )
+        span = (
+            "この画像は、多くのAIアシスタントや大規模言語モデルを比較した"
+            "ベンチマークチャートです。多くのモデルが含まれており、"
+            "多くのカテゴリーに分かれています。"
+        )
+        results = [guard.append("normal", span) for _ in range(4)]
+
+        self.assertFalse(any(results[:-1]))
+        self.assertTrue(results[-1])
+        self.assertEqual(guard.last_state, "normal")
+
+    def test_reasoning_and_normal_histories_are_isolated(self):
+        guard = GenerationTextLoopGuard(
+            min_chars=60,
+            repeats=4,
+            max_span_chars=512,
+            check_interval_chars=1,
+        )
+        span = (
+            "This repeated span is deliberately long enough to satisfy the "
+            "configured character threshold. "
+        )
+
+        for _ in range(2):
+            self.assertFalse(guard.append("reasoning", span))
+            self.assertFalse(guard.append("normal", span))
+
+        self.assertFalse(guard.append("tool", span * 4))
+        self.assertIsNone(guard.last_state)
+
+
+class TestInResponseTextLoopGuards(unittest.TestCase):
+    SPAN = (
+        "この画像は、多くのAIアシスタントや大規模言語モデルを比較した"
+        "ベンチマークチャートです。多くのモデルが含まれており、"
+        "多くのカテゴリーに分かれています。"
+    )
+
+    @classmethod
+    def _make_handler(cls, object_type):
+        args = setup_arg_parser().parse_args(
+            [
+                "--reasoning-loop-guard-min-chars",
+                "60",
+                "--reasoning-loop-guard-repeats",
+                "4",
+                "--reasoning-loop-guard-max-span-chars",
+                "512",
+            ]
+        )
+        ctx = types.SimpleNamespace(
+            prompt=[1, 2, 3],
+            prompt_cache_count=0,
+            tool_parser=None,
+            stop=mock.Mock(),
+        )
+        generated = iter(
+            Response(cls.SPAN, token, "normal", None, 0.0, None, ())
+            for token in range(4)
+        )
+        generator = types.SimpleNamespace(
+            cli_args=args,
+            generate=mock.Mock(return_value=(ctx, generated)),
+            session_loop_guard=GlobalSessionLoopGuard(),
+        )
+        handler = APIHandler.__new__(APIHandler)
+        handler.response_generator = generator
+        handler.wfile = io.BytesIO()
+        handler.headers = {}
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        for name, value in {
+            "request_id": "loop-test",
+            "system_fingerprint": None,
+            "object_type": object_type,
+            "created": 0,
+            "body": {},
+            "requested_model": "model",
+            "requested_draft_model": "draft",
+            "adapter": None,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "min_p": 0.0,
+            "xtc_probability": 0.0,
+            "xtc_threshold": 0.0,
+            "logit_bias": None,
+            "repetition_penalty": 0.0,
+            "repetition_context_size": 20,
+            "presence_penalty": 0.0,
+            "presence_context_size": 20,
+            "frequency_penalty": 0.0,
+            "frequency_context_size": 20,
+            "max_tokens": 512,
+            "max_tokens_source": "cli_default",
+            "requested_max_tokens": 512,
+            "max_tokens_floor_applied": False,
+            "num_draft_tokens": 0,
+            "logprobs": False,
+            "top_logprobs": 0,
+            "seed": None,
+            "chat_template_kwargs": None,
+            "reasoning_effort": None,
+            "stream": False,
+            "stream_options": None,
+        }.items():
+            setattr(handler, name, value)
+        return handler, ctx
+
+    def test_visible_normal_loop_stops_chat_completion(self):
+        handler, ctx = self._make_handler("chat.completion")
+
+        with self.assertLogs(level="WARNING") as captured:
+            handler.handle_completion(types.SimpleNamespace(tools=None), [])
+
+        response = json.loads(handler.wfile.getvalue())
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(response["choices"][0]["message"]["content"], self.SPAN * 4)
+        self.assertTrue(ctx.stop.called)
+        self.assertIn("repeated normal text loop", "\n".join(captured.output))
+
+    def test_visible_normal_loop_stops_responses(self):
+        handler, ctx = self._make_handler("response")
+
+        with self.assertLogs(level="WARNING") as captured:
+            handler.handle_responses_completion(
+                types.SimpleNamespace(tools=None),
+                [],
+            )
+
+        response = json.loads(handler.wfile.getvalue())
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(
+            response["output"][0]["content"][0]["text"],
+            self.SPAN * 4,
+        )
+        self.assertTrue(ctx.stop.called)
+        self.assertIn("repeated normal text loop", "\n".join(captured.output))
 
 
 class TestGlobalSessionLoopGuard(unittest.TestCase):
@@ -1553,6 +1790,74 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertEqual(template_kwargs["custom_flag"], "cli")
         self.assertEqual(cli_template_args, {"custom_flag": "cli"})
 
+    def test_vision_disable_thinking_applies_to_render_and_tokenize(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                chat_template_args={"reasoning_effort": "max"},
+                vision_disable_thinking=True,
+            )
+        )
+
+        class FakeChatTokenizer:
+            has_chat_template = True
+            has_tool_calling = False
+            has_thinking = False
+
+            def __init__(self):
+                self.calls = []
+
+            def apply_chat_template(
+                self,
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                **kwargs,
+            ):
+                self.calls.append(kwargs)
+                return [1, 2, 3] if tokenize else "rendered"
+
+        tokenizer = FakeChatTokenizer()
+        request = types.SimpleNamespace(
+            request_type="chat",
+            messages=[{"role": "user", "content": "describe"}],
+            tools=None,
+            role_mapping=None,
+            images=["data:image/png;base64,example"],
+        )
+        args = types.SimpleNamespace(
+            chat_template_kwargs=None,
+            reasoning_effort=None,
+        )
+
+        generator._render_prompt_text(tokenizer, request, args)
+        generator._tokenize(tokenizer, request, args)
+
+        self.assertEqual(len(tokenizer.calls), 2)
+        self.assertTrue(
+            all(call["enable_thinking"] is False for call in tokenizer.calls)
+        )
+
+    def test_explicit_request_thinking_overrides_vision_default(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                chat_template_args={"reasoning_effort": "max"},
+                vision_disable_thinking=True,
+            )
+        )
+
+        template_args = generator._chat_template_args(
+            types.SimpleNamespace(
+                chat_template_kwargs={"enable_thinking": True},
+                reasoning_effort="high",
+            ),
+            has_images=True,
+        )
+
+        self.assertTrue(template_args["enable_thinking"])
+        self.assertEqual(template_args["reasoning_effort"], "high")
+
     def test_rendered_checkpoint_uses_exact_as_cached_prefix(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
@@ -1875,6 +2180,93 @@ class TestRequestBodySafety(unittest.TestCase):
                 response = json.loads(handler.wfile.getvalue())
                 self.assertIn("requires an image URL", response["error"])
 
+    def test_vision_temperature_dispatch_for_chat_and_responses(self):
+        image_url = "data:image/png;base64,example"
+        cases = (
+            (
+                "/v1/chat/completions",
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": image_url}}
+                            ],
+                        }
+                    ]
+                },
+                "handle_completion",
+                0.0,
+            ),
+            (
+                "/v1/responses",
+                {
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_image", "image_url": image_url}
+                            ],
+                        }
+                    ]
+                },
+                "handle_responses_completion",
+                0.0,
+            ),
+            (
+                "/v1/chat/completions",
+                {
+                    "temperature": 0.7,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": image_url}}
+                            ],
+                        }
+                    ],
+                },
+                "handle_completion",
+                0.7,
+            ),
+            (
+                "/v1/responses",
+                {
+                    "temperature": 0.7,
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_image", "image_url": image_url}
+                            ],
+                        }
+                    ],
+                },
+                "handle_responses_completion",
+                0.7,
+            ),
+        )
+        for path, body, method_name, expected in cases:
+            with self.subTest(path=path, expected=expected):
+                handler = self._make_handler(
+                    json.dumps(body).encode(),
+                    path=path,
+                )
+                handler.response_generator.cli_args.temp = 1.0
+                handler.response_generator.cli_args.vision_temperature = 0.0
+                handler.response_generator.session_loop_guard = (
+                    GlobalSessionLoopGuard()
+                )
+                handler.handle_completion = mock.Mock()
+                handler.handle_responses_completion = mock.Mock()
+
+                handler.do_POST()
+
+                getattr(handler, method_name).assert_called_once()
+                self.assertEqual(handler.temperature, expected)
+
 
 class TestServerCLI(unittest.TestCase):
     def test_setup_arg_parser_accepts_kv_options(self):
@@ -1902,6 +2294,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertIsNone(args.vision_projector)
         self.assertIsNone(args.vision_moonvit)
         self.assertFalse(args.vision_allow_local_images)
+        self.assertFalse(args.vision_disable_thinking)
+        self.assertIsNone(args.vision_temperature)
         self.assertEqual(
             args.vision_prefill_step_size,
             DEFAULT_VISION_PREFILL_STEP_SIZE,
@@ -2029,6 +2423,9 @@ class TestServerCLI(unittest.TestCase):
                 "1234",
                 "--vision-prefill-step-size",
                 "8",
+                "--vision-disable-thinking",
+                "--vision-temperature",
+                "0",
             ]
         )
 
@@ -2037,6 +2434,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.vision_max_images, 2)
         self.assertEqual(args.vision_max_image_bytes, 1234)
         self.assertEqual(args.vision_prefill_step_size, 8)
+        self.assertTrue(args.vision_disable_thinking)
+        self.assertEqual(args.vision_temperature, 0.0)
 
         incomplete = setup_arg_parser().parse_args(
             ["--vision-moonvit", "/tmp/moonvit.safetensors"]
@@ -2066,13 +2465,15 @@ class TestServerCLI(unittest.TestCase):
             "--vision-max-image-pixels",
             "--vision-max-total-image-pixels",
             "--vision-prefill-step-size",
+            "--vision-temperature",
         ):
             with (
                 self.subTest(option=option),
                 mock.patch("sys.stderr", new=io.StringIO()),
                 self.assertRaises(SystemExit),
             ):
-                setup_arg_parser().parse_args([option, "0"])
+                invalid_value = "-0.1" if option == "--vision-temperature" else "0"
+                setup_arg_parser().parse_args([option, invalid_value])
 
     def test_setup_arg_parser_accepts_request_body_limit(self):
         args = setup_arg_parser().parse_args(
@@ -2193,6 +2594,58 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(source, "max_tokens")
         self.assertEqual(requested, 32000)
         self.assertTrue(floor_applied)
+
+    def test_resolve_request_max_tokens_does_not_floor_cli_default(self):
+        cli_args = types.SimpleNamespace(
+            max_tokens=512,
+            request_max_tokens_floor=384000,
+        )
+
+        max_tokens, source, requested, floor_applied = _resolve_request_max_tokens(
+            {},
+            cli_args,
+        )
+
+        self.assertEqual(max_tokens, 512)
+        self.assertEqual(source, "cli_default")
+        self.assertEqual(requested, 512)
+        self.assertFalse(floor_applied)
+
+    def test_resolve_request_temperature_uses_vision_default(self):
+        cli_args = types.SimpleNamespace(temp=1.0, vision_temperature=0.0)
+
+        temperature, source = _resolve_request_temperature(
+            {},
+            cli_args,
+            has_images=True,
+        )
+
+        self.assertEqual(temperature, 0.0)
+        self.assertEqual(source, "vision_default")
+
+    def test_resolve_request_temperature_preserves_text_default(self):
+        cli_args = types.SimpleNamespace(temp=1.0, vision_temperature=0.0)
+
+        temperature, source = _resolve_request_temperature(
+            {},
+            cli_args,
+            has_images=False,
+        )
+
+        self.assertEqual(temperature, 1.0)
+        self.assertEqual(source, "cli_default")
+
+    def test_explicit_request_temperature_overrides_vision_default(self):
+        cli_args = types.SimpleNamespace(temp=1.0, vision_temperature=0.0)
+
+        temperature, source = _resolve_request_temperature(
+            {"temperature": 0.7},
+            cli_args,
+            has_images=True,
+        )
+
+        self.assertEqual(temperature, 0.7)
+        self.assertEqual(source, "request")
 
     def test_setup_arg_parser_glm_dsa_adaptive_prefill_options(self):
         args = setup_arg_parser().parse_args(

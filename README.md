@@ -90,8 +90,8 @@ python -m mlx_lm server \
   --quantized-kv-start 4096 \
   --prefill-step-size 8192 \
   --prefill-max-qk-tokens 67108864 \
-  --repetition-penalty 1.05 \
-  --repetition-context-size 1024
+  --temp 1.0 \
+  --top-p 0.95
 ```
 
 The API base URL is:

@@ -37,15 +37,13 @@ python -m mlx_lm server \
   --checkpoint-async-save-backlog-limit 2 \
   --generation-shutdown-timeout 0 \
   --checkpoint-shutdown-save-limit 0 \
-  --request-max-tokens-floor 384000 \
+  --max-tokens 512 \
   --temp 1.0 \
   --top-p 0.95 \
   --chat-template-args '{"reasoning_effort":"max"}' \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
-  --repetition-penalty 1.05 \
-  --repetition-context-size 1024 \
   --loop-guard-ngram-size 64 \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256 \
@@ -67,7 +65,35 @@ needed. The normal single-model workflow loads the model from `--model`.
 ## Optional GLM-5.2 Vision attachment
 
 This fork's Vision path is validated against the same Alis model used above.
-If the downloaded projector directory contains:
+Download only the four files used by the MLX Vision path:
+
+```sh
+VISION_DIR="$HOME/models/glm52-vision-projector"
+mkdir -p "$VISION_DIR/moonvit"
+
+uvx --from huggingface-hub hf download \
+  baseten/GLM-5.2-Vision-NVFP4 \
+  config.json mm_projector.safetensors \
+  --local-dir "$VISION_DIR"
+
+uvx --from huggingface-hub hf download \
+  baseten/GLM-5.2-Vision-NVFP4 \
+  preprocessor_config.json \
+  --local-dir "$VISION_DIR/moonvit"
+
+uvx --from huggingface-hub hf download \
+  moonshotai/Kimi-K2.6 \
+  model-00064-of-000064.safetensors \
+  --local-dir "$VISION_DIR/moonvit"
+```
+
+Keep the filenames in each `hf download` command. Omitting them would select
+the repositories' full language-model checkpoints, which are not required.
+The Baseten `plugins/` directory and all other Kimi K2.6 weight shards are
+also unnecessary for this MLX implementation. The required download is about
+0.93 GB in total.
+
+The resulting directory should contain:
 
 ```text
 ~/models/glm52-vision-projector/
@@ -78,10 +104,12 @@ If the downloaded projector directory contains:
     └── preprocessor_config.json
 ```
 
-add one argument to the recommended server command:
+Add these arguments to the recommended server command:
 
 ```sh
---vision-projector "$HOME/models/glm52-vision-projector"
+--vision-projector "$HOME/models/glm52-vision-projector" \
+--vision-disable-thinking \
+--vision-temperature 0
 ```
 
 The server then accepts Chat Completions `image_url` parts and Responses API
@@ -89,6 +117,17 @@ The server then accepts Chat Completions `image_url` parts and Responses API
 fetching is deliberately unsupported; download remote images client-side and
 send a bounded data URL. Use `--vision-allow-local-images` only for trusted
 server-local paths.
+
+`--vision-disable-thinking --vision-temperature 0` is the validated OpenWebUI
+default for the Alis dynamic checkpoint. It avoids model-side failure modes
+observed with sampled image generation: repeated reasoning, a second
+`</think>` followed by a restarted answer, and short-period visible-output
+loops. Text-only requests keep the profile's normal reasoning and sampling
+defaults. A client can explicitly opt an image request back into thinking with
+`"reasoning_effort": "high"`/`"max"` or
+`"chat_template_kwargs": {"enable_thinking": true}`; the in-response loop
+guards remain active for that experimental path. An explicit request
+`temperature` overrides `--vision-temperature`.
 
 The defaults allow at most 8 images, 20 MiB and 40 million decoded pixels per
 image, and 64 million decoded pixels in total. These are configurable with
@@ -138,10 +177,16 @@ reuse disk prompt checkpoints and asynchronously save continued/delta
 checkpoints. See [Prompt checkpoints](prompt-checkpoints.md) for the save and
 invalidation rules.
 
-OpenCode can send a conservative `max_tokens` even when its configured output
-limit is higher. `--request-max-tokens-floor 384000` raises that request cap.
-Because an unclosed tool call could then run for a long time,
-`--tool-call-max-tokens 8192` bounds a single tool-call span.
+The profile keeps the server default at `--max-tokens 512`, which is also used
+when OpenWebUI omits `max_tokens`. `--request-max-tokens-floor` does not alter
+that server default; it only raises an explicit client-provided
+`max_tokens`/`max_completion_tokens`.
+
+OpenCode can send a conservative explicit `max_tokens` even when its configured
+output limit is higher. For that client only, add
+`--request-max-tokens-floor 384000`. Because the larger bound lets an unclosed
+tool call run for a long time, keep `--tool-call-max-tokens 8192` and the loop
+guards enabled. Do not add the floor to a general OpenWebUI profile.
 
 The recommended sampling defaults follow the GLM-5.2 guide:
 `temperature=1.0`, `top_p=0.95`, and `reasoning_effort=max` for complex agentic
@@ -159,15 +204,19 @@ accepts `"reasoning": {"effort": "high"}`. GLM-5.2 accepts `high` and `max`.
 
 ## Loop guards and progress
 
-The repetition penalty reduces the chance of a repeated-token loop.
 `--loop-guard-*` bounds the damage if an exact repeated token loop still
-occurs. It watches repeated 8/16/32/64-token windows after the configured
-minimum generation length. Set `--loop-guard-ngram-size 0` only for controlled
-diagnosis.
+occurs. With the recommended maximum of 64 it watches every repeated token
+period from 1 through 64 after the configured minimum generation length. Set
+`--loop-guard-ngram-size 0` only for controlled diagnosis. Periods shorter
+than 8 tokens require enough repeats to cover at least the same 24-token
+evidence window as the default 8-token/3-repeat guard.
 
-`--reasoning-loop-guard-*` detects repeated normalized reasoning spans that do
-not align with exact token n-grams. On detection, generation stops and returns
-a visible message asking the client to summarize state before continuing.
+`--reasoning-loop-guard-*` retains its historical name but now checks reasoning
+and visible assistant output independently. This catches repeated normalized
+text that does not align with exact token n-grams, including Japanese text
+whose sentences are not separated by spaces. A visible-output loop is stopped
+without injecting a guard message into the answer; a reasoning loop retains
+the visible recovery message.
 `--reasoning-max-tokens` is a separate hard fuse and defaults to disabled; it
 is intentionally omitted from the normal long-running profile.
 
