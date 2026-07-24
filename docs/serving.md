@@ -64,6 +64,62 @@ Use `--host 0.0.0.0` only when access from a trusted local network is required.
 Do not pass `--model-name` unless request-facing model aliasing is specifically
 needed. The normal single-model workflow loads the model from `--model`.
 
+## Optional GLM-5.2 Vision attachment
+
+This fork's Vision path is validated against the same Alis model used above.
+If the downloaded projector directory contains:
+
+```text
+~/models/glm52-vision-projector/
+├── config.json
+├── mm_projector.safetensors
+└── moonvit/
+    ├── model-00064-of-000064.safetensors
+    └── preprocessor_config.json
+```
+
+add one argument to the recommended server command:
+
+```sh
+--vision-projector "$HOME/models/glm52-vision-projector"
+```
+
+The server then accepts Chat Completions `image_url` parts and Responses API
+`input_image` parts. `data:image/...` URLs are enabled by default. HTTP(S)
+fetching is deliberately unsupported; download remote images client-side and
+send a bounded data URL. Use `--vision-allow-local-images` only for trusted
+server-local paths.
+
+The defaults allow at most 8 images, 20 MiB and 40 million decoded pixels per
+image, and 64 million decoded pixels in total. These are configurable with
+`--vision-max-images`, `--vision-max-image-bytes`,
+`--vision-max-image-pixels`, and `--vision-max-total-image-pixels`.
+The server also rejects request bodies larger than 256 MiB before reading them;
+adjust that independent ceiling with `--max-request-body-bytes`.
+
+The Alis tokenizer has the required exact mapping:
+`<|begin_of_image|>` = 154830, `<|image|>` = 154854, and
+`<|end_of_image|>` = 154831. Structured image parts are converted to these
+tokens before the repository's text-only chat template can emit its
+no-multimodal reminder.
+
+Vision requests use fresh KV caches and the sequential path, even if batching
+is enabled for text requests. Token-keyed RAM and disk prompt caches are not
+read or written for Vision because the same placeholder token sequence can
+represent different images. MTP speculative and draft-model generation are not
+supported for Vision requests.
+
+Architecture, file provenance, standalone inference, and request examples are
+documented in [GLM-5.2 Vision](../mlx_lm/GLM5V.md).
+
+Before starting the long-lived server for the first time, the documented
+standalone smoke command can cap the image to 128 merged tokens and report
+prefill progress. The Vision adapter materializes its output before Alis
+prefill, keeping the MoonViT and language-model graphs in separate Metal
+commands. Vision requests additionally default to 16-token prefill chunks
+through `--vision-prefill-step-size 16`; the larger text-only prefill setting
+above remains unchanged.
+
 ## Why these settings are used
 
 `--kv-bits 8` reduces the memory occupied by the GLM MLA cache. It is a

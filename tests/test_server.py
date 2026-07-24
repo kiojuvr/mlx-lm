@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import base64
 import http
 import io
 import json
@@ -15,7 +16,9 @@ from queue import Queue
 
 import mlx.core as mx
 import requests
+from PIL import Image
 
+from mlx_lm.glm5v import IMAGE_PLACEHOLDER
 from mlx_lm.models.cache import (
     KVCache,
     MTP_SPECULATIVE_PROMPT_CHECKPOINT_NAMESPACE,
@@ -34,6 +37,7 @@ from mlx_lm.models.cache import (
 from mlx_lm.server import (
     APIHandler,
     DEFAULT_GENERATION_SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
     DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT,
     DEFAULT_PROMPT_CHECKPOINT_BOUNDARY_ALIGN_TOKENS,
@@ -46,19 +50,23 @@ from mlx_lm.server import (
     DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_MAX_TOKENS,
     DEFAULT_PROMPT_CHECKPOINT_SHUTDOWN_SAVE_LIMIT,
+    DEFAULT_VISION_PREFILL_STEP_SIZE,
     GlobalSessionLoopGuard,
     LRUPromptCache,
+    ModelProvider,
     RenderedPromptCheckpoint,
     Response,
     ResponseGenerator,
     TextLoopGuard,
     TokenLoopGuard,
+    VisionRequestError,
     _prompt_checkpoint_boundary_store_length,
     _prompt_checkpoint_continued_frontier_args,
     _prompt_checkpoint_continued_store_length,
     _prompt_checkpoint_save_exact_for_prompt,
     _prompt_checkpoint_store_prefix_lengths,
     _process_control_tokens,
+    _redact_request_body_for_logging,
     _resolve_request_max_tokens,
     _run_http_server,
     configure_checkpoint_cache_dir,
@@ -1691,6 +1699,183 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         update_manifest.assert_not_called()
 
 
+class TestRequestBodySafety(unittest.TestCase):
+    @staticmethod
+    def _make_handler(
+        raw_body,
+        *,
+        path="/v1/chat/completions",
+        content_length=None,
+        max_request_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES,
+    ):
+        args = setup_arg_parser().parse_args([])
+        args.allowed_origins = ["*"]
+        args.max_request_body_bytes = max_request_body_bytes
+
+        handler = APIHandler.__new__(APIHandler)
+        handler.path = path
+        handler.headers = {
+            "Content-Length": (
+                str(len(raw_body)) if content_length is None else content_length
+            )
+        }
+        handler.rfile = io.BytesIO(raw_body)
+        handler.wfile = io.BytesIO()
+        handler.response_generator = types.SimpleNamespace(cli_args=args)
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        return handler
+
+    def test_oversize_body_is_rejected_before_read(self):
+        handler = self._make_handler(
+            b"",
+            content_length="9",
+            max_request_body_bytes=8,
+        )
+        handler.rfile = mock.Mock()
+        handler.rfile.read.side_effect = AssertionError(
+            "oversize request body must not be read"
+        )
+
+        handler.do_POST()
+
+        handler.rfile.read.assert_not_called()
+        handler.send_response.assert_called_once_with(413)
+        response = json.loads(handler.wfile.getvalue())
+        self.assertIn("limit is 8 bytes", response["error"])
+
+    def test_invalid_content_length_is_rejected_before_read(self):
+        for content_length in ("not-a-number", "-1"):
+            with self.subTest(content_length=content_length):
+                handler = self._make_handler(
+                    b"",
+                    content_length=content_length,
+                )
+                handler.rfile = mock.Mock()
+                handler.rfile.read.side_effect = AssertionError(
+                    "invalid Content-Length must not be read"
+                )
+
+                handler.do_POST()
+
+                handler.rfile.read.assert_not_called()
+                handler.send_response.assert_called_once_with(400)
+
+    def test_json_parse_failure_does_not_log_raw_body(self):
+        secret = "do-not-log-this-secret"
+        handler = self._make_handler(
+            ('{"secret":"' + secret + '"').encode(),
+        )
+
+        with self.assertLogs(level="WARNING") as captured:
+            handler.do_POST()
+
+        handler.send_response.assert_called_once_with(400)
+        self.assertNotIn(secret, "\n".join(captured.output))
+
+    def test_debug_redaction_removes_nested_image_sources(self):
+        secret = "data:image/png;base64,do-not-log-this-secret"
+        redacted = _redact_request_body_for_logging(
+            {
+                "messages": [
+                    {
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": secret}},
+                            {"type": "image", "image": secret},
+                            {"type": "text", "text": "keep this"},
+                        ]
+                    }
+                ]
+            }
+        )
+        rendered = json.dumps(redacted)
+        self.assertNotIn(secret, rendered)
+        self.assertIn("keep this", rendered)
+
+    def test_vision_generation_validation_error_returns_400(self):
+        args = setup_arg_parser().parse_args([])
+        generator = types.SimpleNamespace(
+            cli_args=args,
+            generate=mock.Mock(side_effect=VisionRequestError("invalid image")),
+        )
+        handler = APIHandler.__new__(APIHandler)
+        handler.response_generator = generator
+        handler.wfile = io.BytesIO()
+        handler.headers = {}
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        for name, value in {
+            "requested_model": "model",
+            "requested_draft_model": "draft",
+            "adapter": None,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "min_p": 0.0,
+            "xtc_probability": 0.0,
+            "xtc_threshold": 0.0,
+            "logit_bias": None,
+            "repetition_penalty": 0.0,
+            "repetition_context_size": 20,
+            "presence_penalty": 0.0,
+            "presence_context_size": 20,
+            "frequency_penalty": 0.0,
+            "frequency_context_size": 20,
+            "max_tokens": 1,
+            "num_draft_tokens": 0,
+            "logprobs": False,
+            "top_logprobs": 0,
+            "seed": None,
+            "chat_template_kwargs": None,
+            "reasoning_effort": None,
+            "stream": False,
+        }.items():
+            setattr(handler, name, value)
+
+        handler.handle_completion(types.SimpleNamespace(tools=None), [])
+
+        handler.send_response.assert_called_once_with(400)
+        self.assertEqual(
+            json.loads(handler.wfile.getvalue()),
+            {"error": "invalid image"},
+        )
+
+    def test_malformed_structured_image_returns_400(self):
+        requests = (
+            (
+                "/v1/chat/completions",
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {}}
+                            ],
+                        }
+                    ]
+                },
+            ),
+            (
+                "/v1/responses",
+                {"input": [{"type": "input_image"}]},
+            ),
+        )
+        for path, body in requests:
+            with self.subTest(path=path):
+                handler = self._make_handler(
+                    json.dumps(body).encode(),
+                    path=path,
+                )
+
+                handler.do_POST()
+
+                handler.send_response.assert_called_once_with(400)
+                response = json.loads(handler.wfile.getvalue())
+                self.assertIn("requires an image URL", response["error"])
+
+
 class TestServerCLI(unittest.TestCase):
     def test_setup_arg_parser_accepts_kv_options(self):
         args = setup_arg_parser().parse_args(
@@ -1714,6 +1899,17 @@ class TestServerCLI(unittest.TestCase):
         self.assertIsNone(args.kv_bits)
         self.assertEqual(args.kv_group_size, 64)
         self.assertEqual(args.quantized_kv_start, 0)
+        self.assertIsNone(args.vision_projector)
+        self.assertIsNone(args.vision_moonvit)
+        self.assertFalse(args.vision_allow_local_images)
+        self.assertEqual(
+            args.vision_prefill_step_size,
+            DEFAULT_VISION_PREFILL_STEP_SIZE,
+        )
+        self.assertEqual(
+            args.max_request_body_bytes,
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+        )
         self.assertFalse(args.disable_batching)
         self.assertFalse(args.mtp_speculative)
         self.assertEqual(args.mtp_adaptive_fallback_min_drafted_tokens, 8)
@@ -1819,6 +2015,125 @@ class TestServerCLI(unittest.TestCase):
         args = setup_arg_parser().parse_args(["--disable-batching"])
 
         self.assertTrue(args.disable_batching)
+
+    def test_setup_arg_parser_accepts_glm5v_options(self):
+        args = setup_arg_parser().parse_args(
+            [
+                "--vision-projector",
+                "/tmp/projector",
+                "--vision-moonvit",
+                "/tmp/moonvit.safetensors",
+                "--vision-max-images",
+                "2",
+                "--vision-max-image-bytes",
+                "1234",
+                "--vision-prefill-step-size",
+                "8",
+            ]
+        )
+
+        self.assertEqual(args.vision_projector, Path("/tmp/projector"))
+        self.assertEqual(args.vision_moonvit, Path("/tmp/moonvit.safetensors"))
+        self.assertEqual(args.vision_max_images, 2)
+        self.assertEqual(args.vision_max_image_bytes, 1234)
+        self.assertEqual(args.vision_prefill_step_size, 8)
+
+        incomplete = setup_arg_parser().parse_args(
+            ["--vision-moonvit", "/tmp/moonvit.safetensors"]
+        )
+        with self.assertRaisesRegex(ValueError, "requires --vision-projector"):
+            ModelProvider(incomplete)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moonvit = Path(tmpdir) / "moonvit.safetensors"
+            moonvit.touch()
+            provider = ModelProvider.__new__(ModelProvider)
+            provider.cli_args = types.SimpleNamespace(
+                vision_projector=Path(tmpdir) / "projector.safetensors",
+                vision_moonvit=moonvit,
+                vision_preprocessor_config=Path(tmpdir) / "missing.json",
+            )
+            provider.vision_adapter = None
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                "preprocessor config was not found",
+            ):
+                provider._load_vision_adapter(object(), object())
+
+        for option in (
+            "--vision-max-images",
+            "--vision-max-image-bytes",
+            "--vision-max-image-pixels",
+            "--vision-max-total-image-pixels",
+            "--vision-prefill-step-size",
+        ):
+            with (
+                self.subTest(option=option),
+                mock.patch("sys.stderr", new=io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                setup_arg_parser().parse_args([option, "0"])
+
+    def test_setup_arg_parser_accepts_request_body_limit(self):
+        args = setup_arg_parser().parse_args(
+            ["--max-request-body-bytes", "1234"]
+        )
+
+        self.assertEqual(args.max_request_body_bytes, 1234)
+
+        with (
+            mock.patch("sys.stderr", new=io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            setup_arg_parser().parse_args(["--max-request-body-bytes", "0"])
+
+    def test_openai_chat_and_responses_preserve_structured_images(self):
+        image_url = "data:image/png;base64,example"
+        handler = APIHandler.__new__(APIHandler)
+        handler.stream = False
+        handler.body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                    ],
+                }
+            ]
+        }
+        chat_request = handler.handle_chat_completions()
+        self.assertEqual(chat_request.images, [image_url])
+        self.assertEqual(
+            chat_request.messages[0]["content"][1]["text"],
+            IMAGE_PLACEHOLDER,
+        )
+
+        handler.body = {
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": image_url},
+                        {"type": "input_text", "text": "after"},
+                    ],
+                }
+            ]
+        }
+        responses_request = handler.handle_responses()
+        self.assertEqual(responses_request.images, [image_url])
+        self.assertEqual(
+            responses_request.messages[0]["content"][0]["text"],
+            IMAGE_PLACEHOLDER,
+        )
+        self.assertEqual(
+            responses_request.messages[0]["content"][1],
+            {"type": "text", "text": "after"},
+        )
 
     def test_setup_arg_parser_mtp_speculative(self):
         args = setup_arg_parser().parse_args(
@@ -2039,6 +2354,12 @@ class TestServerCLI(unittest.TestCase):
             model=object(),
         )
         self.assertTrue(generator._is_batchable(args))
+        self.assertFalse(
+            generator._is_batchable(
+                args,
+                types.SimpleNamespace(images=["data:image/png;base64,abc"]),
+            )
+        )
 
         generator.model_provider = types.SimpleNamespace(
             is_batchable=True,
@@ -2064,6 +2385,136 @@ class TestServerCLI(unittest.TestCase):
 
         generator.model_provider.cli_args.disable_batching = True
         self.assertFalse(generator._is_batchable(args))
+
+    def test_vision_single_request_uses_embeddings_and_never_token_cache(self):
+        image = Image.new("RGB", (1, 1), (1, 2, 3))
+        image_bytes = io.BytesIO()
+        image.save(image_bytes, format="PNG")
+        image_url = (
+            "data:image/png;base64,"
+            + base64.b64encode(image_bytes.getvalue()).decode()
+        )
+        embeddings = mx.ones((4, 8))
+
+        class FakeVisionAdapter:
+            def prepare(self, model, prompt, images):
+                self.images = images
+                return mx.array([1, 154854, 154854, 2]), embeddings
+
+        class NoTokenCache:
+            def fetch_nearest_cache(self, *args, **kwargs):
+                raise AssertionError("vision must not fetch a token-keyed cache")
+
+            def insert_cache(self, *args, **kwargs):
+                raise AssertionError("vision must not save a token-keyed cache")
+
+        class FakeStateMachine:
+            def make_state(self):
+                return "normal"
+
+            def match(self, state, token):
+                return state, None, "normal"
+
+        cli_args = setup_arg_parser().parse_args([])
+        adapter = FakeVisionAdapter()
+        tokenizer = types.SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+            eos_token_id=0,
+            encode=lambda text: [1],
+        )
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            model=object(),
+            tokenizer=tokenizer,
+            draft_model=None,
+            model_key=("model", None, None),
+            vision_adapter=adapter,
+            cli_args=cli_args,
+        )
+        generator.prompt_cache = NoTokenCache()
+        generator._log_cache_stats = lambda: None
+        generator._render_prompt_text = lambda *args: "rendered"
+        generator._load_rendered_prompt_checkpoint = lambda *args: (
+            (_ for _ in ()).throw(
+                AssertionError("vision must not load a rendered checkpoint")
+            )
+        )
+        generator._tokenize = lambda *args, **kwargs: (
+            [1, 154854, 2],
+            [[1, 154854, 2]],
+            ["user"],
+            "normal",
+            "rendered",
+        )
+        generator._make_state_machine = lambda *args, **kwargs: (
+            FakeStateMachine(),
+            {},
+        )
+
+        request = types.SimpleNamespace(images=[image_url])
+        args = types.SimpleNamespace(
+            seed=None,
+            stop_words=[],
+            max_tokens=1,
+            num_draft_tokens=3,
+            top_logprobs=0,
+            sampling=types.SimpleNamespace(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                xtc_probability=0.0,
+                xtc_threshold=0.0,
+            ),
+            logits=types.SimpleNamespace(
+                logit_bias=None,
+                repetition_penalty=0.0,
+                repetition_context_size=20,
+                presence_penalty=0.0,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
+            ),
+        )
+        captured = {}
+
+        def fake_stream_generate(**kwargs):
+            captured.update(kwargs)
+            yield types.SimpleNamespace(
+                finish_reason="length",
+                token=7,
+                text="x",
+                logprobs=mx.zeros((8,)),
+                from_draft=False,
+            )
+
+        rqueue = Queue()
+        with mock.patch(
+            "mlx_lm.server.make_prompt_cache",
+            return_value=["fresh-vision-cache"],
+        ), mock.patch("mlx_lm.server.stream_generate", fake_stream_generate):
+            generator._serve_single((rqueue, request, args))
+
+        queued = []
+        while not rqueue.empty():
+            queued.append(rqueue.get())
+        self.assertFalse(
+            any(isinstance(item, Exception) for item in queued),
+            queued,
+        )
+        self.assertEqual(adapter.images[0].size, (1, 1))
+        self.assertEqual(captured["prompt"], [1, 154854, 154854, 2])
+        self.assertIs(captured["input_embeddings"], embeddings)
+        self.assertEqual(captured["prompt_cache"], ["fresh-vision-cache"])
+        self.assertFalse(captured["prompt_checkpoint"])
+        self.assertEqual(captured["prompt_checkpoint_store_prefix_lengths"], [])
+        self.assertEqual(captured["prompt_checkpoint_initial_cached_tokens"], 0)
+        self.assertEqual(
+            captured["prefill_step_size"],
+            DEFAULT_VISION_PREFILL_STEP_SIZE,
+        )
 
     def test_single_request_passes_prompt_checkpoint_coexistence_args(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
@@ -2200,6 +2651,7 @@ class TestServerCLI(unittest.TestCase):
         self.assertFalse(captured["prompt_checkpoint_save_exact"])
         self.assertEqual(captured["prompt_checkpoint_frontier_min_tokens"], 0)
         self.assertEqual(captured["prompt_checkpoint_frontier_stride_tokens"], 0)
+        self.assertEqual(captured["prefill_step_size"], 2048)
         self.assertEqual(captured["prefill_max_qk_tokens"], 67_108_864)
         self.assertEqual(captured["glm_dsa_adaptive_prefill_step_size"], 8192)
         self.assertEqual(captured["glm_dsa_adaptive_prefill_after_tokens"], 4096)

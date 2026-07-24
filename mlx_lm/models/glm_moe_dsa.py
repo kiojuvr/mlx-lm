@@ -2898,22 +2898,30 @@ class GlmMoeDsaModel(DeepseekV32Model):
         x: mx.array,
         cache: Optional[Any] = None,
         return_pre_norm_hidden: bool = False,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
+        sequence_length = (
+            input_embeddings.shape[1] if input_embeddings is not None else x.shape[1]
+        )
         cache_offset = 0
         if cache is not None and cache[0] is not None:
             cache_offset = _scalar_int(cache[0][0].offset) or 0
         short_cached_decode = (
-            x.shape[1] <= _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS
+            sequence_length <= _MAX_QUANTIZED_SPARSE_VERIFY_TOKENS
             and cache_offset > 0
         )
         profile_token = _set_profile_scope(
             "decode"
-            if x.shape[1] == 1 or short_cached_decode
+            if sequence_length == 1 or short_cached_decode
             else None
         )
         profile_decode_total = profile_token is not None
         total_start = time.perf_counter() if profile_decode_total else None
-        h = self.embed_tokens(x)
+        h = (
+            self.embed_tokens(x)
+            if input_embeddings is None
+            else input_embeddings
+        )
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
@@ -3030,6 +3038,19 @@ class Model(DSV32Model):
         self.mtp = None
         if _mtp_enabled() and config.num_nextn_predict_layers > 0:
             self.mtp = GlmMoeDsaMTPPredictor(config)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
+    ):
+        out = self.model(
+            inputs,
+            cache,
+            input_embeddings=input_embeddings,
+        )
+        return self.lm_head(out)
 
     def forward_with_hidden(
         self,

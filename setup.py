@@ -77,6 +77,7 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "Pillow",
     ],
     packages=[
         "mlx_lm",

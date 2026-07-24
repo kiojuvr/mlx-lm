@@ -27,7 +27,6 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -49,6 +48,16 @@ from .generate import (
     _prompt_checkpoint_debug,
     model_supports_mtp_speculative,
     stream_generate,
+)
+from .glm5v import (
+    DEFAULT_MAX_IMAGE_BYTES,
+    DEFAULT_MAX_IMAGE_PIXELS,
+    DEFAULT_MAX_IMAGES,
+    DEFAULT_MAX_TOTAL_IMAGE_PIXELS,
+    DEFAULT_MOONVIT_SHARD,
+    GLM5VisionAdapter,
+    load_image_sources,
+    normalize_vision_messages,
 )
 from .models.cache import (
     DEFAULT_PROMPT_CHECKPOINT_MAX_AGE_SECONDS,
@@ -107,7 +116,37 @@ DEFAULT_PROMPT_CHECKPOINT_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 0.0
 DEFAULT_PROMPT_CHECKPOINT_ASYNC_SAVE_BACKLOG_LIMIT = 2
 DEFAULT_PROMPT_CHECKPOINT_PREFILL_FRONTIER_SAVE = "disabled"
 DEFAULT_PROMPT_CHECKPOINT_DELTA_CHUNK_TOKENS = 8192
+DEFAULT_MAX_REQUEST_BODY_BYTES = 256 * 1024 * 1024
+DEFAULT_VISION_PREFILL_STEP_SIZE = 16
 GLM52_REASONING_EFFORTS = ("high", "max")
+
+
+def _positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+class VisionRequestError(ValueError):
+    """An invalid client-supplied image that should produce HTTP 400."""
+
+
+def _redact_request_body_for_logging(value):
+    if isinstance(value, list):
+        return [_redact_request_body_for_logging(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    redacted = {}
+    for key, item in value.items():
+        if key in ("image", "image_url"):
+            redacted[key] = "<redacted>"
+        else:
+            redacted[key] = _redact_request_body_for_logging(item)
+    return redacted
 
 
 def _mtp_speculative_prompt_cache_key(model_key):
@@ -275,6 +314,7 @@ class CompletionRequest:
     messages: List[Any]
     tools: Optional[List[Any]]
     role_mapping: Optional[Dict[str, Any]]
+    images: Optional[List[str]] = None
 
 
 @dataclass
@@ -1033,7 +1073,13 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        self.vision_adapter = None
         self.is_batchable = False
+
+        vision_projector = getattr(cli_args, "vision_projector", None)
+        vision_moonvit = getattr(cli_args, "vision_moonvit", None)
+        if vision_moonvit and not vision_projector:
+            raise ValueError("--vision-moonvit requires --vision-projector.")
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -1041,6 +1087,8 @@ class ModelProvider:
             group if group.size() > 1 and not cli_args.pipeline else None
         )
         self.is_distributed = group.size() > 1
+        if vision_projector and self.is_distributed:
+            raise ValueError("Initial GLM5V server support is not distributed.")
 
         # Maps model and adapter paths the actual paths to be used. Used to
         # map 'default_model' to the provided model by cli argument but could
@@ -1056,6 +1104,62 @@ class ModelProvider:
         self._tokenizer_config = {"trust_remote_code": cli_args.trust_remote_code}
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
+
+    def _load_vision_adapter(self, model, tokenizer):
+        projector_arg = getattr(self.cli_args, "vision_projector", None)
+        if not projector_arg:
+            return None
+        if self.vision_adapter is None:
+            projector_path = Path(projector_arg).expanduser()
+            moonvit_arg = getattr(self.cli_args, "vision_moonvit", None)
+            if moonvit_arg:
+                moonvit_path = Path(moonvit_arg).expanduser()
+            else:
+                projector_dir = (
+                    projector_path if projector_path.is_dir() else projector_path.parent
+                )
+                moonvit_path = (
+                    projector_dir / "moonvit" / DEFAULT_MOONVIT_SHARD
+                )
+            if not moonvit_path.is_file():
+                raise FileNotFoundError(
+                    "MoonViT weights were not found at "
+                    f"{moonvit_path}. Pass --vision-moonvit explicitly."
+                )
+
+            preprocessor_arg = getattr(
+                self.cli_args, "vision_preprocessor_config", None
+            )
+            if preprocessor_arg:
+                preprocessor_path = Path(preprocessor_arg).expanduser()
+                if not preprocessor_path.is_file():
+                    raise FileNotFoundError(
+                        "Vision preprocessor config was not found at "
+                        f"{preprocessor_path}."
+                    )
+            else:
+                preprocessor_path = moonvit_path.parent / "preprocessor_config.json"
+                if not preprocessor_path.is_file():
+                    preprocessor_path = None
+
+            logging.info(
+                "Loading GLM5V adapter: projector=%s moonvit=%s",
+                projector_path,
+                moonvit_path,
+            )
+            config_path = (
+                None
+                if projector_path.is_dir()
+                else projector_path.parent / "config.json"
+            )
+            self.vision_adapter = GLM5VisionAdapter.from_pretrained(
+                projector_path,
+                moonvit_path,
+                config_path=config_path,
+                preprocessor_config_path=preprocessor_path,
+            )
+        self.vision_adapter.validate_model(model, tokenizer)
+        return self.vision_adapter
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
@@ -1100,6 +1204,7 @@ class ModelProvider:
                     os.environ.pop(GLM_DSA_MTP_ENV, None)
                 else:
                     os.environ[GLM_DSA_MTP_ENV] = old_mtp_env
+        self._load_vision_adapter(model, tokenizer)
         if mtp_speculative and not model_supports_mtp_speculative(model):
             raise ValueError(
                 "--mtp-speculative requires a GLM-5.2 checkpoint with native "
@@ -2814,10 +2919,12 @@ class ResponseGenerator:
 
         return sm, sequences
 
-    def _is_batchable(self, args):
+    def _is_batchable(self, args, request=None):
         if getattr(self.model_provider.cli_args, "disable_batching", False):
             return False
         if getattr(self.model_provider.cli_args, "mtp_speculative", False):
+            return False
+        if request is not None and getattr(request, "images", None):
             return False
         kv_bits = self.model_provider.cli_args.kv_bits
         kv_batchable = kv_bits is None or (
@@ -2839,7 +2946,6 @@ class ResponseGenerator:
         self.model_provider.load_default()
 
         current_model = None
-        current_sampling = None
         current_tokenizer = None
         current_model_key = None
         batch_generator = None
@@ -2876,7 +2982,7 @@ class ResponseGenerator:
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and self._is_batchable(args)
+                    and self._is_batchable(args, request)
                 ):
                     try:
                         prompt, segments, segment_types, initial_state = self._tokenize(
@@ -2888,7 +2994,7 @@ class ResponseGenerator:
 
                     sm, sequences = self._make_state_machine(
                         self.model_provider.model_key,
-                        tokenizer,
+                        current_tokenizer,
                         args.stop_words,
                         initial_state,
                     )
@@ -2908,9 +3014,9 @@ class ResponseGenerator:
                             break
 
                     ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        has_thinking=tokenizer.has_thinking,
-                        tool_parser=tokenizer.tool_parser,
+                        has_tool_calling=current_tokenizer.has_tool_calling,
+                        has_thinking=current_tokenizer.has_thinking,
+                        tool_parser=current_tokenizer.tool_parser,
                         sequences=sequences,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
@@ -2922,14 +3028,14 @@ class ResponseGenerator:
                         max_tokens=[args.max_tokens],
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
-                        samplers=[_make_sampler(args, tokenizer)],
+                        samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                         state_machines=[sm],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
-                        "detokenizer": tokenizer.detokenizer,
+                        "detokenizer": current_tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
                     }
@@ -2954,7 +3060,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    if not self._is_batchable(args, request):
                         self._serve_single((rqueue, request, args))
                         continue
 
@@ -2987,7 +3093,6 @@ class ResponseGenerator:
                 if len(batch_results) == 0:
                     if drain_batch:
                         current_model = None
-                        current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
                         batch_generator.close()
@@ -3075,10 +3180,15 @@ class ResponseGenerator:
         # Define the progress callback
         progress_started = False
         ctx = None
+        input_embeddings = None
 
         def progress(tokens_processed, tokens_total):
             nonlocal progress_started
-            if not progress_started and ctx is not None:
+            if (
+                input_embeddings is None
+                and not progress_started
+                and ctx is not None
+            ):
                 ctx.prompt_cache_count = max(ctx.prompt_cache_count, tokens_processed)
                 progress_started = True
             rqueue.put((tokens_processed, tokens_total))
@@ -3091,12 +3201,28 @@ class ResponseGenerator:
             mtp_speculative = bool(
                 getattr(self.model_provider.cli_args, "mtp_speculative", False)
             )
-
+            image_sources = getattr(request, "images", None) or []
+            vision_adapter = getattr(self.model_provider, "vision_adapter", None)
+            if image_sources and vision_adapter is None:
+                raise VisionRequestError(
+                    "This request contains images, but the server was not started "
+                    "with --vision-projector."
+                )
+            if image_sources and mtp_speculative:
+                raise VisionRequestError(
+                    "GLM5V does not support --mtp-speculative."
+                )
+            if image_sources and draft_model is not None:
+                raise VisionRequestError("GLM5V does not support --draft-model.")
             # Prepare the prompt and state machine
             rendered_prompt = self._render_prompt_text(tokenizer, request, args)
-            rendered_checkpoint = self._load_rendered_prompt_checkpoint(
-                tokenizer,
-                rendered_prompt,
+            rendered_checkpoint = (
+                None
+                if image_sources
+                else self._load_rendered_prompt_checkpoint(
+                    tokenizer,
+                    rendered_prompt,
+                )
             )
             if rendered_checkpoint is None:
                 tokenized = self._tokenize(
@@ -3120,6 +3246,46 @@ class ResponseGenerator:
                     segments = [prompt]
                     segment_types = ["system"]
                 initial_state = self._initial_state_from_prompt(tokenizer, prompt)
+            if image_sources:
+                try:
+                    images = load_image_sources(
+                        image_sources,
+                        max_bytes=getattr(
+                            self.cli_args,
+                            "vision_max_image_bytes",
+                            DEFAULT_MAX_IMAGE_BYTES,
+                        ),
+                        max_pixels=getattr(
+                            self.cli_args,
+                            "vision_max_image_pixels",
+                            DEFAULT_MAX_IMAGE_PIXELS,
+                        ),
+                        max_images=getattr(
+                            self.cli_args,
+                            "vision_max_images",
+                            DEFAULT_MAX_IMAGES,
+                        ),
+                        max_total_pixels=getattr(
+                            self.cli_args,
+                            "vision_max_total_image_pixels",
+                            DEFAULT_MAX_TOTAL_IMAGE_PIXELS,
+                        ),
+                        allow_local=getattr(
+                            self.cli_args,
+                            "vision_allow_local_images",
+                            False,
+                        ),
+                    )
+                except (OSError, ValueError) as error:
+                    raise VisionRequestError(str(error)) from error
+                prompt_array, input_embeddings = vision_adapter.prepare(
+                    model,
+                    prompt,
+                    images,
+                )
+                prompt = prompt_array.tolist()
+                segments = [prompt]
+                segment_types = ["vision"]
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -3150,7 +3316,12 @@ class ResponseGenerator:
             self._log_cache_stats()
             prompt_cache_source = "none"
             prompt_cache_model_key = self.model_provider.model_key
-            if mtp_speculative:
+            if input_embeddings is not None:
+                cache = make_prompt_cache(self.model_provider.model)
+                rest = prompt
+                ctx.prompt_cache_count = 0
+                prompt_cache_source = "vision-input-embeddings"
+            elif mtp_speculative:
                 prompt_cache_model_key = _mtp_speculative_prompt_cache_key(
                     self.model_provider.model_key
                 )
@@ -3204,7 +3375,7 @@ class ResponseGenerator:
                 cache = make_mtp_speculative_prompt_cache(self.model_provider.model)
 
             prompt_token_count = len(prompt)
-            if mtp_speculative:
+            if mtp_speculative or input_embeddings is not None:
                 checkpoint_prefix_lengths = []
                 checkpoint_frontier_min_tokens = 0
                 checkpoint_frontier_stride_tokens = 0
@@ -3255,6 +3426,8 @@ class ResponseGenerator:
                 sampler=sampler,
                 logits_processors=logits_processors,
                 prompt_cache=cache,
+                input_embeddings=input_embeddings,
+                prompt_checkpoint=input_embeddings is None,
                 draft_model=draft_model,
                 mtp_speculative=mtp_speculative,
                 mtp_speculative_stats=mtp_speculative_stats,
@@ -3274,7 +3447,14 @@ class ResponseGenerator:
                 ),
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
-                prefill_step_size=self.cli_args.prefill_step_size,
+                prefill_step_size=(
+                    min(
+                        self.cli_args.prefill_step_size,
+                        self.cli_args.vision_prefill_step_size,
+                    )
+                    if input_embeddings is not None
+                    else self.cli_args.prefill_step_size
+                ),
                 prefill_max_qk_tokens=self.cli_args.prefill_max_qk_tokens,
                 glm_dsa_adaptive_prefill_step_size=(
                     self.cli_args.glm_dsa_adaptive_prefill_step_size
@@ -3298,7 +3478,9 @@ class ResponseGenerator:
                 prompt_checkpoint_frontier_stride_tokens=(
                     checkpoint_frontier_stride_tokens
                 ),
-                prompt_checkpoint_rendered_prompt=rendered_prompt,
+                prompt_checkpoint_rendered_prompt=(
+                    None if input_embeddings is not None else rendered_prompt
+                ),
             ):
                 generated_token_at = time.perf_counter()
                 if first_generated_token_at is None:
@@ -3504,7 +3686,11 @@ class ResponseGenerator:
                     decode_profile_suffix,
                 )
 
-            if mtp_speculative:
+            if input_embeddings is not None:
+                _prompt_checkpoint_debug(
+                    "post response cache save skipped input_embeddings active"
+                )
+            elif mtp_speculative:
                 self._save_mtp_speculative_exact_prompt_checkpoint(
                     cache,
                     prompt[:prompt_token_count],
@@ -3706,6 +3892,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _send_json_error(self, status_code: int, message: str):
+        response = json.dumps({"error": message}).encode()
+        self._set_completion_headers(status_code)
+        self.send_header("Content-Length", str(len(response)))
+        if self._end_headers_safely():
+            self._write_response_bytes(response)
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
@@ -3731,35 +3924,60 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = self.headers.get("Content-Length")
         if content_length is None:
-            self._set_completion_headers(411)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Content-Length header is required"}).encode()
-            )
+            self._send_json_error(411, "Content-Length header is required")
             return
         try:
             content_length = int(content_length)
         except ValueError:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Invalid Content-Length header"}).encode()
-            )
+            self._send_json_error(400, "Invalid Content-Length header")
             return
-        raw_body = self.rfile.read(content_length)
-        try:
-            self.body = json.loads(raw_body.decode())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+        if content_length < 0:
+            self._send_json_error(400, "Invalid Content-Length header")
+            return
+
+        max_request_body_bytes = getattr(
+            self.response_generator.cli_args,
+            "max_request_body_bytes",
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+        )
+        if (
+            isinstance(max_request_body_bytes, bool)
+            or not isinstance(max_request_body_bytes, int)
+            or max_request_body_bytes <= 0
+        ):
+            logging.error(
+                "Invalid configured request body limit: %r",
+                max_request_body_bytes,
+            )
+            self._send_json_error(500, "Server request body limit is invalid")
+            return
+        if content_length > max_request_body_bytes:
+            self._send_json_error(
+                413,
+                (
+                    f"Request body contains {content_length} bytes; "
+                    f"limit is {max_request_body_bytes} bytes."
+                ),
             )
             return
 
+        raw_body = self.rfile.read(content_length)
+        try:
+            self.body = json.loads(raw_body.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            logging.warning(
+                "Invalid JSON request body (%d bytes): %s",
+                len(raw_body),
+                e,
+            )
+            self._send_json_error(400, f"Invalid JSON in request body: {e}")
+            return
+
         if logging.getLogger().isEnabledFor(logging.DEBUG):
-            debug_body = json.dumps(self.body, indent="\t")
+            debug_body = json.dumps(
+                _redact_request_body_for_logging(self.body),
+                indent="\t",
+            )
             logging.debug(f"Incoming Request Body: {debug_body}")
         if not isinstance(self.body, dict):
             debug_body = json.dumps(self.body, indent="\t")
@@ -3855,7 +4073,12 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        try:
+            request = request_factories[self.path]()
+        except (AssertionError, AttributeError, KeyError, TypeError, ValueError) as e:
+            logging.warning("Invalid request body: %s", e)
+            self._send_json_error(400, f"Invalid request body: {e}")
+            return
         session_loop_decision = (
             self.response_generator.session_loop_guard.decision(
                 self.response_generator.cli_args
@@ -4351,6 +4574,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
                 idle_callback=idle_callback,
             )
+        except VisionRequestError as e:
+            self._send_json_error(400, str(e))
+            return
         except Exception as e:
             self._set_completion_headers(404)
             if self._end_headers_safely():
@@ -4715,21 +4941,41 @@ class APIHandler(BaseHTTPRequestHandler):
                     item_type = item.get("type", "")
                     if item_type == "message":
                         content = item.get("content", "")
-                        if isinstance(content, list):
+                        has_image = isinstance(content, list) and any(
+                            isinstance(part, dict)
+                            and part.get("type")
+                            in ("image", "image_url", "input_image")
+                            for part in content
+                        )
+                        if isinstance(content, list) and not has_image:
                             parts = []
-                            for c in content:
-                                if isinstance(c, dict):
-                                    text = c.get("text", "")
+                            for part in content:
+                                if isinstance(part, dict):
+                                    text = part.get("text", "")
                                     if text:
                                         parts.append(text)
-                                elif isinstance(c, str):
-                                    parts.append(c)
+                                elif isinstance(part, str):
+                                    parts.append(part)
                             content = "\n".join(parts) if parts else ""
                         role = item.get("role", "user")
                         if role in ("developer", "system"):
+                            if isinstance(content, list):
+                                parts = []
+                                for part in content:
+                                    if isinstance(part, dict):
+                                        text = part.get("text", "")
+                                        if text:
+                                            parts.append(text)
+                                    elif isinstance(part, str):
+                                        parts.append(part)
+                                content = "\n".join(parts) if parts else ""
                             system_parts.append(content)
                             continue
                         non_system_messages.append({"role": role, "content": content})
+                    elif item_type in ("input_text", "input_image", "image_url"):
+                        non_system_messages.append(
+                            {"role": "user", "content": [item]}
+                        )
                     elif item_type == "function_call":
                         non_system_messages.append({
                             "role": "assistant",
@@ -4762,6 +5008,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if system_parts:
             messages.append({"role": "system", "content": "\n\n".join(system_parts)})
         messages.extend(non_system_messages)
+        messages, images = normalize_vision_messages(messages)
 
         # Convert Responses API tools to Chat Completions format and filter
         # unsupported types (web_search, image_generation, namespace, etc.)
@@ -4795,6 +5042,7 @@ class APIHandler(BaseHTTPRequestHandler):
             messages,
             raw_tools,
             body.get("role_mapping"),
+            images,
         )
 
     def handle_responses_completion(
@@ -4867,6 +5115,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
                 idle_callback=idle_callback,
             )
+        except VisionRequestError as e:
+            self._send_json_error(400, str(e))
+            return
         except Exception as e:
             import traceback
             logging.error(f"handle_responses_completion error: {e}")
@@ -5282,13 +5533,15 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
+        messages, images = normalize_vision_messages(body["messages"])
 
         return CompletionRequest(
             "chat",
             "",
-            body["messages"],
+            messages,
             body.get("tools") or None,
             body.get("role_mapping"),
+            images,
         )
 
     def handle_text_completions(self) -> CompletionRequest:
@@ -5468,6 +5721,80 @@ def setup_arg_parser():
         help="Optional path for the trained adapter weights and config.",
     )
     parser.add_argument(
+        "--vision-projector",
+        type=Path,
+        help=(
+            "Enable GLM-5.2 Vision with a projector directory (containing "
+            "config.json and mm_projector.safetensors) or projector file."
+        ),
+    )
+    parser.add_argument(
+        "--vision-moonvit",
+        type=Path,
+        help=(
+            "Kimi-K2.6 MoonViT safetensors shard. If omitted, infer "
+            f"moonvit/{DEFAULT_MOONVIT_SHARD} below the projector directory."
+        ),
+    )
+    parser.add_argument(
+        "--vision-preprocessor-config",
+        type=Path,
+        help=(
+            "Optional Kimi preprocessor_config.json. If omitted, use the file "
+            "next to the MoonViT shard when present."
+        ),
+    )
+    parser.add_argument(
+        "--vision-max-image-bytes",
+        type=_positive_int,
+        default=DEFAULT_MAX_IMAGE_BYTES,
+        help=(
+            "Maximum encoded bytes per image "
+            f"(default: {DEFAULT_MAX_IMAGE_BYTES})."
+        ),
+    )
+    parser.add_argument(
+        "--vision-max-image-pixels",
+        type=_positive_int,
+        default=DEFAULT_MAX_IMAGE_PIXELS,
+        help=(
+            "Maximum decoded pixels per image "
+            f"(default: {DEFAULT_MAX_IMAGE_PIXELS})."
+        ),
+    )
+    parser.add_argument(
+        "--vision-max-images",
+        type=_positive_int,
+        default=DEFAULT_MAX_IMAGES,
+        help=f"Maximum images per request (default: {DEFAULT_MAX_IMAGES}).",
+    )
+    parser.add_argument(
+        "--vision-max-total-image-pixels",
+        type=_positive_int,
+        default=DEFAULT_MAX_TOTAL_IMAGE_PIXELS,
+        help=(
+            "Maximum decoded pixels across one request "
+            f"(default: {DEFAULT_MAX_TOTAL_IMAGE_PIXELS})."
+        ),
+    )
+    parser.add_argument(
+        "--vision-prefill-step-size",
+        type=_positive_int,
+        default=DEFAULT_VISION_PREFILL_STEP_SIZE,
+        help=(
+            "Maximum prefill step size for GLM-5.2 Vision requests "
+            f"(default: {DEFAULT_VISION_PREFILL_STEP_SIZE})."
+        ),
+    )
+    parser.add_argument(
+        "--vision-allow-local-images",
+        action="store_true",
+        help=(
+            "Allow image_url to read server-local paths/file URLs. Disabled by "
+            "default; data:image URLs are always accepted."
+        ),
+    )
+    parser.add_argument(
         "--host",
         type=str,
         default="127.0.0.1",
@@ -5478,6 +5805,15 @@ def setup_arg_parser():
         type=int,
         default=8080,
         help="Port for the HTTP server (default: 8080)",
+    )
+    parser.add_argument(
+        "--max-request-body-bytes",
+        type=_positive_int,
+        default=DEFAULT_MAX_REQUEST_BODY_BYTES,
+        help=(
+            "Maximum request body size in bytes "
+            f"(default: {DEFAULT_MAX_REQUEST_BODY_BYTES})."
+        ),
     )
     parser.add_argument(
         "--allowed-origins",
