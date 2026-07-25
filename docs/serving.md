@@ -37,7 +37,7 @@ python -m mlx_lm server \
   --checkpoint-async-save-backlog-limit 2 \
   --generation-shutdown-timeout 0 \
   --checkpoint-shutdown-save-limit 0 \
-  --max-tokens 512 \
+  --max-tokens 67108864 \
   --temp 1.0 \
   --top-p 0.95 \
   --chat-template-args '{"reasoning_effort":"max"}' \
@@ -48,7 +48,7 @@ python -m mlx_lm server \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256 \
   --decode-progress-interval-tokens 512 \
-  --tool-call-max-tokens 65536 \
+  --tool-call-max-tokens 32768 \
   --reasoning-loop-guard-min-chars 60 \
   --reasoning-loop-guard-repeats 4 \
   --reasoning-loop-guard-max-span-chars 2048 \
