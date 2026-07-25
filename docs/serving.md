@@ -48,7 +48,7 @@ python -m mlx_lm server \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256 \
   --decode-progress-interval-tokens 512 \
-  --tool-call-max-tokens 8192 \
+  --tool-call-max-tokens 16384 \
   --reasoning-loop-guard-min-chars 60 \
   --reasoning-loop-guard-repeats 4 \
   --reasoning-loop-guard-max-span-chars 2048 \
