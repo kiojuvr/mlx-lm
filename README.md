@@ -22,7 +22,7 @@ The primary tested configuration is:
 
 * Apple Silicon Mac
 * Mac Studio M3 Ultra with 512 GB unified memory
-* MLX 0.31.2
+* MLX 0.32.0
 * CPython 3.13
 * [`avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw`](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw)
 
@@ -30,11 +30,10 @@ Smaller-memory systems may require a smaller model, shorter context, or differen
 
 ## Installation
 
-Clone the stable branch:
+Clone the fork's default branch:
 
 ```sh
-git clone --branch glm52-stable \
-  https://github.com/kiojuvr/mlx-lm.git
+git clone https://github.com/kiojuvr/mlx-lm.git
 
 cd mlx-lm
 ```
@@ -51,7 +50,7 @@ Install the known-good runtime versions:
 
 ```sh
 uv pip install \
-  mlx==0.31.2 \
+  mlx==0.32.0 \
   transformers==5.12.1 \
   safetensors==0.8.0 \
   numpy==2.4.6 \
@@ -123,6 +122,8 @@ Prompt checkpoints are stored under:
 ```
 
 Use an empty cache directory after changing model weights, tokenizer files, adapters, quantization, GLM implementation details, or KV-cache settings.
+Checkpoints also record the exact MLX version; an MLX upgrade automatically
+turns older entries into cache misses so they are regenerated safely.
 
 See [Prompt checkpoints](docs/prompt-checkpoints.md) for validation, retention, and invalidation rules.
 
@@ -160,7 +161,8 @@ See [Serving GLM-5.2](docs/serving.md) for an OpenCode provider configuration an
 * The DSA Indexer cache intentionally remains floating point.
 * Native kernels support only specific GLM-5.2 shapes and quantization layouts.
 * MTP speculative decoding remains experimental.
-* Prompt checkpoints must be invalidated after incompatible model or runtime changes.
+* Prompt checkpoints must be invalidated after incompatible model or runtime
+  changes not already covered by the automatic MLX-version check.
 
 ## Upstream project
 

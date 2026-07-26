@@ -8,18 +8,22 @@ changing oMLX repository.
 
 Vendored source:
 
-- Repository: `/Volumes/USB-SSD-2/omlx`
+- Source project: oMLX
 - Commit observed during vendoring: `eca4a7c`
 - Source path: `omlx/custom_kernels/glm_moe_dsa`
 - License: Apache-2.0; see `LICENSE` in this directory.
 
-Build with:
+From the repository root, build with:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 MLX_LM_WITH_CUSTOM_KERNEL=1 \
-uv pip install --python /Users/kioju/.venvs/mlx-glm52/bin/python --no-deps -e .
+uv pip install --python .venv/bin/python --no-deps -e .
 ```
+
+The build requires MLX 0.32.0 and nanobind 2.13.0. See
+[Native GLM Kernels](../../../docs/native-kernels.md) for Xcode selection,
+Metal Toolchain verification, and the full build and smoke-test procedure.
 
 The CMake target still emits an `omlx_glm_kernels.metallib` file name because
 the vendored C++ sources look up that library name internally.

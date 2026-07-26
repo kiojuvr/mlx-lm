@@ -16,13 +16,14 @@ longest-common-prefix reuse, not fuzzy matching.
   very long conversations.
 * Disabled checkpointing reports `checkpoint_resolution=disabled`,
   `disk_cached_tokens=0`, and performs a full fresh prefill.
-* Token mismatches, incompatible GLM DSA metadata, incompatible GLM MLA KV
-  settings, malformed checkpoints, and missing files become normal misses.
+* Token mismatches, a different MLX version, incompatible GLM DSA metadata,
+  incompatible GLM MLA KV settings, malformed checkpoints, and missing files
+  become normal misses.
 
 Prompt checkpointing validates token prefixes, cache structure, GLM DSA
-metadata, and GLM MLA KV settings. It does not prove complete model-weight,
-tokenizer, adapter, or artifact identity. Treat it as a single-model local
-cache.
+metadata, GLM MLA KV settings, and the exact MLX version. It does not prove
+complete model-weight, tokenizer, adapter, or artifact identity. Treat it as a
+single-model local cache.
 
 ## Cache location
 
@@ -59,6 +60,10 @@ Use an empty checkpoint directory after changing any of the following:
 * quantization
 * GLM implementation details
 * KV-cache quantization or layout settings
+
+An MLX version change does not require manual deletion. Older checkpoints fail
+the version check, become normal cache misses, and are replaced after fresh
+prefill.
 
 To preserve the old cache for diagnosis, move the shared root:
 

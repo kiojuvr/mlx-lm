@@ -37,6 +37,7 @@ from mlx_lm.models.cache import (
     PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY,
     PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY,
     PROMPT_CHECKPOINT_LCP_BLOCK_TOKENS_METADATA_KEY,
+    PROMPT_CHECKPOINT_MLX_VERSION_METADATA_KEY,
     PROMPT_CHECKPOINT_RENDERED_PREFIX_BYTES_METADATA_KEY,
     PROMPT_CHECKPOINT_RENDERED_PREFIX_HASH_METADATA_KEY,
     PROMPT_CHECKPOINT_CACHE_DIR_ENV,
@@ -447,6 +448,31 @@ class TestPromptCacheCheckpoint(unittest.TestCase):
         save_prompt_cache(bad_file, wrong_cache, metadata)
 
         with self.assertRaises(PromptCacheCheckpointError):
+            load_prompt_checkpoint(
+                bad_file,
+                model_id="toy-model",
+                prefix_tokens=[1, 2, 3, 4],
+            )
+
+    def test_checkpoint_rejects_mismatched_mlx_version(self):
+        cache = self._filled_kv_cache()
+        cache_file = os.path.join(self.test_dir, "checkpoint.safetensors")
+        save_prompt_checkpoint(
+            cache_file,
+            cache,
+            model_id="toy-model",
+            prefix_tokens=[1, 2, 3, 4],
+        )
+
+        loaded_cache, metadata = load_prompt_cache(
+            cache_file,
+            return_metadata=True,
+        )
+        metadata[PROMPT_CHECKPOINT_MLX_VERSION_METADATA_KEY] = "0.31.2"
+        bad_file = os.path.join(self.test_dir, "old_mlx_checkpoint.safetensors")
+        save_prompt_cache(bad_file, loaded_cache, metadata)
+
+        with self.assertRaisesRegex(PromptCacheCheckpointError, "MLX version"):
             load_prompt_checkpoint(
                 bad_file,
                 model_id="toy-model",

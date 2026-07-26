@@ -11,7 +11,8 @@ sys.path.append(str(package_dir))
 
 from _version import __version__
 
-MIN_MLX_VERSION = "0.31.2"
+MIN_MLX_VERSION = "0.32.0"
+NANOBIND_VERSION = "2.13.0"
 CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
 TRUTHY = {"1", "true", "yes", "on"}
 DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
@@ -40,10 +41,15 @@ def _custom_kernel_build_kwargs() -> dict:
     )
     os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", target)
     cmake_args = os.environ.get("CMAKE_ARGS", "").strip()
+    extra_cmake_args = []
     if "CMAKE_OSX_DEPLOYMENT_TARGET" not in cmake_args:
-        target_arg = f"-DCMAKE_OSX_DEPLOYMENT_TARGET={target}"
+        extra_cmake_args.append(f"-DCMAKE_OSX_DEPLOYMENT_TARGET={target}")
+    if "Python_EXECUTABLE" not in cmake_args:
+        extra_cmake_args.append(f"-DPython_EXECUTABLE={sys.executable}")
+    if extra_cmake_args:
+        appended_args = " ".join(extra_cmake_args)
         os.environ["CMAKE_ARGS"] = (
-            f"{cmake_args} {target_arg}".strip() if cmake_args else target_arg
+            f"{cmake_args} {appended_args}".strip() if cmake_args else appended_args
         )
 
     from mlx import extension
@@ -103,7 +109,7 @@ setup(
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
-        "custom-kernel": ["cmake>=3.27", "nanobind==2.12.0"],
+        "custom-kernel": ["cmake>=3.27", f"nanobind=={NANOBIND_VERSION}"],
         "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],
         "cuda12": [f"mlx[cuda12]>={MIN_MLX_VERSION}"],
         "cpu": [f"mlx[cpu]>={MIN_MLX_VERSION}"],

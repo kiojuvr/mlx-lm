@@ -34,9 +34,9 @@ generation complete: prompt_tokens=44417 generated_tokens=5041 decode_seconds=32
 These numbers are historical target-only baselines unless a row is explicitly
 marked MTP. Use fresh benchmark runs for current performance comparisons.
 
-## Current 199.8K OpenCode serving snapshot
+## July 24–25, 2026 199.8K OpenCode serving snapshot
 
-A July 24–25, 2026 production-style OpenCode task exercised the current
+A July 24–25, 2026 production-style OpenCode task exercised the then-current
 `glm52-vision-projector` branch on the same single-device M3 Ultra 512 GB Mac
 Studio and `avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw`. The server used MLX 0.31.2,
 an int8 GLM MLA KV cache, native sparse MLA over quantized KV,
@@ -104,8 +104,8 @@ This fork now includes a lightweight prefill benchmark:
 
 ```sh
 uv run \
-  --python /opt/homebrew/bin/python3.12 \
-  --with 'mlx>=0.31.2' --with numpy --with 'transformers>=5.7.0' \
+  --python 3.13 \
+  --with 'mlx>=0.32.0' --with numpy --with 'transformers>=5.7.0' \
   --with sentencepiece --with protobuf --with pyyaml --with jinja2 \
   --with huggingface_hub \
   python benchmarks/glm52_prefill_benchmark.py \
@@ -1060,7 +1060,7 @@ python -m mlx_lm server \
   --prefill-step-size 8192 \
   --prefill-max-qk-tokens 67108864 \
   --glm-dsa-adaptive-prefill-step-size 0 \
-  --checkpoint-cache-dir /Volumes/USB-SSD-2/mlx-lm-glm52-local/prompt-checkpoints \
+  --checkpoint-cache-dir "$HOME/.cache/mlx-lm/glm52-local/prompt-checkpoints" \
   --checkpoint-min-tokens 512 \
   --checkpoint-cold-max-tokens 30000 \
   --checkpoint-boundary-trim-tokens 32 \

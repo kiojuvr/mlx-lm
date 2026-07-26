@@ -10,47 +10,68 @@ GLM custom kernels; see the license and README in that directory.
 
 ## Build requirements
 
-Install full Xcode, not only Command Line Tools. Xcode 26 may also require the
-separate Metal Toolchain component:
+Install full Xcode, not only Command Line Tools. First confirm that the active
+developer directory points to Xcode:
 
 ```sh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcode-select -p
+xcodebuild -version
+```
+
+If `xcode-select -p` reports `/Library/Developer/CommandLineTools`, select the
+full Xcode installation and clear the `xcrun` cache:
+
+```sh
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+xcrun --kill-cache
+```
+
+Xcode 26 may also require the separate Metal Toolchain component. Check its
+status before downloading it:
+
+```sh
+xcodebuild -showComponent MetalToolchain
+```
+
+If the status is not `installed`, download it:
+
+```sh
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-Xcode 26.6 may leave the installed Metal Toolchain unselected and invoke the
-stub in `XcodeDefault.xctoolchain`. The known-good local Xcode 26.6 toolchain
-was `com.apple.dt.toolchain.Metal.32023.883`. Confirm the selected compiler:
+Clear the tool lookup cache and verify both the selected path and compiler:
 
 ```sh
-TOOLCHAINS=com.apple.dt.toolchain.Metal.32023.883 \
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcrun --kill-cache
+xcrun --find metal
 xcrun metal --version
 ```
 
-The build requires MLX 0.31.2, CMake 3.27 or newer, nanobind 2.12.0, and
+The build requires MLX 0.32.0, CMake 3.27 or newer, nanobind 2.13.0, and
 wheel/setuptools in the isolated build environment. The `pyproject.toml`
 build-system section pins these dependencies.
 
 Build the editable checkout:
 
 ```sh
-TOOLCHAINS=com.apple.dt.toolchain.Metal.32023.883 \
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 MLX_LM_WITH_CUSTOM_KERNEL=1 \
 uv pip install --python .venv/bin/python --no-deps -e .
 ```
 
-The toolchain identifier is Xcode-installation-specific. If it is unavailable,
-select the installed Metal toolchain reported by Xcode rather than copying the
-identifier blindly.
+If `xcrun metal --version` still invokes the Xcode stub, prefix the verification
+and build commands with the toolchain identifier reported by
+`xcodebuild -showComponent MetalToolchain`, for example
+`TOOLCHAINS=com.apple.dt.toolchain.Metal.32023.883`. The identifier is
+installation-specific; do not copy the example without checking the local
+component report.
 
 ## Verification
 
 Verify that the extension is visible:
 
 ```sh
-python - <<'PY'
+.venv/bin/python - <<'PY'
 from mlx_lm.models import glm_moe_dsa
 print(glm_moe_dsa.get_glm_dsa_native_sparse_prefill_status())
 PY
@@ -66,7 +87,7 @@ source='mlx_lm.custom_kernels.glm_moe_dsa'
 Run the model-free arithmetic smoke test:
 
 ```sh
-python benchmarks/glm52_prefill_benchmark.py \
+.venv/bin/python benchmarks/glm52_prefill_benchmark.py \
   --mode native-smoke \
   --json-output glm52-native-smoke.json
 ```

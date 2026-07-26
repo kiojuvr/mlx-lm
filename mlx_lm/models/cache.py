@@ -62,6 +62,7 @@ PROMPT_CHECKPOINT_DELTA_CACHE_TOKENS_METADATA_KEY = (
 )
 PROMPT_CHECKPOINT_CACHE_LAYOUT_METADATA_KEY = "checkpoint_cache_layout"
 PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY = "checkpoint_cache_layout_hash"
+PROMPT_CHECKPOINT_MLX_VERSION_METADATA_KEY = "checkpoint_mlx_version"
 PROMPT_CHECKPOINT_LCP_BLOCK_HASH_METADATA_KEY = "checkpoint_lcp_block_hash"
 PROMPT_CHECKPOINT_LCP_BLOCK_HASH_ALGO_METADATA_KEY = "checkpoint_lcp_block_hash_algo"
 PROMPT_CHECKPOINT_LCP_BLOCK_SIZE_METADATA_KEY = "checkpoint_lcp_block_size"
@@ -88,6 +89,7 @@ _CHECKPOINT_REQUIRED_METADATA_KEYS = (
     "checkpoint_prefix_length",
     "checkpoint_cache_signature_hash",
     "checkpoint_cache_signature",
+    PROMPT_CHECKPOINT_MLX_VERSION_METADATA_KEY,
     "checkpoint_model_hint_metadata",
     "checkpoint_tokenizer_hint_metadata",
     "checkpoint_glm_dsa_metadata",
@@ -2061,6 +2063,7 @@ def build_prompt_cache_checkpoint_metadata(
         "checkpoint_prefix_length": str(len(prefix)),
         "checkpoint_cache_signature_hash": _json_hash(cache_signature),
         "checkpoint_cache_signature": _json_dumps(cache_signature),
+        PROMPT_CHECKPOINT_MLX_VERSION_METADATA_KEY: str(mx.__version__),
         PROMPT_CHECKPOINT_CACHE_LAYOUT_HASH_METADATA_KEY: _json_hash(
             cache_layout_signature
         ),
@@ -2176,6 +2179,11 @@ def _validate_checkpoint_metadata(
         != PROMPT_CACHE_CHECKPOINT_VERSION
     ):
         raise PromptCacheCheckpointError("unsupported checkpoint version")
+    if (
+        _require_metadata(metadata, PROMPT_CHECKPOINT_MLX_VERSION_METADATA_KEY)
+        != str(mx.__version__)
+    ):
+        raise PromptCacheCheckpointError("checkpoint MLX version does not match")
     if _require_metadata(metadata, "checkpoint_namespace") != checkpoint_namespace:
         raise PromptCacheCheckpointError("checkpoint namespace does not match")
     if _require_metadata(metadata, "checkpoint_model_hint") != model_id:
