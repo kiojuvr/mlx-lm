@@ -10,8 +10,8 @@ The following profile favors repeated-prefix latency for long-running coding
 agents. Set `MODEL` and `CHECKPOINT_DIR` to local paths before starting it.
 
 ```sh
-export MODEL="$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"
-export CHECKPOINT_DIR="$HOME/.cache/mlx-lm/glm52-local/prompt-checkpoints"
+export MODEL="$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw"
+export CHECKPOINT_DIR="$HOME/.cache/mlx-lm/glm52-45bpw/prompt-checkpoints"
 
 MLX_LM_PROMPT_CHECKPOINT_DEBUG=1 \
 MLX_METAL_FAST_SYNCH=1 \
@@ -37,13 +37,11 @@ python -m mlx_lm server \
   --checkpoint-async-save-backlog-limit 2 \
   --generation-shutdown-timeout 0 \
   --checkpoint-shutdown-save-limit 0 \
-  --max-tokens 67108864 \
-  --temp 1.0 \
-  --top-p 0.95 \
   --chat-template-args '{"reasoning_effort":"max"}' \
   --prompt-concurrency 1 \
   --decode-concurrency 1 \
   --disable-batching \
+  --cancel-active-on-new-request \
   --loop-guard-ngram-size 64 \
   --loop-guard-repeats 3 \
   --loop-guard-min-tokens 256 \
@@ -62,9 +60,18 @@ Use `--host 0.0.0.0` only when access from a trusted local network is required.
 Do not pass `--model-name` unless request-facing model aliasing is specifically
 needed. The normal single-model workflow loads the model from `--model`.
 
+The separate `glm52-45bpw` checkpoint directory is intentional. Prompt
+checkpoint metadata does not prove complete model-weight identity, so a cache
+created by the 3.5 bpw checkpoint must not be reused after this migration.
+Keeping the former `glm52-local` directory untouched preserves it for
+diagnosis or rollback.
+
 ## Optional GLM-5.2 Vision attachment
 
-This fork's Vision path is validated against the same Alis model used above.
+This fork's Vision path uses the same Alis model selected above. The 4.5 bpw
+checkpoint retains the architecture and tokenizer artifacts used by the
+validated 3.5 bpw Vision integration; rerun the standalone smoke command below
+after migrating the language model.
 Download only the four files used by the MLX Vision path:
 
 ```sh
@@ -166,6 +173,17 @@ above remains unchanged.
 long-context memory optimization, not a prefill-compute speedup. The DSA
 Indexer cache is independent and intentionally remains floating point.
 
+The 4.5 bpw weights use about 424 GB (395 GiB) and leave less KV-cache
+headroom than the former 3.5 bpw profile. On a 512 GB M3 Ultra, treat about
+500K total tokens as the normal operating budget and about 600K as the
+upper edge. Use the 3.5 bpw checkpoint when a roughly 1M-token context is more
+important than the 4.5 bpw quality improvement.
+
+The routed experts are NVFP4 (`mode="nvfp4"`, group size 16). The optional
+affine 2/3-bit gate/up fusion therefore does not engage for these experts and
+correctly falls back to MLX `gather_qmm`; the native weighted reduction remains
+applicable. Attention projections remain 4-bit affine.
+
 The measured cold-prefill profile favors `--prefill-step-size 8192`,
 `--prefill-max-qk-tokens 67108864`, and
 `--glm-dsa-adaptive-prefill-step-size 0`. The QK cap shrinks later chunks as
@@ -178,10 +196,26 @@ reuse disk prompt checkpoints and asynchronously save continued/delta
 checkpoints. See [Prompt checkpoints](prompt-checkpoints.md) for the save and
 invalidation rules.
 
-The profile keeps the server default at `--max-tokens 512`, which is also used
-when OpenWebUI omits `max_tokens`. `--request-max-tokens-floor` does not alter
-that server default; it only raises an explicit client-provided
-`max_tokens`/`max_completion_tokens`.
+`--cancel-active-on-new-request` gives this single-user profile
+Vision-only last-request-wins behavior. If a browser stops an Open WebUI Vision
+response but the Open WebUI proxy keeps its upstream MLX connection open, the
+MLX server cannot observe the browser disconnect directly. A newly submitted
+generation request then stops the old Vision generation and runs after its
+current token finishes. Active text-only requests, including their tool-call
+generation, are not cancellation targets. A Vision request that itself uses
+tools remains a Vision cancellation target. Do not enable this option on a
+shared multi-user server.
+
+The server has no fixed output-token limit by default. Large OpenCode source
+updates and substantial Vision responses therefore continue until a model stop,
+a client-supplied limit, client cancellation, or a loop guard ends generation.
+There is no generally correct server-wide output cap; safety comes from those
+explicit termination mechanisms rather than an arbitrary default.
+
+`--request-max-tokens-floor` is still available when a client sends an
+explicitly small `max_tokens`/`max_completion_tokens`; it does not add a limit
+when the client omits one. `--max-tokens` remains available only for deployments
+that deliberately want a server-wide fallback cap.
 
 OpenCode can send a conservative explicit `max_tokens` even when its configured
 output limit is higher. For that client only, add
@@ -189,9 +223,11 @@ output limit is higher. For that client only, add
 tool call run for a long time, keep `--tool-call-max-tokens 8192` and the loop
 guards enabled. Do not add the floor to a general OpenWebUI profile.
 
-The recommended sampling defaults follow the GLM-5.2 guide:
-`temperature=1.0`, `top_p=0.95`, and `reasoning_effort=max` for complex agentic
-work. The available server-side thinking defaults are:
+For large source-code updates, the recommended profile leaves sampling at the
+server defaults: `temperature=0.0` and `top_p=1.0`. Omitting `--temp` and
+`--top-p` also lets a client override either value explicitly. The profile
+continues to use `reasoning_effort=max` for complex agentic work. The available
+server-side thinking defaults are:
 
 ```sh
 --chat-template-args '{"reasoning_effort":"max"}'
@@ -267,9 +303,9 @@ OpenCode can use the server through its OpenAI-compatible provider:
       },
       "models": {
         "default_model": {
-          "name": "GLM-5.2-Alis-MLX-Dynamic-3.5bpw",
+          "name": "GLM-5.2-Alis-MLX-Dynamic-4.5bpw",
           "limit": {
-            "context": 1048576,
+            "context": 524288,
             "output": 384000
           }
         }

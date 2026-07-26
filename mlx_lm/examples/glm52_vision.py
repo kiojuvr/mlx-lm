@@ -19,7 +19,7 @@ from mlx_lm.glm5v import (
 
 DEFAULT_ALIS_MODEL = (
     Path.home()
-    / ".lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"
+    / ".lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw"
 )
 DEFAULT_PROJECTOR = Path.home() / "models/glm52-vision-projector"
 

@@ -16,17 +16,21 @@ This fork is optimized for long-context, single-user coding-agent workloads. It 
 * Repetition and loop guards for long-running agent sessions
 * Experimental GLM DSA MTP speculative decoding
 
-## Tested configuration
+## Recommended configuration
 
-The primary tested configuration is:
+The quality-oriented target configuration is:
 
 * Apple Silicon Mac
 * Mac Studio M3 Ultra with 512 GB unified memory
 * MLX 0.32.0
 * CPython 3.13
-* [`avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw`](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw)
+* [`avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw`](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw)
 
-Smaller-memory systems may require a smaller model, shorter context, or different cache settings.
+The 4.5 bpw checkpoint is the quality-oriented profile. Its routed experts use
+NVFP4 and its weights occupy about 395 GiB on disk. On a 512 GB system, use
+int8 KV cache and plan for about 500K tokens of comfortable context (about
+600K maximum), rather than the roughly 1M-token budget of the 3.5 bpw
+checkpoint. Smaller-memory systems require a smaller model.
 
 ## Installation
 
@@ -73,7 +77,7 @@ The native Metal kernels are optional. See [Native kernels](docs/native-kernels.
 Set the path to the local model:
 
 ```sh
-export MODEL="$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"
+export MODEL="$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw"
 ```
 
 Start a local OpenAI-compatible server:
@@ -88,9 +92,7 @@ python -m mlx_lm server \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
   --prefill-step-size 8192 \
-  --prefill-max-qk-tokens 67108864 \
-  --temp 1.0 \
-  --top-p 0.95
+  --prefill-max-qk-tokens 67108864
 ```
 
 The API base URL is:
@@ -124,6 +126,10 @@ Prompt checkpoints are stored under:
 Use an empty cache directory after changing model weights, tokenizer files, adapters, quantization, GLM implementation details, or KV-cache settings.
 Checkpoints also record the exact MLX version; an MLX upgrade automatically
 turns older entries into cache misses so they are regenerated safely.
+When migrating from the 3.5 bpw checkpoint, point
+`--checkpoint-cache-dir` at a new directory such as
+`~/.cache/mlx-lm/glm52-45bpw/prompt-checkpoints`; the model-weight change is
+not covered by the automatic MLX-version check.
 
 See [Prompt checkpoints](docs/prompt-checkpoints.md) for validation, retention, and invalidation rules.
 

@@ -2038,6 +2038,77 @@ class TestPromptCheckpointPolicy(unittest.TestCase):
         self.assertIn("Shutdown sequence started", logs)
         self.assertIn("Shutdown sequence complete", logs)
 
+    def test_cancel_active_generation_stops_registered_vision_context(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._active_context_lock = threading.Lock()
+        ctx = mock.Mock()
+        ctx._should_stop = False
+        ctx.is_vision = True
+        generator._active_context = ctx
+
+        with self.assertLogs(level="INFO") as captured:
+            self.assertTrue(generator._cancel_active_generation("new_request"))
+
+        ctx.stop.assert_called_once_with()
+        self.assertIn("Active Vision generation", "\n".join(captured.output))
+        self.assertIn("reason=new_request", "\n".join(captured.output))
+
+    def test_cancel_active_generation_ignores_text_and_tool_context(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._active_context_lock = threading.Lock()
+        ctx = mock.Mock()
+        ctx._should_stop = False
+        ctx.is_vision = False
+        generator._active_context = ctx
+
+        self.assertFalse(generator._cancel_active_generation("new_request"))
+        ctx.stop.assert_not_called()
+
+    def test_cancel_active_generation_ignores_stopped_context(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._active_context_lock = threading.Lock()
+        ctx = mock.Mock()
+        ctx._should_stop = True
+        ctx.is_vision = True
+        generator._active_context = ctx
+
+        self.assertFalse(generator._cancel_active_generation("new_request"))
+        ctx.stop.assert_not_called()
+
+    def test_clear_active_context_does_not_clear_replacement(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._active_context_lock = threading.Lock()
+        old_ctx = mock.Mock()
+        new_ctx = mock.Mock()
+        generator._active_context = new_ctx
+
+        generator._clear_active_context(old_ctx)
+
+        self.assertIs(generator._active_context, new_ctx)
+
+    def test_generate_preempts_before_enqueuing_new_request(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(cancel_active_on_new_request=True)
+        )
+        generator._cancel_active_generation = mock.Mock(return_value=True)
+        generator.requests = mock.Mock()
+        response_queue = Queue()
+        new_ctx = mock.Mock(sequences={(1,): ""})
+        response_queue.put(new_ctx)
+
+        with mock.patch("mlx_lm.server.Queue", return_value=response_queue):
+            returned_ctx, _response = generator.generate(
+                request="new-request",
+                generation_args="new-args",
+            )
+
+        self.assertIs(returned_ctx, new_ctx)
+        generator._cancel_active_generation.assert_called_once_with("new_request")
+        generator.requests.put.assert_called_once_with(
+            (response_queue, "new-request", "new-args")
+        )
+
     def test_enqueue_checkpoint_save_queues_job(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator._checkpoint_save_queue = Queue()
@@ -2827,6 +2898,8 @@ class TestServerCLI(unittest.TestCase):
         self.assertEqual(args.output_loop_guard_repeats, 4)
         self.assertEqual(args.output_loop_guard_max_span_chars, 2048)
         self.assertEqual(args.prefill_progress_interval_tokens, 0)
+        self.assertFalse(args.cancel_active_on_new_request)
+        self.assertEqual(args.max_tokens, -1)
         self.assertEqual(args.request_max_tokens_floor, 0)
         self.assertEqual(args.checkpoint_save_exact, "enabled")
 
@@ -2854,6 +2927,11 @@ class TestServerCLI(unittest.TestCase):
         args = setup_arg_parser().parse_args(["--disable-batching"])
 
         self.assertTrue(args.disable_batching)
+
+    def test_setup_arg_parser_cancel_active_on_new_request(self):
+        args = setup_arg_parser().parse_args(["--cancel-active-on-new-request"])
+
+        self.assertTrue(args.cancel_active_on_new_request)
 
     def test_setup_arg_parser_accepts_glm5v_options(self):
         args = setup_arg_parser().parse_args(
@@ -3042,7 +3120,7 @@ class TestServerCLI(unittest.TestCase):
 
     def test_resolve_request_max_tokens_does_not_floor_cli_default(self):
         cli_args = types.SimpleNamespace(
-            max_tokens=512,
+            max_tokens=-1,
             request_max_tokens_floor=384000,
         )
 
@@ -3051,9 +3129,9 @@ class TestServerCLI(unittest.TestCase):
             cli_args,
         )
 
-        self.assertEqual(max_tokens, 512)
+        self.assertEqual(max_tokens, -1)
         self.assertEqual(source, "cli_default")
-        self.assertEqual(requested, 512)
+        self.assertEqual(requested, -1)
         self.assertFalse(floor_applied)
 
     def test_resolve_request_temperature_uses_vision_default(self):

@@ -25,6 +25,15 @@ metadata, GLM MLA KV settings, and the exact MLX version. It does not prove
 complete model-weight, tokenizer, adapter, or artifact identity. Treat it as a
 single-model local cache.
 
+The recommended 4.5 bpw serving profile therefore uses:
+
+```text
+~/.cache/mlx-lm/glm52-45bpw/prompt-checkpoints/
+```
+
+This keeps newly generated checkpoints separate from the former 3.5 bpw
+profile under `glm52-local`.
+
 ## Cache location
 
 The shared runtime cache root is:

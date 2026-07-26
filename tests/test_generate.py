@@ -1153,6 +1153,31 @@ class TestGenerate(unittest.TestCase):
                 self.assertTrue(mx.allclose(blp, lp))
                 break
 
+    def test_batch_negative_max_tokens_is_unbounded(self):
+        prompt = self.tokenizer.encode("Continue")
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=[],
+            max_tokens=-1,
+            completion_batch_size=1,
+        )
+        (uid,) = gen.insert([prompt])
+
+        generated = []
+        while len(generated) < 2:
+            generated.extend(
+                response
+                for response in gen.next_generated()
+                if response.uid == uid
+            )
+
+        self.assertEqual(len(generated), 2)
+        self.assertTrue(
+            all(response.finish_reason is None for response in generated)
+        )
+        gen.remove([uid])
+        gen.close()
+
     def test_many_batches(self):
 
         prompts = [

@@ -1051,7 +1051,7 @@ MLX_LM_GLM_DSA_SPARSE_PREFILL_MIN_CONTEXT=131072 \
 MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV=1 \
 MLX_LM_GLM_DSA_NATIVE_SPARSE_PREFILL_QUANTIZED_KV_MAX_CONTEXT=262144 \
 python -m mlx_lm server \
-  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw" \
   --host 0.0.0.0 \
   --port 8000 \
   --kv-bits 8 \
@@ -1060,7 +1060,7 @@ python -m mlx_lm server \
   --prefill-step-size 8192 \
   --prefill-max-qk-tokens 67108864 \
   --glm-dsa-adaptive-prefill-step-size 0 \
-  --checkpoint-cache-dir "$HOME/.cache/mlx-lm/glm52-local/prompt-checkpoints" \
+  --checkpoint-cache-dir "$HOME/.cache/mlx-lm/glm52-45bpw/prompt-checkpoints" \
   --checkpoint-min-tokens 512 \
   --checkpoint-cold-max-tokens 30000 \
   --checkpoint-boundary-trim-tokens 32 \
@@ -1125,7 +1125,7 @@ continuous batching remains available:
 ```sh
 MLX_METAL_FAST_SYNCH=1 \
 python -m mlx_lm server \
-  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw" \
   --host 0.0.0.0 \
   --port 8000 \
   --kv-bits 8 \

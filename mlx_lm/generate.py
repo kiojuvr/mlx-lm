@@ -3480,7 +3480,10 @@ class GenerationBatch:
             match_sequence = None
 
             self._num_tokens[i] += 1
-            if self._num_tokens[i] >= self.max_tokens[i]:
+            if (
+                self.max_tokens[i] >= 0
+                and self._num_tokens[i] >= self.max_tokens[i]
+            ):
                 finish_reason = "length"
 
             self._matcher_states[i], match_sequence, current_state = (

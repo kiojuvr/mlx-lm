@@ -338,6 +338,7 @@ class GenerationContext:
 
     prompt: List[int]
     prompt_cache_count: int = -1
+    is_vision: bool = False
 
     _should_stop: bool = False
 
@@ -1472,6 +1473,8 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
+        self._active_context_lock = Lock()
+        self._active_context = None
         self._shutdown_complete = False
         self._checkpoint_save_queue = Queue()
         self._checkpoint_save_stop = object()
@@ -1483,6 +1486,41 @@ class ResponseGenerator:
         self._checkpoint_save_thread.start()
         self._generation_thread = Thread(target=self._generate, daemon=True)
         self._generation_thread.start()
+
+    def _set_active_context(self, ctx):
+        lock = getattr(self, "_active_context_lock", None)
+        if lock is None:
+            self._active_context_lock = Lock()
+            lock = self._active_context_lock
+        with lock:
+            self._active_context = ctx
+
+    def _clear_active_context(self, ctx):
+        lock = getattr(self, "_active_context_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if getattr(self, "_active_context", None) is ctx:
+                self._active_context = None
+
+    def _cancel_active_generation(self, reason):
+        lock = getattr(self, "_active_context_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            ctx = getattr(self, "_active_context", None)
+            if (
+                ctx is None
+                or ctx._should_stop
+                or not getattr(ctx, "is_vision", False)
+            ):
+                return False
+            ctx.stop()
+        logging.info(
+            "Active Vision generation cancellation requested: reason=%s",
+            reason,
+        )
+        return True
 
     def stop_and_join(self):
         cli_args = getattr(getattr(self, "model_provider", None), "cli_args", None)
@@ -3485,7 +3523,9 @@ class ResponseGenerator:
                 tool_parser=tokenizer.tool_parser,
                 sequences=sequences,
                 prompt=prompt,
+                is_vision=input_embeddings is not None,
             )
+            self._set_active_context(ctx)
             rqueue.put(ctx)
 
             # Seed if requested
@@ -3971,6 +4011,9 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+        finally:
+            if ctx is not None:
+                self._clear_active_context(ctx)
 
     def generate(
         self,
@@ -3979,6 +4022,8 @@ class ResponseGenerator:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         idle_callback: Optional[Callable[[], None]] = None,
     ):
+        if getattr(self.cli_args, "cancel_active_on_new_request", False):
+            self._cancel_active_generation("new_request")
         response_queue = Queue()
         self.requests.put((response_queue, request, generation_args))
 
@@ -4329,7 +4374,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
-        self._validate("max_tokens", int, min_val=0)
+        self._validate("max_tokens", int, min_val=0, whitelist=[-1])
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
@@ -6141,8 +6186,12 @@ def setup_arg_parser():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
-        help="Default maximum number of tokens to generate (default: 512)",
+        default=-1,
+        help=(
+            "Default maximum number of tokens to generate when a request omits "
+            "its own limit. Use -1 for no server-side output limit "
+            "(default: -1)."
+        ),
     )
     parser.add_argument(
         "--request-max-tokens-floor",
@@ -6150,8 +6199,9 @@ def setup_arg_parser():
         default=0,
         help=(
             "Raise an explicit request max_tokens/max_completion_tokens below "
-            "this value to the floor. Requests that omit a limit continue to "
-            "use --max-tokens. Use 0 to honor client limits (default: 0)."
+            "this value to the floor. Requests that omit a limit remain "
+            "unbounded unless --max-tokens is explicitly set. Use 0 to honor "
+            "client limits (default: 0)."
         ),
     )
     parser.add_argument(
@@ -6336,6 +6386,17 @@ def setup_arg_parser():
             "Disable continuous batching and serve requests sequentially. "
             "Useful for latency-focused long-context serving that relies on "
             "disk prompt checkpoint save/reuse."
+        ),
+    )
+    parser.add_argument(
+        "--cancel-active-on-new-request",
+        action="store_true",
+        help=(
+            "In sequential serving, stop the active Vision generation when a "
+            "new generation request arrives. Text-only requests, including "
+            "their tool-call generation, are not cancellation targets. This "
+            "prevents a disconnected proxy Vision request from blocking a "
+            "single-user server indefinitely. Disabled by default."
         ),
     )
     parser.add_argument(

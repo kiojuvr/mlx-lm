@@ -39,8 +39,8 @@ replaced with projected image features. `<|begin_of_image|>` and
 
 ## Required files
 
-- The validated local language model:
-  `~/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw`.
+- The default local language model:
+  `~/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw`.
 - `mm_projector.safetensors` and its GLM5V `config.json`.
 - Kimi-K2.6 `model-00064-of-000064.safetensors` (833.8 MB).
 - Kimi-K2.6 `preprocessor_config.json` (recommended).
@@ -114,7 +114,7 @@ layout used here, the MoonViT shard and preprocessor config are inferred:
 
 ```bash
 python -m mlx_lm server \
-  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw" \
+  --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw" \
   --vision-projector "$HOME/models/glm52-vision-projector" \
   --vision-disable-thinking \
   --vision-temperature 0 \
@@ -145,7 +145,7 @@ bounded data URL. Server-local paths require `--vision-allow-local-images` and
 are disabled by default. Each structured image part is rewritten to
 `<|begin_of_image|><|image|><|end_of_image|>` before the Alis chat template is
 rendered, avoiding that text-only template's image-rejection reminder without
-changing files in the 310 GiB model directory.
+changing files in the 395 GiB model directory.
 
 The server defaults limit each request to 8 images, each image to 20 MiB and
 40 million decoded pixels, and all decoded images together to 64 million
