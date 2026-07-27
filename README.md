@@ -15,6 +15,7 @@ This fork is optimized for long-context, single-user coding-agent workloads. It 
 * Continuous batching support for compatible GLM MLA int8 caches
 * Repetition and loop guards for long-running agent sessions
 * Experimental GLM DSA MTP speculative decoding
+* Initial GLM-5.2 Vision support using a MoonViT tower and trained projector
 
 ## Recommended configuration
 
@@ -105,6 +106,69 @@ Use `--host 0.0.0.0` only when the server must be reachable from a trusted local
 
 For the complete long-context OpenCode profile, including prompt checkpoints and loop guards, see [Serving GLM-5.2](docs/serving.md).
 
+## Optional GLM-5.2 Vision
+
+This fork can add image understanding to the same Alis language model by
+attaching the frozen Kimi-K2.6 MoonViT tower and Baseten's trained GLM-5.2
+projector. The integration downloads only the Vision components (about
+0.93 GB), not either source repository's full language-model checkpoint.
+
+Download the required files:
+
+```sh
+export VISION_DIR="$HOME/models/glm52-vision-projector"
+mkdir -p "$VISION_DIR/moonvit"
+
+uvx --from huggingface-hub hf download \
+  baseten/GLM-5.2-Vision-NVFP4 \
+  config.json mm_projector.safetensors \
+  --local-dir "$VISION_DIR"
+
+uvx --from huggingface-hub hf download \
+  baseten/GLM-5.2-Vision-NVFP4 \
+  preprocessor_config.json \
+  --local-dir "$VISION_DIR/moonvit"
+
+uvx --from huggingface-hub hf download \
+  moonshotai/Kimi-K2.6 \
+  model-00064-of-000064.safetensors \
+  --local-dir "$VISION_DIR/moonvit"
+```
+
+Then add the Vision options to the basic server command:
+
+```sh
+MLX_METAL_FAST_SYNCH=1 \
+python -m mlx_lm server \
+  --model "$MODEL" \
+  --vision-projector "$VISION_DIR" \
+  --vision-disable-thinking \
+  --vision-temperature 0 \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --kv-bits 8 \
+  --kv-group-size 64 \
+  --quantized-kv-start 4096 \
+  --prefill-step-size 8192 \
+  --prefill-max-qk-tokens 67108864
+```
+
+The server accepts OpenAI-style Chat Completions `image_url` parts and
+Responses API `input_image` parts. Base64 `data:image/...` URLs are enabled by
+default. Remote HTTP(S) image fetching is not supported; download remote
+images in the client and send a data URL instead. Server-local image paths are
+disabled unless the server is started with `--vision-allow-local-images`.
+
+Vision requests use the sequential generation path and a fresh KV cache.
+Prompt checkpoints, continuous batching, MTP speculative decoding, and draft
+models remain available for text requests but are not used for image requests.
+Vision currently supports image inference only; video input is not exposed.
+
+See [GLM-5.2 Vision](mlx_lm/GLM5V.md) for architecture details, standalone
+inference, an API request example, limits, and validation notes. The
+production-oriented setup is also covered in
+[Serving GLM-5.2](docs/serving.md#optional-glm-52-vision-attachment).
+
 ## Prompt checkpoints
 
 This fork can store and reuse the longest validated token prefix of earlier requests.
@@ -157,6 +221,7 @@ See [Serving GLM-5.2](docs/serving.md) for an OpenCode provider configuration an
 * [Native GLM kernels](docs/native-kernels.md)
 * [MTP speculative decoding](docs/mtp.md)
 * [Prefill and decode benchmarks](docs/glm52-prefill-benchmark.md)
+* [GLM-5.2 Vision](mlx_lm/GLM5V.md)
 
 ## Important limitations
 
@@ -167,6 +232,7 @@ See [Serving GLM-5.2](docs/serving.md) for an OpenCode provider configuration an
 * The DSA Indexer cache intentionally remains floating point.
 * Native kernels support only specific GLM-5.2 shapes and quantization layouts.
 * MTP speculative decoding remains experimental.
+* GLM-5.2 Vision support is initial and currently handles images, not video.
 * Prompt checkpoints must be invalidated after incompatible model or runtime
   changes not already covered by the automatic MLX-version check.
 
