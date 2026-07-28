@@ -23,6 +23,12 @@ python -m mlx_lm server \
   --host 127.0.0.1 \
   --port 8000 \
   --kv-bits 8 \
+  --prompt-cache-size 1 \
+  --prompt-cache-bytes 12GB \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --min-p 0.20 \
+  --repetition-penalty 1.10 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
   --prefill-step-size 8192 \
