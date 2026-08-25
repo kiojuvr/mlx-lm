@@ -105,7 +105,7 @@ This fork now includes a lightweight prefill benchmark:
 ```sh
 uv run \
   --python 3.13 \
-  --with 'mlx>=0.32.0' --with numpy --with 'transformers>=5.7.0' \
+  --with 'mlx>=0.32.2' --with numpy --with 'transformers>=5.7.0' \
   --with sentencepiece --with protobuf --with pyyaml --with jinja2 \
   --with huggingface_hub \
   python benchmarks/glm52_prefill_benchmark.py \
@@ -1054,7 +1054,6 @@ python -m mlx_lm server \
   --model "$HOME/.lmstudio/models/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw" \
   --host 0.0.0.0 \
   --port 8000 \
-  --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
   --prefill-step-size 8192 \

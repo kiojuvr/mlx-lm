@@ -21,7 +21,7 @@ MLX_LM_WITH_CUSTOM_KERNEL=1 \
 uv pip install --python .venv/bin/python --no-deps -e .
 ```
 
-The build requires MLX 0.32.0 and nanobind 2.13.0. See
+The build requires MLX 0.32.2 and nanobind 2.15.0. See
 [Native GLM Kernels](../../../docs/native-kernels.md) for Xcode selection,
 Metal Toolchain verification, and the full build and smoke-test procedure.
 

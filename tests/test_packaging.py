@@ -6,6 +6,20 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 
+def _markdown_section(document, heading):
+    start = document.index(heading) + len(heading)
+    end = document.find("\n## ", start)
+    return document[start:] if end == -1 else document[start:end]
+
+
+def _first_fenced_code_block(document, heading):
+    section = _markdown_section(document, heading)
+    fence_start = section.index("```", 0) + 3
+    content_start = section.index("\n", fence_start) + 1
+    content_end = section.index("```", content_start)
+    return section[content_start:content_end]
+
+
 def _setup_constants():
     tree = ast.parse((ROOT / "setup.py").read_text())
     constants = {}
@@ -52,6 +66,12 @@ def test_quality_profile_uses_45bpw_model_and_isolated_checkpoint_dir():
     vision_example = (
         ROOT / "mlx_lm" / "examples" / "glm52_vision.py"
     ).read_text()
+    serving_command = _first_fenced_code_block(
+        serving_docs, "## Recommended long-context profile"
+    )
+    benchmark_command = _first_fenced_code_block(
+        benchmark_docs, "## Recommended GLM-5.2 Settings"
+    )
 
     model_name = "GLM-5.2-Alis-MLX-Dynamic-4.5bpw"
     assert model_name in readme
@@ -66,3 +86,6 @@ def test_quality_profile_uses_45bpw_model_and_isolated_checkpoint_dir():
     assert "--top-p 0.95" not in readme
     assert "--temp 1.0" not in serving_docs
     assert "--top-p 0.95" not in serving_docs
+    assert "--kv-bits 8" not in readme
+    assert "--kv-bits 8" not in serving_command
+    assert "--kv-bits 8" not in benchmark_command

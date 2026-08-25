@@ -11,8 +11,8 @@ sys.path.append(str(package_dir))
 
 from _version import __version__
 
-MIN_MLX_VERSION = "0.32.0"
-NANOBIND_VERSION = "2.13.0"
+MIN_MLX_VERSION = "0.32.2"
+NANOBIND_VERSION = "2.15.0"
 CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
 TRUTHY = {"1", "true", "yes", "on"}
 DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"

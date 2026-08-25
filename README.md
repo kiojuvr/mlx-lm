@@ -23,7 +23,7 @@ The quality-oriented target configuration is:
 
 * Apple Silicon Mac
 * Mac Studio M3 Ultra with 512 GB unified memory
-* MLX 0.32.0
+* MLX 0.32.2
 * CPython 3.13
 * [`avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw`](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-4.5bpw)
 
@@ -55,7 +55,7 @@ Install the known-good runtime versions:
 
 ```sh
 uv pip install \
-  mlx==0.32.0 \
+  mlx==0.32.2 \
   transformers==5.12.1 \
   safetensors==0.8.0 \
   numpy==2.4.6 \
@@ -89,7 +89,6 @@ python -m mlx_lm server \
   --model "$MODEL" \
   --host 127.0.0.1 \
   --port 8000 \
-  --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
   --prefill-step-size 8192 \
@@ -146,7 +145,6 @@ python -m mlx_lm server \
   --vision-temperature 0 \
   --host 127.0.0.1 \
   --port 8000 \
-  --kv-bits 8 \
   --kv-group-size 64 \
   --quantized-kv-start 4096 \
   --prefill-step-size 8192 \

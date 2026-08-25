@@ -47,7 +47,7 @@ xcrun --find metal
 xcrun metal --version
 ```
 
-The build requires MLX 0.32.0, CMake 3.27 or newer, nanobind 2.13.0, and
+The build requires MLX 0.32.2, CMake 3.27 or newer, nanobind 2.15.0, and
 wheel/setuptools in the isolated build environment. The `pyproject.toml`
 build-system section pins these dependencies.
 

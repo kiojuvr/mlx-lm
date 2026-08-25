@@ -22,11 +22,8 @@ python -m mlx_lm server \
   --model "$MODEL" \
   --host 127.0.0.1 \
   --port 8000 \
-  --kv-bits 8 \
   --prompt-cache-size 1 \
   --prompt-cache-bytes 12GB \
-  --temp 1.0 \
-  --top-p 0.95 \
   --min-p 0.20 \
   --repetition-penalty 1.10 \
   --kv-group-size 64 \
@@ -175,9 +172,11 @@ above remains unchanged.
 
 ## Why these settings are used
 
-`--kv-bits 8` reduces the memory occupied by the GLM MLA cache. It is a
-long-context memory optimization, not a prefill-compute speedup. The DSA
-Indexer cache is independent and intentionally remains floating point.
+The recommended long-context profile intentionally omits `--kv-bits 8` and
+keeps the GLM MLA cache floating point. When explicitly enabled for an
+alternative profile, KV quantization is a memory optimization, not a
+prefill-compute speedup. The DSA Indexer cache is independent and intentionally
+remains floating point.
 
 The 4.5 bpw weights use about 424 GB (395 GiB) and leave less KV-cache
 headroom than the former 3.5 bpw profile. On a 512 GB M3 Ultra, treat about
